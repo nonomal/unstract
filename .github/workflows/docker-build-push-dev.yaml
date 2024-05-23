@@ -57,7 +57,6 @@ jobs:
           # Push all built images
           docker push unstract/backend:${{ github.event.inputs.tag }}
           docker push unstract/frontend:${{ github.event.inputs.tag }}
-          docker push unstract/document-service:${{ github.event.inputs.tag }}
           docker push unstract/platform-service:${{ github.event.inputs.tag }}
           docker push unstract/worker:${{ github.event.inputs.tag }}
           docker push unstract/prompt-service:${{ github.event.inputs.tag }}
