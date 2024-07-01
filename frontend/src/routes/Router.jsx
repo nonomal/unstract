@@ -21,7 +21,6 @@ import { InviteEditUserPage } from "../pages/InviteEditUserPage.jsx";
 import { LandingPage } from "../pages/LandingPage.jsx";
 import { OnBoardPage } from "../pages/OnBoardPage.jsx";
 import { OutputAnalyzerPage } from "../pages/OutputAnalyzerPage.jsx";
-import { PipelinesOrDeploymentsPage } from "../pages/PipelinesOrDeploymentsPage.jsx";
 import { ProfilePage } from "../pages/ProfilePage.jsx";
 import { SetOrgPage } from "../pages/SetOrgPage.jsx";
 import { SettingsPage } from "../pages/SettingsPage.jsx";
@@ -33,6 +32,10 @@ import { WorkflowsPage } from "../pages/WorkflowsPage.jsx";
 let TrialRoutes;
 let RequirePlatformAdmin;
 let PlatformAdminPage;
+let AppDeployments;
+let ChatAppPage;
+let ChatAppLayout;
+
 try {
   TrialRoutes =
     require("../plugins/subscription/trial-page/TrialEndPage.jsx").TrialEndPage;
@@ -41,7 +44,18 @@ try {
   PlatformAdminPage =
     require("../plugins/frictionless-onboard/platform-admin-page/PlatformAdminPage.jsx").PlatformAdminPage;
 } catch (err) {
-  TrialRoutes = NotFound;
+  // Do nothing, Not-found Page will be triggered.
+}
+
+try {
+  AppDeployments =
+    require("../plugins/app-deployment/AppDeployments.jsx").AppDeployments;
+  ChatAppPage =
+    require("../plugins/app-deployment/chat-app/ChatAppPage.jsx").ChatAppPage;
+  ChatAppLayout =
+    require("../plugins/app-deployment/chat-app/ChatAppLayout.jsx").ChatAppLayout;
+} catch (err) {
+  // Do nothing, Not-found Page will be triggered.
 }
 
 function Router() {
@@ -59,6 +73,11 @@ function Router() {
           <Route path=":orgName" element={<FullPageLayout />}>
             <Route path="onboard" element={<OnBoardPage />} />
           </Route>
+          {ChatAppLayout && ChatAppPage && (
+            <Route path=":orgName" element={<ChatAppLayout />}>
+              <Route path="app/:id" element={<ChatAppPage />} />
+            </Route>
+          )}
           <Route path=":orgName" element={<PageLayout />}>
             <Route path="profile" element={<ProfilePage />} />
             <Route
@@ -73,10 +92,9 @@ function Router() {
               path="task"
               element={<DeploymentsPage type={deploymentTypes.task} />}
             />
-            <Route
-              path="app"
-              element={<PipelinesOrDeploymentsPage type="app" />}
-            />
+            {AppDeployments && (
+              <Route path="app" element={<AppDeployments type="app" />} />
+            )}
             <Route path="workflows" element={<WorkflowsPage />} />
             <Route path="workflows/:id" element={<ProjectHelper />}>
               <Route path="" element={<AgencyPage />} />

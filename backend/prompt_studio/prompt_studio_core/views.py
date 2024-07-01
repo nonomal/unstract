@@ -88,7 +88,14 @@ class PromptStudioCoreView(viewsets.ModelViewSet):
                 f"{ToolStudioErrors.TOOL_NAME_EXISTS}, \
                     {ToolStudioErrors.DUPLICATE_API}"
             )
+        PromptStudioHelper.create_default_profile_manager(
+            request.user, serializer.data["tool_id"]
+        )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def perform_destroy(self, instance: CustomTool) -> None:
+        organization_id = UserSessionUtils.get_organization_id(self.request)
+        instance.delete(organization_id)
 
     def destroy(
         self, request: Request, *args: tuple[Any], **kwargs: dict[str, Any]
@@ -182,7 +189,7 @@ class PromptStudioCoreView(viewsets.ModelViewSet):
             data={"default_profile": profile_manager.profile_id},
         )
 
-    @action(detail=True, methods=["get"])
+    @action(detail=True, methods=["post"])
     def index_document(self, request: HttpRequest, pk: Any = None) -> Response:
         """API Entry point method to index input file.
 
@@ -452,9 +459,13 @@ class PromptStudioCoreView(viewsets.ModelViewSet):
         try:
             # Delete the document record
             document.delete()
-
-            # Delete the file
+            # Delete the files
             FileManagerHelper.delete_file(file_system, path, file_name)
+            # Directories to delete the text files
+            directories = ["extract/", "summarize/"]
+            FileManagerHelper.delete_related_files(
+                file_system, path, file_name, directories
+            )
             return Response(
                 {"data": "File deleted succesfully."},
                 status=status.HTTP_200_OK,

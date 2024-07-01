@@ -1,12 +1,16 @@
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 from account.constants import Common
+from account.models import User
+from adapter_processor.constants import AdapterKeys
 from adapter_processor.models import AdapterInstance
 from django.conf import settings
+from django.db.models.manager import BaseManager
 from file_management.file_management_helper import FileManagerHelper
 from prompt_studio.prompt_profile_manager.models import ProfileManager
 from prompt_studio.prompt_studio.models import ToolStudioPrompt
@@ -47,6 +51,62 @@ logger = logging.getLogger(__name__)
 
 class PromptStudioHelper:
     """Helper class for Custom tool operations."""
+
+    @staticmethod
+    def create_default_profile_manager(user: User, tool_id: uuid) -> None:
+        """Create a default profile manager for a given user and tool.
+
+        Args:
+            user (User): The user for whom the default profile manager is
+            created.
+            tool_id (uuid): The ID of the tool for which the default profile
+            manager is created.
+
+        Raises:
+            AdapterInstance.DoesNotExist: If no suitable adapter instance is
+            found for creating the default profile manager.
+
+        Returns:
+            None
+        """
+        try:
+            AdapterInstance.objects.get(
+                is_friction_less=True,
+                is_usable=True,
+                adapter_type=AdapterKeys.LLM,
+            )
+
+            default_adapters: BaseManager[AdapterInstance] = (
+                AdapterInstance.objects.filter(is_friction_less=True)
+            )
+
+            profile_manager = ProfileManager(
+                prompt_studio_tool=CustomTool.objects.get(pk=tool_id),
+                is_default=True,
+                created_by=user,
+                modified_by=user,
+                chunk_size=0,
+                profile_name="sample profile",
+                chunk_overlap=0,
+                section="Default",
+                retrieval_strategy="simple",
+                similarity_top_k=3,
+            )
+
+            for adapter in default_adapters:
+                if adapter.adapter_type == AdapterKeys.LLM:
+                    profile_manager.llm = adapter
+                elif adapter.adapter_type == AdapterKeys.VECTOR_DB:
+                    profile_manager.vector_store = adapter
+                elif adapter.adapter_type == AdapterKeys.X2TEXT:
+                    profile_manager.x2text = adapter
+                elif adapter.adapter_type == AdapterKeys.EMBEDDING:
+                    profile_manager.embedding_model = adapter
+
+            profile_manager.save()
+
+        except AdapterInstance.DoesNotExist:
+            logger.info("skipping default profile creation")
 
     @staticmethod
     def validate_adapter_status(
@@ -242,7 +302,7 @@ class PromptStudioHelper:
         """
         tool: CustomTool = CustomTool.objects.get(pk=tool_id)
         if is_summary:
-            profile_manager = ProfileManager.objects.get(
+            profile_manager: ProfileManager = ProfileManager.objects.get(
                 prompt_studio_tool=tool, is_summarize_llm=True
             )
             default_profile = profile_manager
@@ -385,7 +445,7 @@ class PromptStudioHelper:
                 )
 
                 OutputManagerHelper.handle_prompt_output_update(
-                    run_id=response[TSPKeys.RUN_ID],
+                    run_id=run_id,
                     prompts=prompts,
                     outputs=response["output"],
                     document_id=document_id,
@@ -461,9 +521,9 @@ class PromptStudioHelper:
                 )
 
                 OutputManagerHelper.handle_prompt_output_update(
-                    run_id=response[TSPKeys.RUN_ID],
+                    run_id=run_id,
                     prompts=prompts,
-                    outputs=response[TSPKeys.SINGLE_PASS_EXTRACTION],
+                    outputs=response[TSPKeys.OUTPUT],
                     document_id=document_id,
                     is_single_pass_extract=True,
                 )
