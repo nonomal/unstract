@@ -1,5 +1,5 @@
-import { Typography } from "antd";
 import { useLocation } from "react-router-dom";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import "./OAuthStatus.css";
 
@@ -11,7 +11,14 @@ function OAuthStatus() {
   const params = new URLSearchParams(location.search);
   const status = params.get("status");
 
-  localStorage.setItem("oauth-status", status);
+  // Set status for the connector that initiated OAuth (stored in sessionStorage for callback)
+  const currentConnector = sessionStorage.getItem("oauth-current-connector");
+  if (currentConnector) {
+    const statusKey = `oauth-status-${currentConnector}`;
+    localStorage.setItem(statusKey, status);
+    // Clear the session storage after use
+    sessionStorage.removeItem("oauth-current-connector");
+  }
 
   if (status === SUCCESS) {
     setTimeout(() => {

@@ -1,3 +1,4 @@
+import { fetchAllPages } from "../../../helpers/pagination.js";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate.js";
 import { useSessionStore } from "../../../store/session-store.js";
 
@@ -10,13 +11,12 @@ function workflowService() {
   const csrfToken = sessionDetails.csrfToken;
 
   return {
-    getWorkflowList: () => {
-      options = {
-        url: `${path}/workflow/?is_active=True`,
-        method: "GET",
-      };
-      return axiosPrivate(options);
-    },
+    // Feeds selectors, so it resolves to every workflow rather than one page.
+    getWorkflowList: () =>
+      fetchAllPages(axiosPrivate, {
+        url: `${path}/workflow/`,
+        params: { is_active: "True" },
+      }),
     getWorkflowEndpointList: (endpointType, connectorType) => {
       options = {
         url: `${path}/workflow/endpoint/?endpoint_type=${endpointType}&connection_type=${connectorType}`,
@@ -24,8 +24,7 @@ function workflowService() {
       };
       return axiosPrivate(options);
     },
-    getProjectList: (myProjects = false) => {
-      const params = myProjects ? { created_by: sessionDetails?.id } : {};
+    getProjectList: (params = {}) => {
       options = {
         url: `${path}/workflow/`,
         method: "GET",
@@ -58,23 +57,55 @@ function workflowService() {
       };
       return axiosPrivate(options);
     },
-    clearCache: (id) => {
+    clearFileMarkers: (id) => {
       options = {
-        url: `${path}/workflow/${id}/clear-cache/`,
-        method: "GET",
+        url: `${path}/workflow/${id}/clear-file-marker/`,
+        method: "POST",
         headers: {
           "X-CSRFToken": csrfToken,
         },
       };
       return axiosPrivate(options);
     },
-    clearFileMarkers: (id) => {
+    getFileHistories: (workflowId, params = {}) => {
       options = {
-        url: `${path}/workflow/${id}/clear-file-marker/`,
+        url: `${path}/workflow/${workflowId}/file-histories/`,
         method: "GET",
+        params: params,
+      };
+      return axiosPrivate(options);
+    },
+    deleteFileHistory: (workflowId, fileHistoryId) => {
+      options = {
+        url: `${path}/workflow/${workflowId}/file-histories/${fileHistoryId}/`,
+        method: "DELETE",
         headers: {
           "X-CSRFToken": csrfToken,
         },
+      };
+      return axiosPrivate(options);
+    },
+    bulkClearFileHistories: (workflowId, filters) => {
+      options = {
+        url: `${path}/workflow/${workflowId}/file-histories/clear/`,
+        method: "POST",
+        headers: {
+          "X-CSRFToken": csrfToken,
+          "Content-Type": "application/json",
+        },
+        data: filters,
+      };
+      return axiosPrivate(options);
+    },
+    bulkDeleteFileHistoriesByIds: (workflowId, ids) => {
+      options = {
+        url: `${path}/workflow/${workflowId}/file-histories/clear/`,
+        method: "POST",
+        headers: {
+          "X-CSRFToken": csrfToken,
+          "Content-Type": "application/json",
+        },
+        data: { ids },
       };
       return axiosPrivate(options);
     },
@@ -82,6 +113,57 @@ function workflowService() {
       options = {
         url: `${path}/workflow/${id}/can-update`,
         method: "GET",
+      };
+      return axiosPrivate(options);
+    },
+    getSharedUsers: (id) => {
+      options = {
+        url: `${path}/workflow/${id}/users/`,
+        method: "GET",
+      };
+      return axiosPrivate(options);
+    },
+    updateSharing: (id, sharedUsers, shareWithEveryone, sharedGroups = []) => {
+      options = {
+        url: `${path}/workflow/${id}/share/`,
+        method: "POST",
+        headers: {
+          "X-CSRFToken": csrfToken,
+        },
+        data: {
+          shared_users: sharedUsers,
+          shared_to_org: shareWithEveryone,
+          shared_groups: sharedGroups,
+        },
+      };
+      return axiosPrivate(options);
+    },
+    getAllUsers: () => {
+      options = {
+        url: `${path}/users/`,
+        method: "GET",
+      };
+      return axiosPrivate(options);
+    },
+    addCoOwner: (id, userId) => {
+      options = {
+        url: `${path}/workflow/${id}/owners/`,
+        method: "POST",
+        headers: {
+          "X-CSRFToken": csrfToken,
+          "Content-Type": "application/json",
+        },
+        data: { user_id: userId },
+      };
+      return axiosPrivate(options);
+    },
+    removeCoOwner: (id, userId) => {
+      options = {
+        url: `${path}/workflow/${id}/owners/${userId}/`,
+        method: "DELETE",
+        headers: {
+          "X-CSRFToken": csrfToken,
+        },
       };
       return axiosPrivate(options);
     },

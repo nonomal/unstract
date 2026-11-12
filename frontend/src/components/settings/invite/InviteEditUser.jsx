@@ -1,6 +1,7 @@
-import { Form, Input, Select } from "antd";
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { Form } from "@/components/ui/shims/antd-form";
+import { Input, Select } from "@/components/ui/shims/antd-inputs";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { IslandLayout } from "../../../layouts/island-layout/IslandLayout.jsx";
@@ -10,6 +11,7 @@ import { CustomButton } from "../../widgets/custom-button/CustomButton.jsx";
 import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader.jsx";
 import { TopBar } from "../../widgets/top-bar/TopBar.jsx";
 import "./InviteEditUser.css";
+import { homePagePath } from "../../../helpers/GetStaticData.js";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
 import usePostHogEvents from "../../../hooks/usePostHogEvents.js";
 
@@ -25,6 +27,7 @@ function InviteEditUser() {
   const [submitLoading, setSubmitLoading] = useState(false);
   const [initialRole, setInitialRole] = useState();
   const { setPostHogCustomEvent } = usePostHogEvents();
+
   const isInvite = location.pathname.split("/").slice(-1)[0] === "invite";
   const validateMessages = {
     required: "required!",
@@ -52,7 +55,7 @@ function InviteEditUser() {
         setInitialRole(
           isInvite
             ? members.find((role) => role.name === USER_ROLE)
-            : members.find((role) => role.name === location.state.role)
+            : members.find((role) => role.name === location.state.role),
         );
       })
       .catch((err) => {
@@ -62,11 +65,11 @@ function InviteEditUser() {
         setLoading(false);
       });
   };
-  const inviteUserToOrg = async (email) => {
+  const inviteUserToOrg = async (value) => {
     const requestOptions = {
       method: "POST",
       url: `/api/v1/unstract/${sessionDetails?.orgId}/users/invite/`,
-      data: { users: [{ email: email }] },
+      data: { users: [value] },
       headers: {
         "X-CSRFToken": sessionDetails?.csrfToken,
         "Content-Type": "application/json",
@@ -120,7 +123,10 @@ function InviteEditUser() {
   const onSubmit = (values) => {
     setSubmitLoading(true);
     if (isInvite) {
-      inviteUserToOrg(values.email);
+      const roleName = userRoles?.filter((val) => val.id === values.role)[0]
+        ?.name;
+      values.role = roleName;
+      inviteUserToOrg(values);
     } else {
       updateUserRole(values);
     }
@@ -130,7 +136,7 @@ function InviteEditUser() {
         ? "Clicked on 'Invite' button"
         : "Clicked on 'Update' button";
       setPostHogCustomEvent("intent_success_add_user", { info });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
@@ -141,7 +147,7 @@ function InviteEditUser() {
 
   useEffect(() => {
     if (!isInvite && !location.state) {
-      navigate(`/${sessionDetails?.orgName}/tools`);
+      navigate(`/${sessionDetails?.orgName}/${homePagePath}`);
     }
     getUserRoles();
   }, []);
@@ -185,7 +191,6 @@ function InviteEditUser() {
                           label: formatOptionLabel(role.name),
                         };
                       })}
-                      disabled={isInvite}
                     />
                   </Form.Item>
                 </div>

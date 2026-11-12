@@ -1,5 +1,7 @@
-import { Card, Image, Typography } from "antd";
 import PropTypes from "prop-types";
+import { Image } from "@/components/ui/shims/antd-leaves";
+import { Card } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import "./DataSourceCard.css";
 import usePostHogEvents from "../../../hooks/usePostHogEvents";
@@ -19,7 +21,7 @@ function DataSourceCard({ srcDetails, setSelectedSourceId, type }) {
         info: "Clicked on the adapters card",
         adapter_name: srcDetails?.name,
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
@@ -30,6 +32,7 @@ function DataSourceCard({ srcDetails, setSelectedSourceId, type }) {
       type="inner"
       bordered={true}
       className={`ds-card ${srcDetails?.isDisabled ? "disabled" : ""}`}
+      data-testid={`ds-card-${srcDetails?.id}`}
       onClick={handleSelectSource}
     >
       <div className="cover-container">
@@ -41,9 +44,10 @@ function DataSourceCard({ srcDetails, setSelectedSourceId, type }) {
         <div className="cover-img">
           <Image
             src={srcDetails?.icon}
-            width="80%"
-            height="auto"
+            width="50%"
+            height="50%"
             preview={false}
+            style={{ objectFit: "contain" }}
           />
         </div>
         <div className="ds-card-name display-flex-center">

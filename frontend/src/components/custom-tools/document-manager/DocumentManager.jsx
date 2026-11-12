@@ -1,26 +1,36 @@
-import { LeftOutlined, RightOutlined } from "@ant-design/icons";
+import { ChevronLeft, ChevronRight, FileText } from "lucide-react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Tag } from "@/components/ui/shims/antd-leaves";
+import { Tooltip } from "@/components/ui/shims/antd-overlays";
+import { Tabs } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 import "@react-pdf-viewer/core/lib/styles/index.css";
 import "@react-pdf-viewer/default-layout/lib/styles/index.css";
 import "@react-pdf-viewer/page-navigation/lib/styles/index.css";
-import { Button, Space, Tabs, Tooltip, Typography } from "antd";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
 import "./DocumentManager.css";
 
-import { base64toBlob, docIndexStatus } from "../../../helpers/GetStaticData";
+import {
+  base64toBlobWithMime,
+  docIndexStatus,
+} from "../../../helpers/GetStaticData";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
+import usePostHogEvents from "../../../hooks/usePostHogEvents";
 import { useCustomToolStore } from "../../../store/custom-tool-store";
 import { useSessionStore } from "../../../store/session-store";
 import { DocumentViewer } from "../document-viewer/DocumentViewer";
 import { ManageDocsModal } from "../manage-docs-modal/ManageDocsModal";
 import { PdfViewer } from "../pdf-viewer/PdfViewer";
+import { TextViewer } from "../text-viewer/TextViewer";
 import { TextViewerPre } from "../text-viewer-pre/TextViewerPre";
-import usePostHogEvents from "../../../hooks/usePostHogEvents";
 
-const items = [
+let items = [
   {
     key: "1",
-    label: "Doc View",
+    label: "PDF View",
   },
   {
     key: "2",
@@ -33,12 +43,13 @@ const viewTypes = {
   extract: "EXTRACT",
 };
 
+// Import components for the summarize feature
 let SummarizeView = null;
 try {
-  SummarizeView =
-    require("../../../plugins/summarize-view/SummarizeView").SummarizeView;
-  const tabLabel =
-    require("../../../plugins/summarize-tab/SummarizeTab").tabLabel;
+  const svMod = await import("../../../plugins/summarize-view/SummarizeView");
+  SummarizeView = svMod.SummarizeView;
+  const stMod = await import("../../../plugins/summarize-tab/SummarizeTab");
+  const tabLabel = stMod.tabLabel;
   if (tabLabel) {
     items.push({
       key: "3",
@@ -49,6 +60,25 @@ try {
   // The component will remain null of it is not available
 }
 
+// Import component for the simple prompt studio feature
+let getDocumentsSps;
+try {
+  const mod = await import(
+    "../../../plugins/simple-prompt-studio/simple-prompt-studio-api-service"
+  );
+  getDocumentsSps = mod.getDocumentsSps;
+} catch {
+  // The component will remain null of it is not available
+}
+let publicDocumentApi;
+try {
+  const mod = await import(
+    "../../../plugins/prompt-studio-public-share/helpers/PublicShareAPIs"
+  );
+  publicDocumentApi = mod.publicDocumentApi;
+} catch {
+  // The component will remain null of it is not available
+}
 function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
   const [openManageDocsModal, setOpenManageDocsModal] = useState(false);
   const [page, setPage] = useState(1);
@@ -60,19 +90,72 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
   const [isDocLoading, setIsDocLoading] = useState(false);
   const [isExtractLoading, setIsExtractLoading] = useState(false);
   const [currDocIndexStatus, setCurrDocIndexStatus] = useState(
-    docIndexStatus.yet_to_start
+    docIndexStatus.yet_to_start,
   );
+  const [hasMounted, setHasMounted] = useState(false);
   const {
     selectedDoc,
     listOfDocs,
-    disableLlmOrDocChange,
+    isMultiPassExtractLoading,
     details,
     indexDocs,
     isSinglePassExtractLoading,
+    isSimplePromptStudio,
+    isPublicSource,
+    refreshRawView,
+    selectedHighlight,
   } = useCustomToolStore();
   const { sessionDetails } = useSessionStore();
   const axiosPrivate = useAxiosPrivate();
   const { setPostHogCustomEvent } = usePostHogEvents();
+  const { id } = useParams();
+  const highlightData = selectedHighlight?.highlight || [];
+
+  const [blobFileUrl, setBlobFileUrl] = useState("");
+  const [fileData, setFileData] = useState({});
+
+  useEffect(() => {
+    // Convert blob URL to an object URL
+    if (fileData.blob) {
+      const objectUrl = URL.createObjectURL(fileData.blob);
+      setBlobFileUrl(objectUrl);
+
+      // Clean up the URL after component unmount
+      return () => URL.revokeObjectURL(objectUrl);
+    }
+  }, [fileData]);
+
+  useEffect(() => {
+    if (isSimplePromptStudio) {
+      items = [
+        {
+          key: "1",
+          label: (
+            <Tooltip title="PDF View">
+              <FileText />
+            </Tooltip>
+          ),
+        },
+        {
+          key: "2",
+          label: (
+            <Tooltip title="Raw View">
+              <FileText />
+            </Tooltip>
+          ),
+        },
+      ];
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasMounted) {
+      setHasMounted(true);
+      return;
+    }
+    setExtractTxt("");
+    handleFetchContent(viewTypes.extract);
+  }, [refreshRawView]);
 
   useEffect(() => {
     setFileUrl("");
@@ -92,7 +175,7 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
   useEffect(() => {
     if (docIndexStatus.yet_to_start === currDocIndexStatus) {
       const isIndexing = indexDocs.find(
-        (item) => item === selectedDoc?.document_id
+        (item) => item === selectedDoc?.document_id,
       );
 
       if (isIndexing) {
@@ -103,7 +186,7 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
 
     if (docIndexStatus.indexing === currDocIndexStatus) {
       const isIndexing = indexDocs.find(
-        (item) => item === selectedDoc?.document_id
+        (item) => item === selectedDoc?.document_id,
       );
 
       if (!isIndexing) {
@@ -127,34 +210,80 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
       return;
     }
 
-    const requestOptions = {
-      method: "GET",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/file/${details?.tool_id}?document_id=${selectedDoc?.document_id}&view_type=${viewType}`,
-    };
+    if (isSimplePromptStudio && getDocumentsSps) {
+      handleGetDocumentsReq(getDocumentsSps, viewType);
+    } else {
+      handleGetDocumentsReq(getDocuments, viewType);
+    }
+  };
 
-    handleLoadingStateUpdate(viewType, true);
-    axiosPrivate(requestOptions)
+  const handleGetDocumentsReq = (getDocsFunc, viewType) => {
+    getDocsFunc(details?.tool_id, selectedDoc?.document_id, viewType)
       .then((res) => {
-        const data = res?.data?.data;
-        if (viewType === viewTypes.original) {
-          const base64String = data || "";
-          const blob = base64toBlob(base64String);
-          setFileUrl(URL.createObjectURL(blob));
-          return;
-        }
-
-        if (viewType === viewTypes?.extract) {
-          setExtractTxt(data);
-        }
+        const data = res?.data || "";
+        const mimeType = res?.data?.mime_type || "";
+        processGetDocsResponse(data, viewType, mimeType);
       })
       .catch((err) => {
-        if (err?.response?.status === 404) {
-          setErrorMessage(viewType);
-        }
+        handleGetDocsError(err, viewType);
       })
       .finally(() => {
         handleLoadingStateUpdate(viewType, false);
       });
+  };
+
+  const getDocuments = async (toolId, docId, viewType) => {
+    let url = `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/file/${toolId}?document_id=${docId}&view_type=${viewType}`;
+    if (isPublicSource) {
+      url = publicDocumentApi(id, docId, viewType);
+    }
+
+    const requestOptions = {
+      url,
+      method: "GET",
+    };
+    return axiosPrivate(requestOptions)
+      .then((res) => res)
+      .catch((err) => {
+        throw err;
+      });
+  };
+
+  const processGetDocsResponse = (data, viewType, mimeType) => {
+    if (viewType === viewTypes.original) {
+      if (mimeType === "application/pdf") {
+        // Existing flow: base64 → blob → PdfViewer
+        const base64String = data || "";
+        const blob = base64toBlobWithMime(base64String, mimeType);
+        setFileData({ blob, mimeType });
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onload = () => {
+          setFileUrl(reader.result);
+        };
+        reader.onerror = () => {
+          setFileErrMsg("Failed to load the file");
+        };
+      } else {
+        // Non-PDF file (CSV, TXT, Excel, or non-convertible)
+        // data is text, not base64
+        setFileUrl("");
+        setFileData({ blob: null, mimeType });
+        // Auto-switch to Raw View for non-PDF files
+        setActiveKey("2");
+      }
+    } else if (viewType === viewTypes.extract) {
+      setExtractTxt(data?.data);
+    }
+  };
+
+  const handleGetDocsError = (err, viewType) => {
+    if (viewType === viewTypes.original) {
+      setFileData({});
+    }
+    if (err?.response?.status === 404) {
+      setErrorMessage(viewType);
+    }
   };
 
   const handleLoadingStateUpdate = (viewType, value) => {
@@ -182,7 +311,7 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
           info: "Clicked on the 'Summary View' tab",
         });
       }
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
@@ -194,14 +323,14 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
 
     if (viewType === viewTypes.extract) {
       setExtractErrMsg(
-        "Raw content is not available. Please index or re-index to generate it."
+        "Raw content is not available. Please index or re-index to generate it.",
       );
     }
   };
 
   useEffect(() => {
     const index = [...listOfDocs].findIndex(
-      (item) => item?.document_id === selectedDoc?.document_id
+      (item) => item?.document_id === selectedDoc?.document_id,
     );
     setPage(index + 1);
   }, [selectedDoc, listOfDocs]);
@@ -232,6 +361,22 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
     }
   };
 
+  const renderDoc = (docName, fileUrl, highlightData) => {
+    // Use mimeType from response for rendering decisions
+    if (fileData.mimeType === "application/pdf") {
+      return <PdfViewer fileUrl={fileUrl} highlightData={highlightData} />;
+    }
+    // Non-PDF: show placeholder message
+    return (
+      <div className="text-viewer-layout">
+        <Typography.Text type="secondary">
+          Document preview is not available for this file type. Please index the
+          document and switch to Raw View.
+        </Typography.Text>
+      </div>
+    );
+  };
+
   return (
     <div className="doc-manager-layout">
       <div className="doc-manager-header">
@@ -240,67 +385,118 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
             activeKey={activeKey}
             items={items}
             onChange={handleActiveKeyChange}
+            data-testid="doc-manager-tabs"
+            moreIcon={<></>}
           />
         </div>
-        <Space>
-          <div className="doc-main-title-div">
-            {selectedDoc ? (
-              <Tooltip title={selectedDoc?.document_name}>
-                <Typography.Text className="doc-main-title" ellipsis>
-                  {selectedDoc?.document_name}
-                </Typography.Text>
+        {!isSimplePromptStudio && (
+          <Space>
+            {details?.enable_highlight && (
+              <div>
+                <Tag color="rgb(45, 183, 245)">
+                  Confidence Score: {(() => {
+                    const { confidence } = selectedHighlight || {};
+                    // Handle new format: confidence is a number (average)
+                    if (typeof confidence === "number") {
+                      return confidence.toFixed(2);
+                    }
+                    // Handle word confidence format: object with line numbers as keys
+                    if (
+                      confidence &&
+                      typeof confidence === "object" &&
+                      !Array.isArray(confidence)
+                    ) {
+                      const values = Object.values(confidence);
+                      if (
+                        values.length > 0 &&
+                        values.every((v) => typeof v === "number")
+                      ) {
+                        const avg =
+                          values.reduce((sum, val) => sum + val, 0) /
+                          values.length;
+                        return avg.toFixed(2);
+                      }
+                    }
+                    // Handle old format: nested array structure
+                    if (confidence?.[0]?.[0]?.confidence) {
+                      return confidence[0][0].confidence;
+                    }
+                    // Handle old format: empty array means confidence = 1
+                    if (
+                      Array.isArray(confidence?.[0]) &&
+                      confidence[0].length === 0
+                    ) {
+                      return "1";
+                    }
+                    return "NA";
+                  })()}
+                </Tag>
+              </div>
+            )}
+            <div className="doc-main-title-div">
+              {selectedDoc ? (
+                <Tooltip title={selectedDoc?.document_name}>
+                  <Typography.Text className="doc-main-title" ellipsis>
+                    {selectedDoc?.document_name}
+                  </Typography.Text>
+                </Tooltip>
+              ) : null}
+            </div>
+            <div>
+              <Tooltip title="Manage Document Variants">
+                <Button
+                  className="doc-manager-btn"
+                  onClick={() => setOpenManageDocsModal(true)}
+                >
+                  <Typography.Text ellipsis>Manage Documents</Typography.Text>
+                </Button>
               </Tooltip>
-            ) : null}
-          </div>
-          <div>
-            <Tooltip title="Manage Documents">
+            </div>
+            <div>
               <Button
-                className="doc-manager-btn"
-                onClick={() => setOpenManageDocsModal(true)}
+                type="text"
+                size="small"
+                disabled={
+                  !selectedDoc ||
+                  isMultiPassExtractLoading ||
+                  isSinglePassExtractLoading ||
+                  page <= 1
+                }
+                data-testid="doc-manager-prev-doc-btn"
+                onClick={handlePageLeft}
               >
-                <Typography.Text ellipsis>{"Manage Documents"}</Typography.Text>
+                <ChevronLeft className="doc-manager-paginate-icon" />
               </Button>
-            </Tooltip>
-          </div>
-          <div>
-            <Button
-              type="text"
-              size="small"
-              disabled={
-                !selectedDoc ||
-                disableLlmOrDocChange?.length > 0 ||
-                isSinglePassExtractLoading ||
-                page <= 1
-              }
-              onClick={handlePageLeft}
-            >
-              <LeftOutlined className="doc-manager-paginate-icon" />
-            </Button>
-            <Button
-              type="text"
-              size="small"
-              disabled={
-                !selectedDoc ||
-                disableLlmOrDocChange?.length > 0 ||
-                isSinglePassExtractLoading ||
-                page >= listOfDocs?.length
-              }
-              onClick={handlePageRight}
-            >
-              <RightOutlined className="doc-manager-paginate-icon" />
-            </Button>
-          </div>
-        </Space>
+              <Button
+                type="text"
+                size="small"
+                disabled={
+                  !selectedDoc ||
+                  isMultiPassExtractLoading ||
+                  isSinglePassExtractLoading ||
+                  page >= listOfDocs?.length
+                }
+                data-testid="doc-manager-next-doc-btn"
+                onClick={handlePageRight}
+              >
+                <ChevronRight className="doc-manager-paginate-icon" />
+              </Button>
+            </div>
+          </Space>
+        )}
       </div>
       {activeKey === "1" && (
         <DocumentViewer
           doc={selectedDoc?.document_name}
           isLoading={isDocLoading}
-          isContentAvailable={fileUrl?.length > 0}
+          isContentAvailable={
+            fileUrl?.length > 0 ||
+            (fileData.mimeType && fileData.mimeType !== "application/pdf")
+          }
           setOpenManageDocsModal={setOpenManageDocsModal}
           errMsg={fileErrMsg}
         >
-          <PdfViewer fileUrl={fileUrl} />
+          {renderDoc(selectedDoc?.document_name, blobFileUrl, highlightData)}
         </DocumentViewer>
       )}
       {activeKey === "2" && (
@@ -314,7 +510,7 @@ function DocumentManager({ generateIndex, handleUpdateTool, handleDocChange }) {
           <TextViewerPre text={extractTxt} />
         </DocumentViewer>
       )}
-      {SummarizeView && activeKey === "3" && (
+      {SummarizeView && !isSimplePromptStudio && activeKey === "3" && (
         <SummarizeView
           setOpenManageDocsModal={setOpenManageDocsModal}
           currDocIndexStatus={currDocIndexStatus}

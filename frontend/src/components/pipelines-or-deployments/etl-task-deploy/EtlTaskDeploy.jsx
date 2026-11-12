@@ -1,19 +1,28 @@
-import { Form, Input, Modal, Select, Space, Typography, Button } from "antd";
+import cronstrue from "cronstrue";
+import { CalendarClock, Clock } from "lucide-react";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
-import { ScheduleOutlined, ClockCircleOutlined } from "@ant-design/icons";
-import cronstrue from "cronstrue";
-
+import { Button } from "@/components/ui/shims/antd-button";
+import { Form } from "@/components/ui/shims/antd-form";
+import { Input, Select } from "@/components/ui/shims/antd-inputs";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Modal } from "@/components/ui/shims/antd-overlays";
+import { Typography } from "@/components/ui/shims/antd-typography";
+import { canEditResource } from "../../../helpers/resourceAccess.js";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate.js";
 import { useAlertStore } from "../../../store/alert-store";
+import { usePromptStudioStore } from "../../../store/prompt-studio-store";
 import { useSessionStore } from "../../../store/session-store";
 import CronGenerator from "../../cron-generator/CronGenerator.jsx";
 import { workflowService } from "../../workflows/workflow/workflow-service.js";
 import "./EtlTaskDeploy.css";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
-import { useWorkflowStore } from "../../../store/workflow-store.js";
 import { getBackendErrorDetail } from "../../../helpers/GetStaticData.js";
+import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
 import usePostHogEvents from "../../../hooks/usePostHogEvents.js";
+import { useInitialFetchCount } from "../../../hooks/usePromptStudioFetchCount";
+import { useWorkflowStore } from "../../../store/workflow-store.js";
+import { usePromptStudioService } from "../../api/prompt-studio-service";
+import { PromptStudioModal } from "../../common/PromptStudioModal";
 
 const defaultFromDetails = {
   pipeline_name: "",
@@ -31,6 +40,7 @@ const EtlTaskDeploy = ({
   isEdit,
   selectedRow = {},
   setDeploymentName,
+  onDeploymentCreated,
 }) => {
   const [form] = Form.useForm();
   const workflowStore = useWorkflowStore();
@@ -44,7 +54,7 @@ const EtlTaskDeploy = ({
   const { Option } = Select;
   const [workflowList, setWorkflowList] = useState([]);
   const [formDetails, setFormDetails] = useState(
-    isEdit ? { ...selectedRow } : { ...defaultFromDetails }
+    isEdit ? { ...selectedRow } : { ...defaultFromDetails },
   );
   const [isLoading, setLoading] = useState(false);
   const [openCronGenerator, setOpenCronGenerator] = useState(false);
@@ -52,6 +62,15 @@ const EtlTaskDeploy = ({
   const [summary, setSummary] = useState(null);
   const { posthogDeploymentEventText, setPostHogCustomEvent } =
     usePostHogEvents();
+
+  const { count, isLoadingModal, fetchCount } = usePromptStudioStore();
+  const [showModal, setShowModal] = useState(false);
+  const [modalDismissed, setModalDismissed] = useState(false);
+  const { getPromptStudioCount } = usePromptStudioService();
+  const initialFetchComplete = useInitialFetchCount(
+    fetchCount,
+    getPromptStudioCount,
+  );
 
   useEffect(() => {
     if (workflowId) {
@@ -68,8 +87,12 @@ const EtlTaskDeploy = ({
   const getWorkflowList = () => {
     workflowApiService
       .getWorkflowList()
-      .then((res) => {
-        setWorkflowList(res?.data);
+      .then((workflows) => {
+        // Deploying is an owner act, and the serializer refuses the rest.
+        // Offering them anyway produces an unexplained rejection on save.
+        setWorkflowList(
+          workflows?.filter((wf) => canEditResource(wf, sessionDetails)) || [],
+        );
       })
       .catch(() => {
         console.error("Unable to get workflow list");
@@ -88,37 +111,52 @@ const EtlTaskDeploy = ({
     setBackendErrors((prevErrors) => {
       if (prevErrors) {
         const updatedErrors = prevErrors.errors.filter(
-          (error) => error.attr !== changedFieldName
+          (error) => error.attr !== changedFieldName,
         );
         return { ...prevErrors, errors: updatedErrors };
       }
       return null;
     });
   };
-
-  const getWorkflows = () => {
-    const connectorType = type === "task" ? "FILESYSTEM" : "DATABASE";
+  const fetchWorkflows = (type) =>
     workflowApiService
-      .getWorkflowEndpointList("DESTINATION", connectorType)
-      .then((res) => {
-        const updatedData = res?.data.map((record) => ({
+      .getWorkflowEndpointList("DESTINATION", type)
+      .then((res) =>
+        res?.data.map((record) => ({
           ...record,
           id: record.workflow,
-        }));
-        setWorkflowList(updatedData);
-      })
+        })),
+      )
       .catch(() => {
-        console.error("Unable to get workflow list");
+        return [];
       });
+  const getWorkflows = () => {
+    const connectorType = type === "task" ? "FILESYSTEM" : "DATABASE";
+    setWorkflowList([]);
+    fetchWorkflows(connectorType).then((data) => {
+      if (connectorType === "DATABASE") {
+        fetchWorkflows("MANUALREVIEW").then((manualReviewData) => {
+          const combinedData = [...data, ...manualReviewData];
+          setWorkflowList(combinedData);
+        });
+      } else {
+        setWorkflowList(data);
+      }
+    });
   };
 
   useEffect(() => {
-    if (type === "app") {
-      getWorkflowList();
-    } else {
-      getWorkflows();
+    // Only fetch workflow list when workflowId is not provided
+    // If workflowId exists, the workflow dropdown is hidden and list fetching is unnecessary
+    if (!workflowId) {
+      if (type === "app") {
+        getWorkflowList();
+      } else {
+        getWorkflows();
+      }
     }
-  }, [type]);
+    fetchCount();
+  }, [type, fetchCount, workflowId]);
 
   const clearFormDetails = () => {
     setFormDetails({ ...defaultFromDetails });
@@ -145,6 +183,18 @@ const EtlTaskDeploy = ({
     });
   };
 
+  const updatePipelineTable = (pipeline) => {
+    setTableData((prev) => {
+      const index = prev.findIndex((item) => item?.id === pipeline?.id);
+      if (index !== -1) {
+        const newData = [...prev];
+        newData[index] = { ...newData[index], ...pipeline };
+        return newData;
+      }
+      return prev;
+    });
+  };
+
   const updatePipeline = () => {
     const body = formDetails;
     body["pipeline_type"] = type.toUpperCase();
@@ -161,13 +211,9 @@ const EtlTaskDeploy = ({
     setLoading(true);
     axiosPrivate(requestOptions)
       .then((res) => {
-        addPipeline(res?.data);
+        updatePipelineTable(res?.data);
         setOpen(false);
         clearFormDetails();
-        setAlertDetails({
-          type: "success",
-          content: "Pipeline Updated Successfully",
-        });
       })
       .catch((err) => {
         setAlertDetails(handleException(err, "", setBackendErrors));
@@ -178,18 +224,12 @@ const EtlTaskDeploy = ({
   };
 
   const createPipeline = () => {
-    try {
-      const wf = workflowList.find(
-        (item) => item?.id === formDetails?.workflow
-      );
-      setPostHogCustomEvent(posthogDeploymentEventText[`${type}_success`], {
-        info: "Clicked on 'Save and Deploy' button",
-        deployment_name: formDetails?.pipeline_name,
-        workflow_name: wf?.workflow_name,
-      });
-    } catch (err) {
-      // If an error occurs while setting custom posthog event, ignore it and continue
-    }
+    const wf = workflowList.find((item) => item?.id === formDetails?.workflow);
+    setPostHogCustomEvent(posthogDeploymentEventText[`${type}_success`], {
+      info: "Clicked on 'Save and Deploy' button",
+      deployment_name: formDetails?.pipeline_name,
+      workflow_name: wf?.workflow_name,
+    });
 
     const body = formDetails;
     body["pipeline_type"] = type.toUpperCase();
@@ -211,6 +251,11 @@ const EtlTaskDeploy = ({
           // Update - can update workflow endpoint status in store
           updateWorkflow({ allowChangeEndpoint: false });
           setDeploymentName(body.pipeline_name);
+
+          // Call the callback to refresh deployment info
+          if (onDeploymentCreated) {
+            onDeploymentCreated();
+          }
         } else {
           addPipeline(res?.data);
         }
@@ -229,8 +274,25 @@ const EtlTaskDeploy = ({
       });
   };
 
+  useEffect(() => {
+    if (
+      initialFetchComplete &&
+      !isLoadingModal &&
+      count === 0 &&
+      !modalDismissed
+    ) {
+      setShowModal(true);
+    }
+  }, [initialFetchComplete, isLoadingModal, count, modalDismissed]);
+
+  const handleModalClose = () => {
+    setShowModal(false);
+    setModalDismissed(true);
+  };
+
   return (
     <>
+      {showModal && <PromptStudioModal onClose={handleModalClose} />}
       <Modal
         title={isEdit ? `Update ${title}` : `Add ${title}`}
         centered
@@ -276,7 +338,7 @@ const EtlTaskDeploy = ({
               }
               help={getBackendErrorDetail("workflow", backendErrors)}
             >
-              <Select>
+              <Select showSearch>
                 {workflowList.map((workflow) => {
                   return (
                     <Option value={workflow.id} key={workflow.workflow_name}>
@@ -290,12 +352,6 @@ const EtlTaskDeploy = ({
           <Form.Item
             label="Cron Schedule"
             name="cron_string"
-            rules={[
-              {
-                required: true,
-                message: "Please add cron schedule",
-              },
-            ]}
             validateStatus={
               getBackendErrorDetail("cron_string", backendErrors) ? "error" : ""
             }
@@ -304,21 +360,20 @@ const EtlTaskDeploy = ({
             <div className="cron-string-div">
               <Input
                 readOnly={true}
-                disabled={true}
                 value={formDetails?.cron_string}
                 className="cron-string-input"
               />
               <Button
                 type="primary"
                 onClick={showCronGenerator}
-                icon={<ScheduleOutlined />}
+                icon={<CalendarClock />}
                 className="cron-string-btn"
               />
             </div>
           </Form.Item>
           <Space>
             <div className="cron-summary-div">
-              <ClockCircleOutlined />
+              <Clock />
             </div>
             <div>
               <Typography.Text className="summary-text">
@@ -349,6 +404,7 @@ EtlTaskDeploy.propTypes = {
   isEdit: PropTypes.bool,
   selectedRow: PropTypes.object,
   setDeploymentName: PropTypes.func,
+  onDeploymentCreated: PropTypes.func,
 };
 
 export { EtlTaskDeploy };

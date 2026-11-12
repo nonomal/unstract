@@ -1,0 +1,1722 @@
+"""Integration tests for the structure tool Celery task.
+
+Tests the full structure tool pipeline with mocked platform API and
+ExecutionDispatcher. After Phase 5E, the structure tool task dispatches a
+single ``structure_pipeline`` operation to the executor worker instead of
+3 sequential dispatches.  These tests verify the correct pipeline params
+are assembled and the result is written to filesystem.
+"""
+
+from unittest.mock import MagicMock, create_autospec, patch
+
+# create_autospec, NOT MagicMock(spec=...): only autospec enforces the method
+# SIGNATURE. A bare MagicMock accepts any keyword, which is how a `headers=`
+# argument the real dispatcher does not take (UN-4046) reached production and
+# made every extraction raise TypeError while this suite stayed green.
+# `spec=` alone does not close that hole — it restricts attribute names only,
+# and was verified to still accept `headers=`.
+from unstract.workflow_execution.executor_rpc import PgExecutionDispatcher
+
+import pytest
+from shared.enums.task_enums import TaskName
+from unstract.sdk1.execution.result import ExecutionResult
+
+# ---------------------------------------------------------------------------
+# Patch targets
+# ---------------------------------------------------------------------------
+
+_PATCH_DISPATCHER = "file_processing.structure_tool_task.get_executor_dispatcher"
+_PATCH_PLATFORM_HELPER = "file_processing.structure_tool_task._create_platform_helper"
+_PATCH_FILE_STORAGE = "file_processing.structure_tool_task._get_file_storage"
+_PATCH_SHIM = "executor.executor_tool_shim.ExecutorToolShim"
+_PATCH_IMAGE_MODE = "executor.executors.vlm_image_answer._resolve_image_mode_config"
+_PATCH_SERVICE_IS_STRUCTURE = (
+    "shared.workflow.execution.service."
+    "WorkerWorkflowExecutionService._is_structure_tool_workflow"
+)
+_PATCH_SERVICE_EXECUTE_STRUCTURE = (
+    "shared.workflow.execution.service."
+    "WorkerWorkflowExecutionService._execute_structure_tool_workflow"
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_fs():
+    """Create a mock file storage."""
+    fs = MagicMock(name="file_storage")
+    fs.exists.return_value = False
+    fs.read.return_value = ""
+    fs.json_dump.return_value = None
+    fs.write.return_value = None
+    fs.get_hash_from_file.return_value = "abc123hash"
+    return fs
+
+
+@pytest.fixture
+def mock_dispatcher():
+    """Create a mock ExecutionDispatcher that returns success results."""
+    dispatcher = MagicMock(name="ExecutionDispatcher")
+    return dispatcher
+
+
+@pytest.fixture
+def mock_platform_helper():
+    """Create a mock PlatformHelper."""
+    helper = MagicMock(name="PlatformHelper")
+    return helper
+
+
+@pytest.fixture
+def tool_metadata_regular():
+    """Standard prompt studio tool metadata."""
+    return {
+        "name": "Test Project",
+        "is_agentic": False,
+        "tool_id": "tool-123",
+        "tool_settings": {
+            "vector-db": "vdb-1",
+            "embedding": "emb-1",
+            "x2text_adapter": "x2t-1",
+            "llm": "llm-1",
+        },
+        "outputs": [
+            {
+                "name": "field_a",
+                "prompt": "What is the revenue?",
+                "type": "text",
+                "active": True,
+                "chunk-size": 512,
+                "chunk-overlap": 128,
+                "retrieval-strategy": "simple",
+                "llm": "llm-1",
+                "embedding": "emb-1",
+                "vector-db": "vdb-1",
+                "x2text_adapter": "x2t-1",
+                "similarity-top-k": 5,
+            },
+        ],
+    }
+
+
+@pytest.fixture
+def base_params():
+    """Base params dict for execute_structure_tool."""
+    return {
+        "organization_id": "org-test",
+        "workflow_id": "wf-123",
+        "execution_id": "exec-456",
+        "file_execution_id": "fexec-789",
+        "tool_instance_metadata": {
+            "prompt_registry_id": "preg-001",
+        },
+        "platform_service_api_key": "sk-test-key",
+        "input_file_path": "/data/test.pdf",
+        "output_dir_path": "/output",
+        "source_file_name": "test.pdf",
+        "execution_data_dir": "/data/exec",
+        "messaging_channel": "channel-1",
+        "file_hash": "filehash123",
+        "exec_metadata": {"tags": ["tag1"]},
+    }
+
+
+def _make_pipeline_result(
+    output: dict | None = None,
+    metadata: dict | None = None,
+    metrics: dict | None = None,
+) -> ExecutionResult:
+    """Create a mock structure_pipeline result."""
+    return ExecutionResult(
+        success=True,
+        data={
+            "output": output or {},
+            "metadata": metadata or {},
+            "metrics": metrics or {},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestTaskEnumRegistered:
+    """3-SANITY: Verify TaskName enum exists."""
+
+    def test_task_enum_registered(self):
+        assert hasattr(TaskName, "EXECUTE_STRUCTURE_TOOL")
+        assert str(TaskName.EXECUTE_STRUCTURE_TOOL) == "execute_structure_tool"
+
+
+class TestStructureToolPipeline:
+    """Full pipeline dispatched as single structure_pipeline operation."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_single_dispatch(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """Single structure_pipeline dispatch for extract+index+answer."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+
+        pipeline_result = _make_pipeline_result(
+            output={"field_a": "$1M"},
+            metadata={"run_id": "fexec-789", "file_name": "test.pdf"},
+            metrics={"field_a": {"extraction_llm": {"tokens": 50}}},
+        )
+        dispatcher_instance.dispatch.return_value = pipeline_result
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        assert result["data"]["output"]["field_a"] == "$1M"
+        assert result["data"]["metadata"]["file_name"] == "test.pdf"
+        # json_dump called 3 times: output file + INFILE overwrite + COPY_TO_FOLDER
+        assert mock_fs.json_dump.call_count == 3
+
+        # Single dispatch with structure_pipeline
+        assert dispatcher_instance.dispatch.call_count == 1
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        assert ctx.operation == "structure_pipeline"
+        assert ctx.execution_source == "tool"
+        assert ctx.executor_name == "legacy"
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_pipeline_params_structure(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """Verify executor_params contains all pipeline sub-params."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result()
+
+        execute_structure_tool(base_params)
+
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        ep = ctx.executor_params
+
+        # All required keys present
+        assert "extract_params" in ep
+        assert "index_template" in ep
+        assert "answer_params" in ep
+        assert "pipeline_options" in ep
+
+        # Extract params
+        assert ep["extract_params"]["file_path"] == "/data/test.pdf"
+
+        # Index template
+        assert ep["index_template"]["tool_id"] == "tool-123"
+        assert ep["index_template"]["file_hash"] == "filehash123"
+
+        # Answer params
+        assert ep["answer_params"]["tool_id"] == "tool-123"
+        assert ep["answer_params"]["run_id"] == "fexec-789"
+
+        # Pipeline options (normal flow)
+        opts = ep["pipeline_options"]
+        assert opts["skip_extraction_and_indexing"] is False
+        assert opts["is_summarization_enabled"] is False
+        assert opts["is_single_pass_enabled"] is False
+        assert opts["source_file_name"] == "test.pdf"
+
+
+class TestStructureToolSinglePass:
+    """Single-pass flag passed to pipeline_options."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_single_pass(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        base_params["tool_instance_metadata"]["single_pass_extraction_mode"] = True
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "answer"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        # Single dispatch with is_single_pass_enabled flag
+        assert dispatcher_instance.dispatch.call_count == 1
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        assert ctx.operation == "structure_pipeline"
+        opts = ctx.executor_params["pipeline_options"]
+        assert opts["is_single_pass_enabled"] is True
+
+
+class TestStructureToolSummarize:
+    """Summarization params passed to pipeline."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_summarize_flow(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        tool_metadata_regular["tool_settings"]["summarize_prompt"] = "Summarize this doc"
+        base_params["tool_instance_metadata"]["summarize_as_source"] = True
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "answer"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        assert dispatcher_instance.dispatch.call_count == 1
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        assert ctx.operation == "structure_pipeline"
+
+        opts = ctx.executor_params["pipeline_options"]
+        assert opts["is_summarization_enabled"] is True
+
+        # Summarize params included
+        sp = ctx.executor_params["summarize_params"]
+        assert sp is not None
+        assert sp["summarize_prompt"] == "Summarize this doc"
+        assert sp["llm_adapter_instance_id"] == "llm-1"
+        assert "extract_file_path" in sp
+        assert "summarize_file_path" in sp
+
+
+class TestStructureToolSmartTable:
+    """Excel with valid JSON schema sets skip_extraction_and_indexing."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_skip_extraction_smart_table(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        tool_metadata_regular["outputs"][0]["table_settings"] = {
+            "is_directory_mode": False,
+        }
+        tool_metadata_regular["outputs"][0]["prompt"] = '{"key": "value"}'
+
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "table_answer"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        # Single pipeline dispatch with skip flag
+        assert dispatcher_instance.dispatch.call_count == 1
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        assert ctx.operation == "structure_pipeline"
+        opts = ctx.executor_params["pipeline_options"]
+        assert opts["skip_extraction_and_indexing"] is True
+
+
+class TestStructureToolAgentic:
+    """Agentic project routes to AgenticPromptStudioExecutor."""
+
+    @patch("unstract.sdk1.x2txt.X2Text")
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_agentic_routing(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        mock_x2text_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        # Prompt studio lookup fails, agentic succeeds
+        mock_platform_helper.get_prompt_studio_tool.return_value = None
+
+        agentic_metadata = {
+            "name": "Agentic Project",
+            "project_id": "ap-001",
+            "json_schema": {"field": "string"},
+        }
+        mock_platform_helper.get_agentic_studio_tool.return_value = {
+            "tool_metadata": agentic_metadata,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+
+        # Mock X2Text extraction
+        mock_x2text_instance = MagicMock()
+        mock_x2text_instance.process.return_value = MagicMock(
+            extracted_text="extracted text"
+        )
+        mock_x2text_cls.return_value = mock_x2text_instance
+
+        # Simulate successful agentic extraction
+        agentic_result = ExecutionResult(
+            success=True,
+            data={"output": {"field": "value"}},
+        )
+        dispatcher_instance.dispatch.return_value = agentic_result
+
+        execute_structure_tool(base_params)
+
+        # Should dispatch to agentic executor with agentic_extract operation
+        calls = dispatcher_instance.dispatch.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0].executor_name == "agentic"
+        assert calls[0][0][0].operation == "agentic_extract"
+
+
+class TestStructureToolProfileOverrides:
+    """Profile overrides modify tool_metadata before pipeline dispatch."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_profile_overrides(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        base_params["exec_metadata"]["llm_profile_id"] = "profile-1"
+        mock_platform_helper.get_llm_profile.return_value = {
+            "profile_name": "Test Profile",
+            "llm_id": "llm-override",
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "answer"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        mock_platform_helper.get_llm_profile.assert_called_once_with("profile-1")
+        assert tool_metadata_regular["tool_settings"]["llm"] == "llm-override"
+
+
+class TestStructureToolPipelineFailure:
+    """Pipeline failure propagated to caller."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_pipeline_failure(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+
+        pipeline_failure = ExecutionResult.failure(
+            error="X2Text adapter error: connection refused"
+        )
+        dispatcher_instance.dispatch.return_value = pipeline_failure
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is False
+        assert "X2Text" in result["error"]
+        assert dispatcher_instance.dispatch.call_count == 1
+
+
+class TestStructureToolMultipleOutputs:
+    """Multiple outputs are passed to executor in answer_params."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_multiple_outputs(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        # Add a second output with same chunking params
+        second_output = dict(tool_metadata_regular["outputs"][0])
+        second_output["name"] = "field_b"
+        tool_metadata_regular["outputs"].append(second_output)
+
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "a", "field_b": "b"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        # Single dispatch — index dedup handled inside executor
+        assert dispatcher_instance.dispatch.call_count == 1
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        outputs = ctx.executor_params["answer_params"]["outputs"]
+        assert len(outputs) == 2
+        assert outputs[0]["name"] == "field_a"
+        assert outputs[1]["name"] == "field_b"
+
+
+class TestStructureToolOutputWritten:
+    """Output JSON written to correct path with correct structure."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_output_written(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "answer"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+
+        # json_dump called 3 times: output file, INFILE overwrite, COPY_TO_FOLDER
+        assert mock_fs.json_dump.call_count == 3
+
+        # First call: output file (execution_dir/{stem}.json)
+        first_call = mock_fs.json_dump.call_args_list[0]
+        first_path = first_call.kwargs.get(
+            "path", first_call[1].get("path") if len(first_call) > 1 else None
+        )
+        if first_path is None:
+            first_path = first_call[0][0] if first_call[0] else None
+        assert str(first_path).endswith("test.json")
+
+        # Second call: INFILE overwrite (so destination connector reads JSON, not PDF)
+        second_call = mock_fs.json_dump.call_args_list[1]
+        second_path = second_call.kwargs.get(
+            "path", second_call[1].get("path") if len(second_call) > 1 else None
+        )
+        if second_path is None:
+            second_path = second_call[0][0] if second_call[0] else None
+        assert str(second_path) == base_params["input_file_path"]
+
+        # Third call: COPY_TO_FOLDER/{stem}.json (for FS destinations)
+        third_call = mock_fs.json_dump.call_args_list[2]
+        third_path = third_call.kwargs.get(
+            "path", third_call[1].get("path") if len(third_call) > 1 else None
+        )
+        if third_path is None:
+            third_path = third_call[0][0] if third_call[0] else None
+        assert "COPY_TO_FOLDER" in str(third_path)
+        assert str(third_path).endswith("test.json")
+
+
+class TestStructureToolMetadataFileName:
+    """metadata.file_name in pipeline result preserved."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_structure_tool_metadata_file_name(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result(
+            output={"field_a": "answer"},
+            metadata={"run_id": "123", "file_name": "test.pdf"},
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        assert result["data"]["metadata"]["file_name"] == "test.pdf"
+
+
+class TestStructureToolNoSummarize:
+    """No summarize_params when summarization is not enabled."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_no_summarize_params_when_disabled(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result()
+
+        execute_structure_tool(base_params)
+
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        assert ctx.executor_params["summarize_params"] is None
+        assert (
+            ctx.executor_params["pipeline_options"]["is_summarization_enabled"] is False
+        )
+
+
+class TestWorkflowServiceDetection:
+    """Test _is_structure_tool_workflow detection."""
+
+    def test_is_structure_tool_detection(self):
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        # Mock execution_service with a structure tool instance
+        mock_exec_service = MagicMock()
+        ti = MagicMock()
+        ti.image_name = "unstract/tool-structure"
+        mock_exec_service.tool_instances = [ti]
+
+        result = service._is_structure_tool_workflow(mock_exec_service)
+        assert result is True
+
+    def test_non_structure_tool_uses_docker(self):
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        # Mock execution_service with a non-structure tool
+        mock_exec_service = MagicMock()
+        ti = MagicMock()
+        ti.image_name = "unstract/tool-classifier"
+        mock_exec_service.tool_instances = [ti]
+
+        result = service._is_structure_tool_workflow(mock_exec_service)
+        assert result is False
+
+    @patch.dict("os.environ", {"STRUCTURE_TOOL_IMAGE_NAME": "custom/structure"})
+    def test_custom_structure_image_name(self):
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        mock_exec_service = MagicMock()
+        ti = MagicMock()
+        ti.image_name = "custom/structure"
+        mock_exec_service.tool_instances = [ti]
+
+        result = service._is_structure_tool_workflow(mock_exec_service)
+        assert result is True
+
+    def test_registry_prefix_match(self):
+        """Image from backend with registry prefix matches default base name."""
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        # Worker uses default "unstract/tool-structure", but backend sends
+        # image with registry prefix (common in K8s deployments)
+        mock_exec_service = MagicMock()
+        ti = MagicMock()
+        ti.image_name = "gcr.io/my-project/tool-structure"
+        mock_exec_service.tool_instances = [ti]
+
+        result = service._is_structure_tool_workflow(mock_exec_service)
+        assert result is True
+
+    def test_registry_prefix_with_tag_match(self):
+        """Image with registry prefix and tag still matches."""
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        mock_exec_service = MagicMock()
+        ti = MagicMock()
+        ti.image_name = "us.gcr.io/prod/tool-structure:v1.2.3"
+        mock_exec_service.tool_instances = [ti]
+
+        result = service._is_structure_tool_workflow(mock_exec_service)
+        assert result is True
+
+    @patch.dict("os.environ", {"STRUCTURE_TOOL_IMAGE_NAME": "gcr.io/prod/tool-structure"})
+    def test_env_has_registry_prefix_instance_has_different_prefix(self):
+        """Both env and instance have different registry prefixes, same base."""
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        mock_exec_service = MagicMock()
+        ti = MagicMock()
+        ti.image_name = "ecr.aws/other/tool-structure"
+        mock_exec_service.tool_instances = [ti]
+
+        result = service._is_structure_tool_workflow(mock_exec_service)
+        assert result is True
+
+
+class TestStructureToolParamsPassthrough:
+    """Task receives correct params from WorkerWorkflowExecutionService."""
+
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_execute_structure_tool_workflow"
+    )
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_is_structure_tool_workflow",
+        return_value=True,
+    )
+    @pytest.mark.parametrize("auto_enable", [True, False])
+    def test_structure_tool_params_passthrough(
+        self, mock_is_struct, mock_exec_struct, auto_enable
+    ):
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        mock_exec_service = MagicMock()
+        mock_exec_service.tool_instances = [MagicMock()]
+
+        service._build_and_execute_workflow(
+            mock_exec_service, "test.pdf", auto_enable_highlight=auto_enable
+        )
+
+        # Verify _execute_structure_tool_workflow was called
+        mock_exec_struct.assert_called_once_with(
+            mock_exec_service, "test.pdf", auto_enable
+        )
+
+    @pytest.mark.parametrize(
+        "review_config, expected",
+        [({"auto_enable_highlight": True}, True), ({}, False)],
+    )
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_build_and_execute_workflow"
+    )
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_prepare_workflow_input_file",
+        return_value=None,
+    )
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_compile_workflow",
+        return_value=True,
+    )
+    def test_auto_enable_highlight_read_from_review_config(
+        self, mock_compile, mock_prepare, mock_build, review_config, expected
+    ):
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        context = MagicMock()
+        context.file_data.manual_review_config = review_config
+
+        assert WorkerWorkflowExecutionService()._execute_workflow_with_service(
+            execution_service=MagicMock(),
+            file_processing_context=context,
+            file_name="invoice.pdf",
+            workflow_file_execution_id="",
+            execution_id="exec-1",
+            workflow_id="wf-1",
+        )
+        assert mock_build.call_args.kwargs["auto_enable_highlight"] is expected
+
+    @pytest.mark.parametrize(
+        "util, expected",
+        [
+            (MagicMock(has_confidence_rules=MagicMock(return_value=True)), True),
+            (MagicMock(has_confidence_rules=MagicMock(return_value=False)), False),
+            # Older plugin without the method
+            (object(), False),
+        ],
+    )
+    def test_has_confidence_rules_helper(self, util, expected):
+        from shared.utils.manual_review_factory import has_confidence_rules
+
+        assert has_confidence_rules(util, "wf-1", "DB") is expected
+        if isinstance(util, MagicMock):
+            util.has_confidence_rules.assert_called_once_with("wf-1", "DB")
+
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_get_platform_service_api_key",
+        return_value="sk-test",
+    )
+    @patch("file_processing.structure_tool_task.execute_structure_tool")
+    def test_source_file_name_uses_real_filename_not_sentinel(
+        self, mock_execute_struct, mock_get_key
+    ):
+        """Regression: params["source_file_name"] is the real file name,
+        not the literal "SOURCE" sentinel from file_handler.source_file.
+
+        Bug: previously the producer used
+        os.path.basename(file_handler.source_file), but
+        file_handler.source_file is always
+        {file_execution_dir}/SOURCE — a fixed local-copy sentinel — so
+        every per-file COPY_TO_FOLDER ended up with SOURCE.json and the
+        destination connector overwrote files at the destination.
+        """
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        service = WorkerWorkflowExecutionService()
+
+        # Mock execution_service / file_handler to recreate the buggy
+        # state: file_handler.source_file is the fixed "SOURCE" sentinel.
+        mock_exec_service = MagicMock()
+        mock_exec_service.organization_id = "org-test"
+        mock_exec_service.workflow_id = "wf-1"
+        mock_exec_service.execution_id = "exec-1"
+        mock_exec_service.file_execution_id = "fexec-1"
+        mock_exec_service.tool_instances = [MagicMock(metadata={})]
+
+        file_handler = MagicMock()
+        file_handler.source_file = "/data/exec/fexec-1/SOURCE"
+        file_handler.infile = "/data/exec/fexec-1/INFILE"
+        file_handler.execution_dir = "/data/exec"
+        file_handler.file_execution_dir = "/data/exec/fexec-1"
+        file_handler.get_workflow_metadata.return_value = {
+            "source_hash": "abc",
+        }
+        mock_exec_service.file_handler = file_handler
+
+        mock_execute_struct.return_value = {"success": True}
+
+        service._execute_structure_tool_workflow(mock_exec_service, "invoice.pdf")
+
+        # The dispatched params dict must carry the real file name,
+        # not the "SOURCE" sentinel from file_handler.source_file.
+        params = mock_execute_struct.call_args[0][0]
+        assert params["source_file_name"] == "invoice.pdf"
+        assert params["source_file_name"] != "SOURCE"
+
+    @pytest.mark.parametrize("auto_enable", [True, False])
+    @patch(
+        "shared.workflow.execution.service.WorkerWorkflowExecutionService."
+        "_get_platform_service_api_key",
+        return_value="sk-test",
+    )
+    @patch("file_processing.structure_tool_task.execute_structure_tool")
+    def test_auto_enable_highlight_passed_in_params(
+        self, mock_execute_struct, mock_get_key, auto_enable
+    ):
+        """The service passes the flag on and leaves the metadata alone."""
+        from shared.workflow.execution.service import (
+            WorkerWorkflowExecutionService,
+        )
+
+        saved_metadata = {"enable_highlight": False}
+        mock_exec_service = MagicMock()
+        mock_exec_service.tool_instances = [MagicMock(metadata=saved_metadata)]
+        mock_exec_service.file_handler.get_workflow_metadata.return_value = {}
+        mock_execute_struct.return_value = {"success": True}
+
+        WorkerWorkflowExecutionService()._execute_structure_tool_workflow(
+            mock_exec_service, "invoice.pdf", auto_enable_highlight=auto_enable
+        )
+
+        params = mock_execute_struct.call_args[0][0]
+        assert params["auto_enable_highlight"] is auto_enable
+        assert params["tool_instance_metadata"] == {"enable_highlight": False}
+
+
+class TestAutoEnableHighlight:
+    """``auto_enable_highlight`` turns highlight on for the run."""
+
+    @pytest.mark.parametrize(
+        "user_highlight, auto_enable, expected",
+        [
+            (False, True, True),  # HITL confidence rule present
+            (True, False, True),  # user setting respected
+            (False, False, False),
+        ],
+    )
+    @patch(_PATCH_IMAGE_MODE, return_value=None)
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_regular_overrides_a_copy(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        _mock_image_mode,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+        user_highlight,
+        auto_enable,
+        expected,
+    ):
+        """Word confidence and the saved metadata stay as the user set them."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+        from shared.utils.manual_review_factory import (
+            HIGHLIGHT_AUTO_ENABLED_MESSAGE,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result()
+
+        saved_metadata = base_params["tool_instance_metadata"]
+        saved_metadata["enable_highlight"] = user_highlight
+        saved_metadata["enable_word_confidence"] = False
+        base_params["auto_enable_highlight"] = auto_enable
+
+        execute_structure_tool(base_params)
+
+        ep = dispatcher_instance.dispatch.call_args[0][0].executor_params
+        assert ep["extract_params"]["enable_highlight"] is expected
+        assert ep["answer_params"]["tool_settings"]["enable_word_confidence"] is False
+        assert saved_metadata["enable_highlight"] is user_highlight
+        messages = [
+            c.args[0] for c in mock_shim_cls.return_value.stream_log.call_args_list
+        ]
+        assert (HIGHLIGHT_AUTO_ENABLED_MESSAGE in messages) is auto_enable
+
+    @patch(_PATCH_IMAGE_MODE, return_value={"adapter_id": "llmwhisperer|v2"})
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_image_output_mode_keeps_highlight_off(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        _mock_image_mode,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """LLMWhisperer rejects highlight in image output mode."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+        from shared.utils.manual_review_factory import (
+            HIGHLIGHT_AUTO_ENABLED_MESSAGE,
+            HIGHLIGHT_IMAGE_MODE_MESSAGE,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result()
+
+        base_params["tool_instance_metadata"]["enable_highlight"] = False
+        base_params["auto_enable_highlight"] = True
+
+        execute_structure_tool(base_params)
+
+        ep = dispatcher_instance.dispatch.call_args[0][0].executor_params
+        assert ep["extract_params"]["enable_highlight"] is False
+        messages = [
+            c.args[0] for c in mock_shim_cls.return_value.stream_log.call_args_list
+        ]
+        assert HIGHLIGHT_IMAGE_MODE_MESSAGE in messages
+        assert HIGHLIGHT_AUTO_ENABLED_MESSAGE not in messages
+
+    @patch("unstract.sdk1.x2txt.X2Text")
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_agentic_keeps_user_setting(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        mock_x2text_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """Agentic runs get no highlight data, so the flag is ignored."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+        from shared.utils.manual_review_factory import (
+            HIGHLIGHT_AUTO_ENABLED_MESSAGE,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = None
+        mock_platform_helper.get_agentic_studio_tool.return_value = {
+            "tool_metadata": {
+                "name": "Agentic Project",
+                "project_id": "ap-001",
+                "json_schema": {"field": "string"},
+            },
+        }
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = ExecutionResult(
+            success=True, data={"output": {"field": "value"}}
+        )
+        mock_x2text_instance = MagicMock()
+        mock_x2text_instance.process.return_value = MagicMock(
+            extracted_text="extracted text"
+        )
+        mock_x2text_cls.return_value = mock_x2text_instance
+
+        base_params["tool_instance_metadata"]["enable_highlight"] = False
+        base_params["auto_enable_highlight"] = True
+
+        execute_structure_tool(base_params)
+
+        assert mock_x2text_instance.process.call_args.kwargs["enable_highlight"] is False
+        messages = [
+            c.args[0] for c in mock_shim_cls.return_value.stream_log.call_args_list
+        ]
+        assert HIGHLIGHT_AUTO_ENABLED_MESSAGE not in messages
+
+
+class TestAgenticTableParamsAndResults:
+    """Agentic table: params forwarding and result assembly.
+
+    Covers the enable_highlight gate, extraction_priority,
+    enable_raw_extraction, and the _raw_data / _highlight_data paths
+    in both mixed (agentic + regular) and all-agentic results.
+    """
+
+    # -- Fixtures local to agentic table tests --
+
+    @staticmethod
+    def _agentic_output(
+        *,
+        name: str = "rent_roll",
+        extraction_priority: str | None = "accuracy",
+        enable_raw_extraction: bool = True,
+    ) -> dict:
+        """Single agentic_table output entry for tool_metadata["outputs"]."""
+        return {
+            "name": name,
+            "type": "agentic_table",
+            "llm": "llm-agentic",
+            "agentic_table_settings": {
+                "target_table": "invoice_lines",
+                "json_structure": {"line": "int", "amount": "float"},
+                "instructions": "Extract all rows",
+                "lite_llm_adapter_instance_id": "llm-lite",
+                "extraction_priority": extraction_priority,
+                "enable_raw_extraction": enable_raw_extraction,
+            },
+        }
+
+    @staticmethod
+    def _make_agentic_result(
+        tables: list | None = None,
+        raw_data: dict | None = None,
+        highlight_data: dict | None = None,
+        metrics: dict | None = None,
+    ) -> ExecutionResult:
+        """Build an ExecutionResult matching the agentic_table executor shape."""
+        output: dict = {"tables": tables or [{"line": 1, "amount": 100}]}
+        if raw_data is not None:
+            output["_raw_data"] = raw_data
+        if highlight_data is not None:
+            output["_highlight_data"] = highlight_data
+        meta: dict = {}
+        if metrics is not None:
+            meta["metrics"] = metrics
+        return ExecutionResult(success=True, data={"output": output, "metadata": meta})
+
+    @staticmethod
+    def _tool_metadata_agentic_only(outputs: list[dict]) -> dict:
+        """tool_metadata with only agentic_table prompts (no regular)."""
+        return {
+            "name": "Agentic Only Project",
+            "is_agentic": False,
+            "tool_id": "tool-at-1",
+            "tool_settings": {
+                "vector-db": "vdb-1",
+                "embedding": "emb-1",
+                "x2text_adapter": "x2t-1",
+                "llm": "llm-1",
+            },
+            "outputs": outputs,
+        }
+
+    @staticmethod
+    def _tool_metadata_mixed(
+        regular_output: dict, agentic_outputs: list[dict]
+    ) -> dict:
+        """tool_metadata with both regular and agentic_table prompts."""
+        return {
+            "name": "Mixed Project",
+            "is_agentic": False,
+            "tool_id": "tool-mx-1",
+            "tool_settings": {
+                "vector-db": "vdb-1",
+                "embedding": "emb-1",
+                "x2text_adapter": "x2t-1",
+                "llm": "llm-1",
+            },
+            "outputs": [regular_output] + agentic_outputs,
+        }
+
+    # -- enable_highlight gate (Gate 1) --
+
+    @pytest.mark.parametrize("highlight_on", [True, False])
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_enable_highlight_forwarded_to_agentic_params(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        highlight_on,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """enable_highlight in agentic_params mirrors the workflow setting."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        at_out = self._agentic_output()
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": self._tool_metadata_agentic_only([at_out]),
+        }
+        base_params["tool_instance_metadata"]["enable_highlight"] = highlight_on
+
+        dispatcher_instance = create_autospec(
+            PgExecutionDispatcher, instance=True
+        )
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = self._make_agentic_result()
+
+        execute_structure_tool(base_params)
+
+        ctx = dispatcher_instance.dispatch.call_args[0][0]
+        assert ctx.executor_params["enable_highlight"] is highlight_on
+
+    # -- extraction_priority and enable_raw_extraction forwarding --
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_extraction_priority_and_raw_extraction_forwarded(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """extraction_priority and enable_raw_extraction pass through."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        at_out = self._agentic_output(
+            extraction_priority="accuracy",
+            enable_raw_extraction=True,
+        )
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": self._tool_metadata_agentic_only([at_out]),
+        }
+
+        dispatcher_instance = create_autospec(
+            PgExecutionDispatcher, instance=True
+        )
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = self._make_agentic_result()
+
+        execute_structure_tool(base_params)
+
+        ep = dispatcher_instance.dispatch.call_args[0][0].executor_params
+        assert ep["extraction_priority"] == "accuracy"
+        assert ep["enable_raw_extraction"] is True
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_extraction_priority_defaults_none(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """extraction_priority defaults to None when not set."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        at_out = self._agentic_output(
+            extraction_priority=None,
+            enable_raw_extraction=False,
+        )
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": self._tool_metadata_agentic_only([at_out]),
+        }
+
+        dispatcher_instance = create_autospec(
+            PgExecutionDispatcher, instance=True
+        )
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = self._make_agentic_result()
+
+        execute_structure_tool(base_params)
+
+        ep = dispatcher_instance.dispatch.call_args[0][0].executor_params
+        assert ep["extraction_priority"] is None
+        assert ep["enable_raw_extraction"] is False
+
+    # -- All-agentic result assembly --
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_all_agentic_preserves_highlight_and_raw_data(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """All-agentic: _highlight_data and _raw_data appear in result."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        at_out = self._agentic_output()
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": self._tool_metadata_agentic_only([at_out]),
+        }
+        base_params["tool_instance_metadata"]["enable_highlight"] = True
+
+        raw = {"pages": [{"page": 1, "text": "raw"}]}
+        hl = {"tables": {"coords": [1, 2, 3]}}
+
+        dispatcher_instance = create_autospec(
+            PgExecutionDispatcher, instance=True
+        )
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = self._make_agentic_result(
+            raw_data=raw,
+            highlight_data=hl,
+        )
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        data = result["data"]
+        # _raw_data keyed by prompt name
+        assert data["output"]["_raw_data"]["rent_roll"] == raw
+        # highlight_data in metadata keyed by prompt name
+        assert data["metadata"]["highlight_data"]["rent_roll"] == hl
+        assert data["metadata"]["agentic_only"] is True
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_all_agentic_no_highlight_when_absent(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """All-agentic: no highlight_data key when executor omits it."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        at_out = self._agentic_output()
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": self._tool_metadata_agentic_only([at_out]),
+        }
+
+        dispatcher_instance = create_autospec(
+            PgExecutionDispatcher, instance=True
+        )
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        # No raw_data or highlight_data in result
+        dispatcher_instance.dispatch.return_value = self._make_agentic_result()
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        assert "highlight_data" not in result["data"]["metadata"]
+        assert "_raw_data" not in result["data"]["output"]
+
+    # -- Mixed result assembly (regular + agentic) --
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_mixed_preserves_highlight_and_raw_data(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        """Mixed: agentic highlight_data and _raw_data merged into pipeline result."""
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+
+        regular = {
+            "name": "field_a",
+            "prompt": "What is the revenue?",
+            "type": "text",
+            "active": True,
+            "chunk-size": 512,
+            "chunk-overlap": 128,
+            "retrieval-strategy": "simple",
+            "llm": "llm-1",
+            "embedding": "emb-1",
+            "vector-db": "vdb-1",
+            "x2text_adapter": "x2t-1",
+            "similarity-top-k": 5,
+        }
+        at_out = self._agentic_output()
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": self._tool_metadata_mixed(regular, [at_out]),
+        }
+        base_params["tool_instance_metadata"]["enable_highlight"] = True
+
+        raw = {"pages": [{"page": 1}]}
+        hl = {"tables": {"coords": [10, 20]}}
+
+        dispatcher_instance = create_autospec(
+            PgExecutionDispatcher, instance=True
+        )
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+
+        # First call: agentic_table dispatch; second call: legacy pipeline
+        agentic_result = self._make_agentic_result(
+            raw_data=raw,
+            highlight_data=hl,
+        )
+        pipeline_result = _make_pipeline_result(
+            output={"field_a": "$1M"},
+            metadata={"run_id": "fexec-789", "file_name": "test.pdf"},
+        )
+        dispatcher_instance.dispatch.side_effect = [
+            agentic_result,
+            pipeline_result,
+        ]
+
+        result = execute_structure_tool(base_params)
+
+        assert result["success"] is True
+        data = result["data"]
+        # Regular output merged
+        assert data["output"]["field_a"] == "$1M"
+        # Agentic tables merged
+        assert "rent_roll" in data["output"]
+        # _raw_data keyed by prompt name
+        assert data["output"]["_raw_data"]["rent_roll"] == raw
+        # highlight_data in metadata keyed by prompt name
+        assert data["metadata"]["highlight_data"]["rent_roll"] == hl
+
+
+class TestHelperFunctions:
+    """Test standalone helper functions."""
+
+    def test_apply_profile_overrides(self):
+        from file_processing.structure_tool_task import (
+            _apply_profile_overrides,
+        )
+
+        tool_metadata = {
+            "tool_settings": {
+                "llm": "old-llm",
+                "embedding": "old-emb",
+            },
+            "outputs": [
+                {
+                    "name": "field_a",
+                    "llm": "old-llm",
+                    "embedding": "old-emb",
+                },
+            ],
+        }
+        profile_data = {
+            "llm_id": "new-llm",
+            "embedding_model_id": "new-emb",
+        }
+
+        changes = _apply_profile_overrides(tool_metadata, profile_data)
+
+        assert len(changes) == 4  # 2 in tool_settings + 2 in output
+        assert tool_metadata["tool_settings"]["llm"] == "new-llm"
+        assert tool_metadata["tool_settings"]["embedding"] == "new-emb"
+        assert tool_metadata["outputs"][0]["llm"] == "new-llm"
+        assert tool_metadata["outputs"][0]["embedding"] == "new-emb"
+
+    def test_should_skip_extraction_no_table_settings(self):
+        from file_processing.structure_tool_task import (
+            _should_skip_extraction_for_smart_table,
+        )
+
+        outputs = [{"name": "field_a", "prompt": "What?"}]
+        assert _should_skip_extraction_for_smart_table(outputs) is False
+
+    def test_should_skip_extraction_with_json_schema(self):
+        from file_processing.structure_tool_task import (
+            _should_skip_extraction_for_smart_table,
+        )
+
+        outputs = [
+            {
+                "name": "field_a",
+                "table_settings": {},
+                "prompt": '{"col1": "string", "col2": "number"}',
+            }
+        ]
+        assert _should_skip_extraction_for_smart_table(outputs) is True
+
+
+class TestStructureToolImageLimitLlms:
+    """Extraction receives every LLM that will read the pages (UN-4427)."""
+
+    @patch(_PATCH_SHIM)
+    @patch(_PATCH_FILE_STORAGE)
+    @patch(_PATCH_PLATFORM_HELPER)
+    @patch(_PATCH_DISPATCHER)
+    def test_extract_params_carry_the_distinct_prompt_llms(
+        self,
+        mock_get_executor_dispatcher,
+        mock_create_ph,
+        mock_get_fs,
+        mock_shim_cls,
+        base_params,
+        tool_metadata_regular,
+        mock_fs,
+        mock_platform_helper,
+    ):
+        from file_processing.structure_tool_task import (
+            _execute_structure_tool_impl as execute_structure_tool,
+        )
+
+        second = dict(tool_metadata_regular["outputs"][0], name="field_b", llm="llm-2")
+        no_llm = dict(tool_metadata_regular["outputs"][0], name="field_c", llm="")
+        tool_metadata_regular["outputs"].extend([second, no_llm])
+        # The tool-level LLM never reads page images (it only summarizes),
+        # so its limits must not restrict the extraction.
+        tool_metadata_regular["tool_settings"]["llm"] = "llm-tool"
+        mock_get_fs.return_value = mock_fs
+        mock_create_ph.return_value = mock_platform_helper
+        mock_platform_helper.get_prompt_studio_tool.return_value = {
+            "tool_metadata": tool_metadata_regular,
+        }
+        dispatcher_instance = create_autospec(PgExecutionDispatcher, instance=True)
+        mock_get_executor_dispatcher.return_value = dispatcher_instance
+        dispatcher_instance.dispatch.return_value = _make_pipeline_result()
+
+        execute_structure_tool(base_params)
+
+        pipeline_ctx = next(
+            call.args[0]
+            for call in dispatcher_instance.dispatch.call_args_list
+            if "extract_params" in call.args[0].executor_params
+        )
+        from executor.executors.constants import IndexingConstants as IKeys
+
+        # The key the executor's extract handler reads.
+        assert IKeys.LLM_INSTANCE_IDS == "llm_instance_ids"
+        extract_params = pipeline_ctx.executor_params["extract_params"]
+        assert IKeys.LLM_INSTANCE_IDS in extract_params
+        ids = extract_params[IKeys.LLM_INSTANCE_IDS]
+        # Each prompt's LLM, de-duplicated and sorted; blanks are dropped
+        # and the tool-level LLM is not included.
+        assert ids == ["llm-1", "llm-2"]

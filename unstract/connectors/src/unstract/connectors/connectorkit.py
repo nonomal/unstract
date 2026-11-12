@@ -1,27 +1,28 @@
 import logging
-from typing import Any, Optional
+from typing import Any
 
-from unstract.connectors import ConnectorDict  # type: ignore
+from singleton_decorator import singleton
+
 from unstract.connectors.base import UnstractConnector
-from unstract.connectors.constants import Common
+from unstract.connectors.constants import Common, ConnectorDict
 from unstract.connectors.databases import connectors as db_connectors
 from unstract.connectors.enums import ConnectorMode
 from unstract.connectors.filesystems import connectors as fs_connectors
+from unstract.connectors.queues import connectors as q_connectors
 
 logger = logging.getLogger(__name__)
 
 
+@singleton
 class Connectorkit:
     def __init__(self) -> None:
-        self._connectors: ConnectorDict = fs_connectors | db_connectors
+        self._connectors: ConnectorDict = fs_connectors | db_connectors | q_connectors
 
     @property
     def connectors(self) -> ConnectorDict:
         return self._connectors
 
-    def get_connector_class_by_connector_id(
-        self, connector_id: str
-    ) -> UnstractConnector:
+    def get_connector_class_by_connector_id(self, connector_id: str) -> UnstractConnector:
         if connector_id in self._connectors:
             connector_class: UnstractConnector = self._connectors[connector_id][
                 Common.METADATA
@@ -34,7 +35,7 @@ class Connectorkit:
     # Once workflow code from core is removed
     def get_connector_class_by_name(
         self, connector_name: str
-    ) -> Optional[UnstractConnector]:
+    ) -> UnstractConnector | None:
         for (
             connector_id,
             connector_registry_metadata,
@@ -71,7 +72,7 @@ class Connectorkit:
         return connector_class(*args, **kwargs)
 
     def get_connectors_list(
-        self, mode: Optional[ConnectorMode] = None
+        self, mode: ConnectorMode | None = None
     ) -> list[dict[str, Any]]:
         connectors = []
         for (
@@ -107,6 +108,7 @@ class Connectorkit:
                     "can_write": can_write,
                     "json_schema": json_schema,
                     "connector_mode": connector_mode,
+                    "doc_url": m.get_doc_url(),
                 }
             )
         return connectors

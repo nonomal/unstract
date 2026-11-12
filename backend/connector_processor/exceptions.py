@@ -4,39 +4,19 @@ from backend.exceptions import UnstractBaseException
 from unstract.connectors.exceptions import ConnectorError
 
 
-class IdIsMandatory(APIException):
-    status_code = 400
-    default_detail = "ID is Mandatory."
-
-
-class InValidType(APIException):
-    status_code = 400
-    default_detail = "Type is not Valid."
-
-
-class InValidConnectorMode(APIException):
+class InvalidConnectorMode(APIException):
     status_code = 400
     default_detail = "Connector mode is not Valid."
 
 
-class InValidConnectorId(APIException):
+class InvalidConnectorID(APIException):
     status_code = 400
     default_detail = "Connector ID is not Valid."
 
 
-class JSONParseException(APIException):
-    status_code = 500
-    default_detail = "Exception occured while Parsing JSON Schema."
-
-
 class OAuthTimeOut(APIException):
     status_code = 408
-    default_detail = "Timed Out. Please re authenticate."
-
-
-class InternalServiceError(APIException):
-    status_code = 500
-    default_detail = "Internal Service error"
+    default_detail = "Timed out. Please re-authenticate."
 
 
 class TestConnectorException(APIException):
@@ -44,8 +24,10 @@ class TestConnectorException(APIException):
     default_detail = "Error while testing connector."
 
 
-class TestConnectorInputException(UnstractBaseException):
+class TestConnectorInputError(UnstractBaseException):
     def __init__(self, core_err: ConnectorError) -> None:
         super().__init__(detail=core_err.message, core_err=core_err)
         self.default_detail = core_err.message
-        self.status_code = 400
+        # Preserve status code from connector error if available, otherwise default to 400
+        if not core_err.status_code:
+            self.status_code = 400

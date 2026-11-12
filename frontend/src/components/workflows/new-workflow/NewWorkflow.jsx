@@ -1,21 +1,30 @@
-import { Form, Input, Modal } from "antd";
 import PropTypes from "prop-types";
 import { useRef, useState } from "react";
+import { Form } from "@/components/ui/shims/antd-form";
+import { Input } from "@/components/ui/shims/antd-inputs";
+import { Modal } from "@/components/ui/shims/antd-overlays";
 import { getBackendErrorDetail } from "../../../helpers/GetStaticData";
+
 const { TextArea } = Input;
 
 function NewWorkflow({
   name = "",
   description = "",
-  onDone = () => {},
-  onClose = () => {},
+  onDone = () => {
+    // No-op default
+  },
+  onClose = () => {
+    // No-op default
+  },
   loading = {},
-  toggleModal = () => {},
+  toggleModal = () => {
+    // No-op default
+  },
   openModal = {},
   backendErrors,
   setBackendErrors,
 }) {
-  const [disableCreation, setDisableCreation] = useState(true);
+  const [disableCreation, setDisableCreation] = useState(!name || !description);
   const nameRef = useRef(name);
   const descriptionRef = useRef(description);
   const [form] = Form.useForm();
@@ -54,7 +63,7 @@ function NewWorkflow({
     setBackendErrors((prevErrors) => {
       if (prevErrors) {
         const updatedErrors = prevErrors.errors.filter(
-          (error) => error.attr !== changedFieldName
+          (error) => error.attr !== changedFieldName,
         );
         return { ...prevErrors, errors: updatedErrors };
       }
@@ -71,6 +80,7 @@ function NewWorkflow({
       centered
       maskClosable={false}
       okText={name ? "Edit Workflow" : "Create Workflow"}
+      data-testid="new-workflow-modal"
       width="400px"
       okButtonProps={{ disabled: disableCreation, loading: loading }}
     >
@@ -78,6 +88,10 @@ function NewWorkflow({
         name="workflowForm"
         labelCol={{ span: 8 }}
         wrapperCol={{ span: 16 }}
+        initialValues={{
+          workflow_name: name,
+          workflow_description: description,
+        }}
         onValuesChange={handleInputChange}
       >
         <Form.Item
@@ -91,7 +105,7 @@ function NewWorkflow({
           }
           help={getBackendErrorDetail("workflow_name", backendErrors)}
         >
-          <Input defaultValue={nameRef.current} onChange={updateName} />
+          <Input onChange={updateName} />
         </Form.Item>
         <Form.Item
           label="Description"
@@ -107,7 +121,6 @@ function NewWorkflow({
           help={getBackendErrorDetail("workflow_description", backendErrors)}
         >
           <TextArea
-            defaultValue={descriptionRef.current}
             autoSize={{ minRows: 4, maxRows: 6 }}
             onChange={updateDescription}
           />

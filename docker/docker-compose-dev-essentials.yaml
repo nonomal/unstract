@@ -1,8 +1,6 @@
-version: '3.7'
-
 services:
   db:
-    image: 'postgres:15.6'
+    image: "pgvector/pgvector:pg15"
     container_name: unstract-db
     restart: unless-stopped
     # set shared memory limit when using docker-compose
@@ -11,7 +9,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data/
-      - ../backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./scripts/db-setup/db_setup.sh:/docker-entrypoint-initdb.d/db_setup.sh
     env_file:
       - ./essentials.env
     labels:
@@ -31,13 +29,17 @@ services:
       - traefik.enable=false
 
   minio:
-    image: 'minio/minio:latest'
+    # Mirror of cgr.dev/chainguard/minio (upstream minio/* images are gone from Docker Hub
+    # and quay.io now requires auth) - pinned by digest so a tag change can't break us
+    image: "unstract/minio:RELEASE.2026-09-22T19-25-18Z@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1"
+    # Chainguard runs as uid 65532; keep root so existing root-owned minio_data volumes stay writable
+    user: root
     container_name: unstract-minio
     hostname: minio
     restart: unless-stopped
     ports:
-      - '9000:9000'
-      - '9001:9001'
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio_data:/data
     env_file:
@@ -48,9 +50,25 @@ services:
       - traefik.http.routers.minio.rule=Host(`minio.unstract.localhost`)
       - traefik.http.services.minio.loadbalancer.server.port=9001
 
+  minio-bootstrap:
+    # Mirror of cgr.dev/chainguard/minio-client:latest-dev (-dev variant ships /bin/sh for the entrypoint)
+    image: "unstract/minio-client:2026-09-24-dev@sha256:f0dd93b48af1f8a641edcd3c64661c8dbe05189bd2ef2f8cea216eb18af10bf8"
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set minio http://unstract-minio:9000 minio minio123;
+      mc mb minio/unstract;
+      mc mirror /app/prompt-studio-data minio/unstract/prompt-studio-data;
+      exit 0;
+      "
+    volumes:
+      - prompt_studio_data:/app/prompt-studio-data
+
   reverse-proxy:
     # The official v2 Traefik docker image
-    image: traefik:v2.10
+    image: traefik:v3.6.2
     container_name: unstract-proxy
     restart: unless-stopped
     # - Enables the web UI.
@@ -59,8 +77,7 @@ services:
     #   This is required because Traefik by default tries available networks in a
     #   round-robin fashion. With multiple providers, services can be on multiple
     #   networks causing 504 Gateway Timeout.
-    command:
-      --api.insecure=true
+    command: --api.insecure=true
       --accesslog=true --log.level=INFO
       --providers.docker=true --providers.docker.network=unstract-network
       --providers.file.filename=/proxy_overrides.yaml --providers.file.watch=true
@@ -80,18 +97,14 @@ services:
       - "host.docker.internal:host-gateway"
 
   feature-flag:
-    image: flipt/flipt:v1.34.0 # Dated(05/01/2024) Latest stable version. Ref:https://github.com/flipt-io/flipt/releases
+    image: docker.flipt.io/flipt/flipt:v2.3.1
     container_name: unstract-flipt
     restart: unless-stopped
     ports: # Forwarded to available host ports
-      - "8082:8080"  # REST API port
-      - "9005:9000"  # gRPC port
-    # https://www.flipt.io/docs/configuration/overview#environment-variables)
-    # https://www.flipt.io/docs/configuration/overview#configuration-parameters
-    env_file:
-      - ./essentials.env
-    environment:
-      FLIPT_CACHE_ENABLED: true
+      - "8082:8080" # REST API port
+      - "9005:9000" # gRPC port
+    volumes:
+      - flipt_data:/var/opt/flipt
     labels:
       - traefik.enable=true
       - traefik.http.routers.feature-flag.rule=Host(`feature-flag.unstract.localhost`)
@@ -109,8 +122,10 @@ services:
       - traefik.enable=false
 
   qdrant:
-    # Vector DB for doc indexer
-    image: 'qdrant/qdrant:v1.8.3'
+    # Vector DB for doc indexer.
+    # Server minor version must track qdrant-client pin in unstract/sdk1/pyproject.toml;
+    # the 1.16 client calls endpoints the 1.8 server lacks and returns 404 with empty body.
+    image: "qdrant/qdrant:v1.16.1"
     container_name: unstract-vector-db
     restart: unless-stopped
     ports:
@@ -122,9 +137,24 @@ services:
     env_file:
       - ./essentials.env
 
+  rabbitmq:
+    image: rabbitmq:4.1.0-management
+    container_name: unstract-rabbitmq
+    hostname: unstract-rabbit
+    restart: unless-stopped
+    env_file:
+      - ./essentials.env
+    ports:
+      - "5672:5672" # AMQP port
+      - "15672:15672" # Management UI port
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
 volumes:
   flipt_data:
   minio_data:
   postgres_data:
   qdrant_data:
   redis_data:
+  prompt_studio_data:
+  rabbitmq_data:

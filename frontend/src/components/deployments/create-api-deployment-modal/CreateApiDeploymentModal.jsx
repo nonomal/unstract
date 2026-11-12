@@ -1,12 +1,15 @@
-import { Form, Input, Modal, Select } from "antd";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { Form } from "@/components/ui/shims/antd-form";
+import { Input, Select } from "@/components/ui/shims/antd-inputs";
+import { Modal } from "@/components/ui/shims/antd-overlays";
+
 import { getBackendErrorDetail } from "../../../helpers/GetStaticData.js";
-import { useAlertStore } from "../../../store/alert-store";
-import { apiDeploymentsService } from "../../deployments/api-deployment/api-deployments-service.js";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
-import { useWorkflowStore } from "../../../store/workflow-store.js";
 import usePostHogEvents from "../../../hooks/usePostHogEvents.js";
+import { useAlertStore } from "../../../store/alert-store";
+import { useWorkflowStore } from "../../../store/workflow-store.js";
+import { apiDeploymentsService } from "../../deployments/api-deployment/api-deployments-service.js";
 
 const defaultFromDetails = {
   display_name: "",
@@ -24,8 +27,10 @@ const CreateApiDeploymentModal = ({
   openCodeModal,
   setSelectedRow,
   workflowId,
-  workflowEndpointList,
+  workflowEndpointList = [],
   setDeploymentName,
+  onDeploymentCreated,
+  refreshList,
 }) => {
   const workflowStore = useWorkflowStore();
   const { updateWorkflow } = workflowStore;
@@ -34,7 +39,7 @@ const CreateApiDeploymentModal = ({
   const handleException = useExceptionHandler();
   const { Option } = Select;
   const [formDetails, setFormDetails] = useState(
-    isEdit ? { ...selectedRow } : { ...defaultFromDetails }
+    isEdit ? { ...selectedRow } : { ...defaultFromDetails },
   );
   const [isLoading, setIsLoading] = useState(false);
   const [form] = Form.useForm();
@@ -55,7 +60,7 @@ const CreateApiDeploymentModal = ({
     setBackendErrors((prevErrors) => {
       if (prevErrors) {
         const updatedErrors = prevErrors.errors.filter(
-          (error) => error.attr !== changedFieldName
+          (error) => error.attr !== changedFieldName,
         );
         return { ...prevErrors, errors: updatedErrors };
       }
@@ -80,33 +85,15 @@ const CreateApiDeploymentModal = ({
     setOpen(false);
   };
 
-  const updateTableData = () => {
-    apiDeploymentsApiService
-      .getApiDeploymentsList()
-      .then((res) => {
-        setTableData(res?.data);
-      })
-      .catch((err) => {
-        setAlertDetails({
-          type: "error",
-          content: "Error fetching API deployments",
-        });
-      });
-  };
-
   const createApiDeployment = () => {
-    try {
-      const wf = workflowEndpointList.find(
-        (item) => item?.workflow === formDetails?.workflow
-      );
-      setPostHogCustomEvent("intent_success_api_deployment", {
-        info: "Clicked on 'Save' button",
-        deployment_name: formDetails?.api_name,
-        workflow_name: wf?.workflow_name,
-      });
-    } catch (err) {
-      // If an error occurs while setting custom posthog event, ignore it and continue
-    }
+    const wf = workflowEndpointList?.find(
+      (item) => item?.workflow === formDetails?.workflow,
+    );
+    setPostHogCustomEvent("intent_success_api_deployment", {
+      info: "Clicked on 'Save' button",
+      deployment_name: formDetails?.api_name,
+      workflow_name: wf?.workflow_name,
+    });
 
     setIsLoading(true);
     const body = formDetails;
@@ -117,8 +104,15 @@ const CreateApiDeploymentModal = ({
           // Update - can update workflow endpoint status in store
           updateWorkflow({ allowChangeEndpoint: false });
           setDeploymentName(body.display_name);
+
+          // Call the callback to refresh deployment info
+          if (onDeploymentCreated) {
+            onDeploymentCreated();
+          }
         } else {
-          updateTableData();
+          // Refetch: the create response is a summary without the owner
+          // fields the list renders.
+          refreshList?.();
           setSelectedRow(res?.data);
           openCodeModal(true);
         }
@@ -130,11 +124,38 @@ const CreateApiDeploymentModal = ({
         });
       })
       .catch((err) => {
-        handleException(err, "", setBackendErrors);
+        if (err.response?.data) {
+          setBackendErrors(err.response.data);
+
+          // Show error notification
+          const errorData = err.response.data;
+          if (errorData.errors && errorData.errors.length > 0) {
+            setAlertDetails({
+              type: "error",
+              content: errorData.errors[0].detail || "Validation failed",
+            });
+          }
+        } else {
+          setAlertDetails(
+            handleException(err, "Failed to create API deployment"),
+          );
+        }
       })
       .finally(() => {
         setIsLoading(false);
       });
+  };
+
+  const mergeUpdatedRow = (updatedData) => {
+    setTableData((prev) => {
+      const index = prev.findIndex((item) => item?.id === updatedData?.id);
+      if (index !== -1) {
+        const newData = [...prev];
+        newData[index] = { ...newData[index], ...updatedData };
+        return newData;
+      }
+      return prev;
+    });
   };
 
   const updateApiDeployment = () => {
@@ -144,7 +165,7 @@ const CreateApiDeploymentModal = ({
     apiDeploymentsApiService
       .updateApiDeployment(body)
       .then((res) => {
-        updateTableData();
+        mergeUpdatedRow(res?.data);
         setOpen(false);
         clearFormDetails();
         setAlertDetails({
@@ -153,7 +174,13 @@ const CreateApiDeploymentModal = ({
         });
       })
       .catch((err) => {
-        handleException(err, "", setBackendErrors);
+        if (err.response?.data) {
+          setBackendErrors(err.response.data);
+        } else {
+          setAlertDetails(
+            handleException(err, "Failed to update API deployment"),
+          );
+        }
       })
       .finally(() => {
         setIsLoading(false);
@@ -183,9 +210,9 @@ const CreateApiDeploymentModal = ({
         onValuesChange={handleInputChange}
       >
         <Form.Item
-          label="Display Name"
+          label="Display Name (for humans)"
           name="display_name"
-          rules={[{ required: true, message: "Please enter display name" }]}
+          rules={[{ required: true, message: "Please enter a display name" }]}
           validateStatus={
             getBackendErrorDetail("display_name", backendErrors) ? "error" : ""
           }
@@ -206,10 +233,10 @@ const CreateApiDeploymentModal = ({
         </Form.Item>
 
         <Form.Item
-          label="API Name"
+          label="API Name (forms part of the API signature)"
           name="api_name"
           rules={[
-            { required: true, message: "Please enter API Name" },
+            { required: true, message: "Please enter an API Name" },
             {
               pattern: /^[a-zA-Z0-9_-]+$/,
               message:
@@ -232,14 +259,14 @@ const CreateApiDeploymentModal = ({
           <Form.Item
             label="Workflow"
             name="workflow"
-            rules={[{ required: true, message: "Please select an workflow" }]}
+            rules={[{ required: true, message: "Please select a workflow" }]}
             validateStatus={
               getBackendErrorDetail("workflow", backendErrors) ? "error" : ""
             }
             help={getBackendErrorDetail("workflow", backendErrors)}
           >
-            <Select>
-              {workflowEndpointList.map((endpoint) => {
+            <Select showSearch>
+              {workflowEndpointList?.map((endpoint) => {
                 return (
                   <Option
                     value={endpoint.workflow}
@@ -268,6 +295,8 @@ CreateApiDeploymentModal.propTypes = {
   workflowId: PropTypes.string,
   workflowEndpointList: PropTypes.object,
   setDeploymentName: PropTypes.func,
+  onDeploymentCreated: PropTypes.func,
+  refreshList: PropTypes.func,
 };
 
 export { CreateApiDeploymentModal };

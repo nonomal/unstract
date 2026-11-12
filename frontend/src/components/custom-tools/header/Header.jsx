@@ -1,49 +1,92 @@
-import {
-  ArrowLeftOutlined,
-  EditOutlined,
-  SettingOutlined,
-} from "@ant-design/icons";
-import { Button, Tooltip, Typography } from "antd";
+import { Settings } from "lucide-react";
 import PropTypes from "prop-types";
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import "./Header.css";
-
+import { useCallback, useMemo, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Form } from "@/components/ui/shims/antd-form";
+import { Input } from "@/components/ui/shims/antd-inputs";
+import { Dropdown, Modal, Tooltip } from "@/components/ui/shims/antd-overlays";
 import { ExportToolIcon } from "../../../assets";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
+import usePostHogEvents from "../../../hooks/usePostHogEvents";
+import { usePromptStudioCanEdit } from "../../../hooks/usePromptStudioCanEdit";
 import { useAlertStore } from "../../../store/alert-store";
 import { useCustomToolStore } from "../../../store/custom-tool-store";
 import { useSessionStore } from "../../../store/session-store";
+import { CreateApiDeploymentFromPromptStudio } from "../../deployments/create-api-deployment-from-prompt-studio/CreateApiDeploymentFromPromptStudio.jsx";
+import { ToolNavBar } from "../../navigations/tool-nav-bar/ToolNavBar";
 import { CustomButton } from "../../widgets/custom-button/CustomButton";
 import { ExportTool } from "../export-tool/ExportTool";
-import usePostHogEvents from "../../../hooks/usePostHogEvents";
+import "./Header.css";
 
 let SinglePassToggleSwitch;
+let CloneButton;
+let PromptShareButton;
 try {
-  SinglePassToggleSwitch =
-    require("../../../plugins/single-pass-toggle-switch/SinglePassToggleSwitch").SinglePassToggleSwitch;
-} catch {
-  // The variable will remain undefined if the component is not available.
-}
-function Header({ setOpenSettings, handleUpdateTool }) {
+  const mod = await import(
+    "../../../plugins/single-pass-toggle-switch/SinglePassToggleSwitch"
+  );
+  SinglePassToggleSwitch = mod.SinglePassToggleSwitch;
+} catch {}
+try {
+  const mod = await import(
+    "../../../plugins/prompt-studio-public-share/public-share-btn/PromptShareButton.jsx"
+  );
+  PromptShareButton = mod.PromptShareButton;
+} catch {}
+try {
+  const mod = await import(
+    "../../../plugins/prompt-studio-clone/clone-btn/CloneButton.jsx"
+  );
+  CloneButton = mod.CloneButton;
+} catch {}
+
+const noopCheckLookups = () => Promise.resolve(true);
+
+function Header({
+  setOpenSettings,
+  handleUpdateTool,
+  setOpenShareModal,
+  setOpenCloneModal,
+  checkLookups = noopCheckLookups,
+}) {
   const [isExportLoading, setIsExportLoading] = useState(false);
-  const { details } = useCustomToolStore();
+  const { details, isPublicSource, markChangesAsExported } =
+    useCustomToolStore();
   const { sessionDetails } = useSessionStore();
+  // Renaming a shared project is an edit, so it follows the same rule.
+  const canEdit = usePromptStudioCanEdit();
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
-  const navigate = useNavigate();
   const handleException = useExceptionHandler();
   const [userList, setUserList] = useState([]);
   const [openExportToolModal, setOpenExportToolModal] = useState(false);
   const { setPostHogCustomEvent } = usePostHogEvents();
 
   const [toolDetails, setToolDetails] = useState(null);
+  const [confirmModalVisible, setConfirmModalVisible] = useState(false);
+  const [lastExportParams, setLastExportParams] = useState(null);
+  const [openCreateApiDeploymentModal, setOpenCreateApiDeploymentModal] =
+    useState(false);
+  const [
+    apiDeploymentConfirmModalVisible,
+    setApiDeploymentConfirmModalVisible,
+  ] = useState(false);
+  const [existingApiDeployments, setExistingApiDeployments] = useState([]);
+  const [isApiDeploymentLoading, setIsApiDeploymentLoading] = useState(false);
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editForm] = Form.useForm();
 
-  const handleExport = (selectedUsers, toolDetail, isSharedWithEveryone) => {
+  const handleExport = (
+    selectedUsers,
+    toolDetail,
+    isSharedWithEveryone,
+    forcedExport = false,
+  ) => {
     const body = {
       is_shared_with_org: isSharedWithEveryone,
       user_id: isSharedWithEveryone ? [] : selectedUsers,
+      force_export: forcedExport,
     };
     const requestOptions = {
       method: "POST",
@@ -61,8 +104,19 @@ function Header({ setOpenSettings, handleUpdateTool }) {
           type: "success",
           content: "Custom tool exported successfully",
         });
+        // Clear the export reminder after successful export
+        markChangesAsExported();
       })
       .catch((err) => {
+        if (err?.response?.data?.errors[0]?.code === "warning") {
+          setLastExportParams({
+            selectedUsers,
+            toolDetail,
+            isSharedWithEveryone,
+          });
+          setConfirmModalVisible(true); // Show the confirmation modal
+          return; // Exit early to prevent any further execution
+        }
         setAlertDetails(handleException(err, "Failed to export"));
       })
       .finally(() => {
@@ -71,15 +125,26 @@ function Header({ setOpenSettings, handleUpdateTool }) {
       });
   };
 
-  const handleShare = (isEdit) => {
+  const handleConfirmForceExport = useCallback(() => {
+    const { selectedUsers, toolDetail, isSharedWithEveryone } =
+      lastExportParams;
+
+    handleExport(selectedUsers, toolDetail, isSharedWithEveryone, true);
+    setConfirmModalVisible(false);
+  }, [lastExportParams, handleExport]);
+
+  const handleShare = async (isEdit) => {
     try {
       setPostHogCustomEvent("ps_exported_tool", {
         info: `Clicked on the 'Export' button`,
         tool_name: details?.tool_name,
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
+
+    const ok = await checkLookups(details?.tool_id, "export");
+    if (!ok) return;
 
     const requestOptions = {
       method: "GET",
@@ -90,6 +155,10 @@ function Header({ setOpenSettings, handleUpdateTool }) {
     };
     setIsExportLoading(true);
     getAllUsers().then((users) => {
+      // getAllUsers has already shown the error and cleared the loading state.
+      if (!users) {
+        return;
+      }
       if (users.length < 2) {
         handleExport([details?.created_by], details, false);
       } else {
@@ -122,7 +191,8 @@ function Header({ setOpenSettings, handleUpdateTool }) {
           users.map((user) => ({
             id: user?.id,
             email: user?.email,
-          }))
+            is_admin: user?.is_admin,
+          })),
         );
         return users;
       })
@@ -136,25 +206,139 @@ function Header({ setOpenSettings, handleUpdateTool }) {
     return userList;
   };
 
-  return (
-    <div className="custom-tools-header-layout">
-      <div>
-        <Button
-          size="small"
-          type="text"
-          onClick={() => navigate(`/${sessionDetails?.orgName}/tools`)}
-        >
-          <ArrowLeftOutlined />
-        </Button>
-      </div>
-      <div className="custom-tools-name">
-        <Typography.Text strong>{details?.tool_name}</Typography.Text>
-      </div>
-      <div>
-        <Button size="small" type="text" disabled>
-          <EditOutlined />
-        </Button>
-      </div>
+  const handleExportProject = () => {
+    try {
+      setPostHogCustomEvent("intent_tool_export_project", {
+        info: "Clicked Export Project in tool IDE",
+        tool_id: details?.tool_id,
+        tool_name: details?.tool_name,
+      });
+    } catch (_err) {
+      // If an error occurs while setting custom posthog event, ignore it and continue
+    }
+
+    setIsExportLoading(true);
+    const downloadUrl = `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/project-transfer/${details?.tool_id}`;
+
+    // Add authorization header by fetching the file
+    const requestOptions = {
+      method: "GET",
+      url: downloadUrl,
+      headers: {
+        "X-CSRFToken": sessionDetails?.csrfToken,
+      },
+      responseType: "blob",
+    };
+
+    axiosPrivate(requestOptions)
+      .then((response) => {
+        // Create blob link to download
+        const url = window.URL.createObjectURL(new Blob([response.data]));
+        const link = document.createElement("a");
+        link.href = url;
+
+        // Get filename from response headers or use default
+        const contentDisposition = response.headers["content-disposition"];
+        let filename = `${details?.tool_name}_export.json`;
+        if (contentDisposition) {
+          const filenameMatch =
+            contentDisposition.match(/filename="?([^"]+)"?/);
+          if (filenameMatch) {
+            filename = filenameMatch[1];
+          }
+        }
+
+        link.setAttribute("download", filename);
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.URL.revokeObjectURL(url);
+
+        setAlertDetails({
+          type: "success",
+          content: "Project exported successfully",
+        });
+      })
+      .catch((err) => {
+        setAlertDetails(handleException(err, "Failed to export project"));
+      })
+      .finally(() => {
+        setIsExportLoading(false);
+      });
+  };
+
+  const handleCreateApiDeployment = async () => {
+    try {
+      setPostHogCustomEvent("intent_create_api_deployment_from_prompt_studio", {
+        info: "Clicked Create API Deployment in tool IDE",
+        tool_id: details?.tool_id,
+        tool_name: details?.tool_name,
+      });
+    } catch (_err) {
+      // If an error occurs while setting custom posthog event, ignore it and continue
+    }
+
+    const ok = await checkLookups(details?.tool_id, "API deployment");
+    if (!ok) return;
+
+    // Check for existing API deployments before proceeding
+    setIsApiDeploymentLoading(true);
+    const path = `/api/v1/unstract/${sessionDetails.orgId}`;
+    const requestOptions = {
+      method: "GET",
+      url: `${path}/api/deployment/by-prompt-studio-tool/?tool_id=${details?.tool_id}`,
+    };
+    axiosPrivate(requestOptions)
+      .then((response) => {
+        const deployments = response?.data || [];
+        setExistingApiDeployments(deployments);
+        setApiDeploymentConfirmModalVisible(true);
+      })
+      .catch((err) => {
+        setAlertDetails(
+          handleException(err, "Failed to check existing deployments"),
+        );
+        // If check fails, still allow proceeding
+        setOpenCreateApiDeploymentModal(true);
+      })
+      .finally(() => {
+        setIsApiDeploymentLoading(false);
+      });
+  };
+
+  const handleConfirmApiDeployment = useCallback(() => {
+    setApiDeploymentConfirmModalVisible(false);
+    setOpenCreateApiDeploymentModal(true);
+  }, []);
+
+  const handleOpenEditModal = useCallback(() => {
+    editForm.setFieldsValue({
+      tool_name: details?.tool_name || "",
+      description: details?.description || "",
+    });
+    setEditModalOpen(true);
+  }, [details, editForm]);
+
+  const handleEditSubmit = useCallback(async () => {
+    try {
+      const values = await editForm.validateFields();
+      const res = await handleUpdateTool(values);
+      const updatedData = res?.data;
+      if (updatedData) {
+        useCustomToolStore.setState({ details: updatedData });
+      }
+      setEditModalOpen(false);
+      setAlertDetails({ type: "success", content: "Updated successfully" });
+    } catch (err) {
+      if (err?.errorFields) {
+        return;
+      }
+      setAlertDetails(handleException(err, "Failed to update"));
+    }
+  }, [editForm, handleUpdateTool, setAlertDetails, handleException]);
+
+  const actionButtons = useMemo(
+    () => (
       <div className="custom-tools-header-btns">
         {SinglePassToggleSwitch && (
           <SinglePassToggleSwitch handleUpdateTool={handleUpdateTool} />
@@ -162,22 +346,64 @@ function Header({ setOpenSettings, handleUpdateTool }) {
         <div>
           <Tooltip title="Settings">
             <Button
-              icon={<SettingOutlined />}
+              icon={<Settings />}
+              data-testid="ps-header-settings-btn"
               onClick={() => setOpenSettings(true)}
             />
           </Tooltip>
         </div>
+        {CloneButton && <CloneButton setOpenCloneModal={setOpenCloneModal} />}
         <div className="custom-tools-header-v-divider" />
+        <Dropdown
+          menu={{
+            items: [
+              ...(PromptShareButton
+                ? [
+                    {
+                      key: "public-share",
+                      label: "Create / Manage Public Sharing",
+                      onClick: () => setOpenShareModal(true),
+                    },
+                  ]
+                : []),
+              {
+                key: "export-tool",
+                label: "Export as Tool",
+                onClick: () => handleShare(true),
+              },
+              {
+                key: "export-json",
+                label: "Export as JSON",
+                onClick: handleExportProject,
+              },
+            ],
+          }}
+          trigger={["click"]}
+          disabled={isPublicSource}
+          data-testid="ps-header-export-menu"
+        >
+          <CustomButton
+            type="primary"
+            loading={isExportLoading}
+            disabled={isPublicSource}
+            icon={<ExportToolIcon />}
+            className="export-text"
+            data-testid="ps-header-export-btn"
+          >
+            Export
+          </CustomButton>
+        </Dropdown>
         <div>
-          <Tooltip title="Export as tool">
-            <CustomButton
-              type="primary"
-              onClick={() => handleShare(true)}
-              loading={isExportLoading}
-            >
-              <ExportToolIcon />
-            </CustomButton>
-          </Tooltip>
+          <CustomButton
+            type="primary"
+            loading={isApiDeploymentLoading}
+            disabled={isPublicSource}
+            icon={<ExportToolIcon />}
+            className="export-text"
+            onClick={handleCreateApiDeployment}
+          >
+            Deploy as API
+          </CustomButton>
         </div>
         <ExportTool
           allUsers={userList}
@@ -187,14 +413,143 @@ function Header({ setOpenSettings, handleUpdateTool }) {
           loading={isExportLoading}
           toolDetails={toolDetails}
         />
+        {!isPublicSource && (
+          <CreateApiDeploymentFromPromptStudio
+            open={openCreateApiDeploymentModal}
+            setOpen={setOpenCreateApiDeploymentModal}
+            toolDetails={details}
+          />
+        )}
       </div>
-    </div>
+    ),
+    [
+      handleUpdateTool,
+      setOpenSettings,
+      setOpenCloneModal,
+      setOpenShareModal,
+      isPublicSource,
+      isExportLoading,
+      isApiDeploymentLoading,
+      userList,
+      openExportToolModal,
+      toolDetails,
+      details,
+      openCreateApiDeploymentModal,
+    ],
+  );
+
+  return (
+    <>
+      <ToolNavBar
+        title={details?.tool_name || ""}
+        subtitle={isPublicSource ? undefined : details?.description}
+        previousRoute={
+          isPublicSource || !sessionDetails?.orgName
+            ? undefined
+            : `/${sessionDetails.orgName}/tools`
+        }
+        onEditTitle={
+          isPublicSource || !details?.tool_id ? undefined : handleOpenEditModal
+        }
+        editTitleDisabled={!canEdit}
+        customButtons={actionButtons}
+      />
+      <Modal
+        title="Edit Project"
+        data-testid="ps-edit-project-modal"
+        open={editModalOpen}
+        onOk={handleEditSubmit}
+        onCancel={() => setEditModalOpen(false)}
+        okText="Save"
+        centered
+        destroyOnClose
+      >
+        <Form form={editForm} layout="vertical">
+          <Form.Item
+            name="tool_name"
+            label="Project Name"
+            rules={[{ required: true, message: "Name is required" }]}
+          >
+            <Input />
+          </Form.Item>
+          <Form.Item name="description" label="Description">
+            <Input.TextArea rows={3} />
+          </Form.Item>
+        </Form>
+      </Modal>
+      <Modal
+        onOk={handleConfirmForceExport} // Pass the confirm action
+        onCancel={() => setConfirmModalVisible(false)} // Close the modal on cancel
+        open={confirmModalVisible}
+        title="Are you sure"
+        data-testid="ps-force-export-modal"
+        okText="Force Export"
+        centered
+      >
+        Unable to export tool. Some prompt(s) were not run. Please run them
+        before exporting.{" "}
+        <strong>Would you like to force export anyway?</strong>
+      </Modal>
+      <Modal
+        onOk={handleConfirmApiDeployment}
+        onCancel={() => setApiDeploymentConfirmModalVisible(false)}
+        open={apiDeploymentConfirmModalVisible}
+        title="Create API Deployment"
+        data-testid="ps-create-api-deployment-modal"
+        okText="Proceed"
+        centered
+        width={600}
+      >
+        <div className="api-deployment-modal-content">
+          <p>
+            <strong>
+              You are about to create a new API deployment for this tool.
+            </strong>
+          </p>
+        </div>
+        {existingApiDeployments.length > 0 && (
+          <div className="api-deployment-notice">
+            <p className="api-deployment-notice-title">
+              Notice: You have {existingApiDeployments.length} existing API
+              deployment{existingApiDeployments.length > 1 ? "s" : ""}
+            </p>
+            <p className="api-deployment-notice-description">
+              Creating a new deployment will add another API endpoint. Consider
+              managing existing deployments if needed.
+            </p>
+            <div className="api-deployment-existing-section">
+              <strong>Existing deployments:</strong>
+              <ul className="api-deployment-existing-list">
+                {existingApiDeployments.map((deployment) => (
+                  <li
+                    key={deployment.id}
+                    className="api-deployment-existing-item"
+                  >
+                    {deployment.display_name}
+                    {deployment.api_name && (
+                      <span className="api-deployment-api-name">
+                        {" "}
+                        (API: {deployment.api_name})
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+        <p>Do you want to proceed with creating the API deployment?</p>
+      </Modal>
+    </>
   );
 }
 
 Header.propTypes = {
   setOpenSettings: PropTypes.func.isRequired,
   handleUpdateTool: PropTypes.func.isRequired,
+  setOpenCloneModal: PropTypes.func.isRequired,
+  setOpenShareModal: PropTypes.func.isRequired,
+  checkLookups: PropTypes.func,
 };
 
 export { Header };

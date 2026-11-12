@@ -1,13 +1,40 @@
+import datetime
+import logging
 import os
+import re
 from typing import Any
 
 import psycopg2
-from psycopg2.extensions import connection
+from psycopg2 import sql as psycopg2_sql
+from psycopg2.extensions import connection, parse_dsn
 
+from unstract.connectors.constants import DatabaseTypeConstants
+from unstract.connectors.databases.psycopg_handler import PsycoPgHandler
+from unstract.connectors.databases.sql_safety import (
+    QuoteStyle,
+    safe_identifier,
+    validate_identifier,
+)
 from unstract.connectors.databases.unstract_db import UnstractDB
+from unstract.connectors.exceptions import ConnectorError
+
+logger = logging.getLogger(__name__)
+
+INVALID_URL_MESSAGE = "The connection URL is not valid."
+CONNECT_FAILED_MESSAGE = (
+    "Could not connect. If the user name or password has special characters, "
+    "percent-encode them."
+)
 
 
-class PostgreSQL(UnstractDB):
+class PostgreSQL(UnstractDB, PsycoPgHandler):
+    # Connection timeout settings (in seconds)
+    CONNECT_TIMEOUT = 30  # Time to establish connection
+    STATEMENT_TIMEOUT = 300  # Time for query execution (5 minutes)
+    KEEPALIVE_IDLE = 30  # Time before sending keepalive
+    KEEPALIVE_INTERVAL = 10  # Time between keepalive probes
+    KEEPALIVE_COUNT = 3  # Number of keepalive failures before dropping
+
     def __init__(self, settings: dict[str, Any]):
         super().__init__("PostgreSQL")
 
@@ -44,6 +71,10 @@ class PostgreSQL(UnstractDB):
         return "/icons/connector-icons/Postgresql.png"
 
     @staticmethod
+    def get_doc_url() -> str:
+        return "https://docs.unstract.com/unstract/unstract_platform/connectors/databases/postgresql_database/"
+
+    @staticmethod
     def get_json_schema() -> str:
         f = open(f"{os.path.dirname(__file__)}/static/json_schema.json")
         schema = f.read()
@@ -58,16 +89,215 @@ class PostgreSQL(UnstractDB):
     def can_read() -> bool:
         return True
 
+    def get_quote_style(self) -> QuoteStyle:
+        return QuoteStyle.DOUBLE_QUOTE
+
+    def sql_to_db_mapping(self, value: Any, column_name: str | None = None) -> str:
+        """Gets the python datatype of value and converts python datatype to
+        corresponding DB datatype.
+
+        Args:
+            value (Any): python value of any datatype
+            column_name (str | None): name of the column being mapped
+
+        Returns:
+            str: database columntype
+        """
+        data_type = type(value)
+
+        if data_type in (dict, list):
+            if column_name and column_name.endswith("_v2"):
+                return str(DatabaseTypeConstants.POSTGRES_JSONB)
+            else:
+                return str(DatabaseTypeConstants.POSTGRES_TEXT)
+
+        mapping = {
+            str: DatabaseTypeConstants.POSTGRES_TEXT,
+            int: DatabaseTypeConstants.POSTGRES_INTEGER,
+            float: DatabaseTypeConstants.POSTGRES_DOUBLE_PRECISION,
+            datetime.datetime: DatabaseTypeConstants.POSTGRES_TIMESTAMP,
+        }
+        return str(mapping.get(data_type, DatabaseTypeConstants.POSTGRES_TEXT))
+
+    @staticmethod
+    def _connect(conn_params: dict[str, Any]) -> connection:
+        """Open a connection, hiding libpq's error when it may echo a password."""
+        url = conn_params.get("dsn", "")
+        PostgreSQL._check_url(url)
+        try:
+            return psycopg2.connect(**conn_params)
+        except psycopg2.OperationalError as exc:
+            if PostgreSQL._password_may_be_misread(url):
+                # The error text may echo the password, so only its code is logged.
+                logger.warning("Connect failed, URL may be misread: %s", exc.pgcode)
+                raise ConnectorError(CONNECT_FAILED_MESSAGE) from None
+            raise
+
+    @staticmethod
+    def _check_url(url: str) -> None:
+        """Reject a URL libpq can't parse, with a fixed message."""
+        try:
+            parse_dsn(url)
+        except (psycopg2.ProgrammingError, UnicodeError) as exc:
+            # These echo the URL or its bytes, password included.
+            logger.warning("Connection URL could not be parsed: %s", type(exc).__name__)
+            raise ConnectorError(INVALID_URL_MESSAGE) from None
+
+    @staticmethod
+    def _password_may_be_misread(url: str) -> bool:
+        """Best-effort check that libpq read part of a password as another setting.
+
+        An unescaped ``@`` or ``/`` in it, or an ``@`` in a query value with no ``/``
+        before it, moves text into the host, port or database, and libpq's errors
+        echo those. With no ``@``, only a port that isn't a number from 1 to 65535
+        gives it away. Not caught: any other URL with no ``@``, or a keyword
+        inside a query password.
+        """
+        # libpq stops reading at a NUL.
+        rest = url.partition("\0")[0].partition("://")[2]
+        at_signs = rest.count("@")
+        if not at_signs:
+            ports = parse_dsn(url).get("port", "").split(",")
+            return not all(PostgreSQL._looks_like_port(port) for port in ports)
+        authority = re.split("[/?]", rest, maxsplit=1)[0]
+        return at_signs > 1 or at_signs != authority.count("@")
+
+    @staticmethod
+    def _looks_like_port(port: str) -> bool:
+        """Whether this reads as a port number; anything else may be a password."""
+        return not port or (
+            re.fullmatch("[0-9]{1,5}", port) is not None and 0 < int(port) <= 65535
+        )
+
     def get_engine(self) -> connection:
+        """Returns a connection to the PostgreSQL database.
+
+        Returns:
+            connection: A connection to the PostgreSQL database.
+        """
+        conn_params = {
+            "keepalives": 1,
+            "keepalives_idle": self.KEEPALIVE_IDLE,
+            "keepalives_interval": self.KEEPALIVE_INTERVAL,
+            "keepalives_count": self.KEEPALIVE_COUNT,
+            "connect_timeout": self.CONNECT_TIMEOUT,
+            "application_name": "unstract_connector",
+            "sslmode": "prefer",
+        }
+
         if self.connection_url:
-            con = psycopg2.connect(dsn=self.connection_url)
+            # Use the URL directly without adding extra options
+            conn_params["dsn"] = self.connection_url
         else:
-            con = psycopg2.connect(
-                host=self.host,
-                port=self.port,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                options=f"-c search_path={self.schema}",
+            # For non-URL connections
+            conn_params.update(
+                {
+                    "host": self.host,
+                    "port": self.port,
+                    "database": self.database,
+                    "user": self.user,
+                    "password": self.password,
+                }
             )
+
+        con = self._connect(conn_params)
+
+        # Set schema explicitly only if schema is specified (avoids PgBouncer issues)
+        if self.schema:
+            validate_identifier(self.schema)
+            with con.cursor() as cur:
+                cur.execute(
+                    psycopg2_sql.SQL("SET search_path TO {}").format(
+                        psycopg2_sql.Identifier(self.schema)
+                    )
+                )
+
         return con
+
+    def get_create_table_base_query(self, table: str) -> str:
+        """Function to create a base create table sql query with PostgreSQL specific types.
+
+        Args:
+            table (str): db-connector table name
+
+        Returns:
+            str: generates a create sql base query with the constant columns
+        """
+        quoted_table = self._quote_identifier(table)
+        sql_query = (
+            f"CREATE TABLE IF NOT EXISTS {quoted_table} "
+            f"(id TEXT, "
+            f"created_by TEXT, created_at TIMESTAMP, "
+            f"metadata JSONB, "
+            f"user_field_1 BOOLEAN DEFAULT FALSE, "
+            f"user_field_2 INTEGER DEFAULT 0, "
+            f"user_field_3 TEXT DEFAULT NULL, "
+            f"status TEXT CHECK (status IN ('ERROR', 'SUCCESS')), "
+            f"error_message TEXT, "
+        )
+        return sql_query
+
+    def prepare_multi_column_migration(self, table_name: str, column_name: str) -> str:
+        quoted_table = self._quote_identifier(table_name)
+        quoted_col_v2 = safe_identifier(f"{column_name}_v2", QuoteStyle.DOUBLE_QUOTE)
+        sql_query = (
+            f"ALTER TABLE {quoted_table} "
+            f"ADD COLUMN {quoted_col_v2} JSONB, "
+            f"ADD COLUMN metadata JSONB, "
+            f"ADD COLUMN user_field_1 BOOLEAN DEFAULT FALSE, "
+            f"ADD COLUMN user_field_2 INTEGER DEFAULT 0, "
+            f"ADD COLUMN user_field_3 TEXT DEFAULT NULL, "
+            f"ADD COLUMN status TEXT CHECK (status IN ('ERROR', 'SUCCESS')), "
+            f"ADD COLUMN error_message TEXT"
+        )
+        return sql_query
+
+    def execute_query(
+        self, engine: Any, sql_query: str, sql_values: Any, **kwargs: Any
+    ) -> None:
+        table_name = kwargs.get("table_name", None)
+        PsycoPgHandler.execute_query(
+            engine=engine,
+            sql_query=sql_query,
+            sql_values=sql_values,
+            database=self.database,
+            schema=self.schema,
+            table_name=table_name,
+        )
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        """Quote PostgreSQL identifier to handle special characters like hyphens.
+
+        PostgreSQL identifiers with special characters must be enclosed in double quotes.
+        This method adds proper quoting for table names containing hyphens, spaces,
+        or other special characters. Embedded double quotes are escaped.
+
+        Args:
+            identifier (str): Table name or column name to quote
+
+        Returns:
+            str: Properly quoted identifier safe for PostgreSQL
+        """
+        return safe_identifier(identifier, QuoteStyle.DOUBLE_QUOTE)
+
+    def get_sql_insert_query(
+        self, table_name: str, sql_keys: list[str], sql_values: list[str] | None = None
+    ) -> str:
+        """Override base method to add PostgreSQL-specific table name quoting.
+
+        Generates INSERT query with properly quoted table name for PostgreSQL.
+
+        Args:
+            table_name (str): Name of the table
+            sql_keys (list[str]): List of column names
+            sql_values (list[str], optional): SQL values for database-specific handling (ignored for PostgreSQL)
+
+        Returns:
+            str: INSERT query with properly quoted table name
+        """
+        quoted_table = self._quote_identifier(table_name)
+        quoted_keys = [safe_identifier(k, QuoteStyle.DOUBLE_QUOTE) for k in sql_keys]
+        keys_str = ", ".join(quoted_keys)
+        values_placeholder = ", ".join(["%s"] * len(sql_keys))
+        return f"INSERT INTO {quoted_table} ({keys_str}) VALUES ({values_placeholder})"

@@ -1,81 +1,242 @@
-import {
-  Alert,
-  Button,
-  Col,
-  Dropdown,
-  Image,
-  Row,
-  Space,
-  Typography,
-} from "antd";
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
 import axios from "axios";
+import {
+  ChevronDown,
+  LogIn,
+  LogOut,
+  Settings,
+  User,
+  UserRoundCog,
+} from "lucide-react";
+import PropTypes from "prop-types";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Col, Row, Space } from "@/components/ui/shims/antd-layout";
+import { Alert, Image } from "@/components/ui/shims/antd-leaves";
+import { Dropdown } from "@/components/ui/shims/antd-overlays";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
-import { UnstractLogo } from "../../../assets/index.js";
+import { UnstractBlackLogo, UnstractLogo } from "../../../assets/index.js";
 import {
   getBaseUrl,
+  homePagePath,
   onboardCompleted,
+  THEME,
 } from "../../../helpers/GetStaticData.js";
+import { switchOrgViaLogin } from "../../../helpers/orgSwitchLogin.js";
 import useLogout from "../../../hooks/useLogout.js";
 import "../../../layouts/page-layout/PageLayout.css";
 import { useSessionStore } from "../../../store/session-store.js";
 import "./TopNavBar.css";
-import { useAlertStore } from "../../../store/alert-store.js";
-import { ConfirmModal } from "../../widgets/confirm-modal/ConfirmModal.jsx";
+import config from "../../../config";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
+import { useAlertStore } from "../../../store/alert-store.js";
+import { openConfirm } from "../../widgets/confirm-modal/confirmStore.js";
 
 let TrialDaysInfo;
 try {
-  TrialDaysInfo =
-    require("../../../plugins/subscription/trial-helper/TrialDaysInfo.jsx").default;
-} catch (err) {
+  const mod = await import(
+    "../../../plugins/unstract-subscription/components/TrialDaysInfo.jsx"
+  );
+  TrialDaysInfo = mod.default;
+} catch {
   // Plugin not found
 }
 
-function TopNavBar() {
+let selectedProductStore;
+let selectedProduct;
+
+try {
+  selectedProductStore = await import(
+    "../../../plugins/store/select-product-store.js"
+  );
+} catch {
+  // Ignore if hook not available
+}
+
+let PlatformDropdown;
+try {
+  const mod = await import(
+    "../../../plugins/platform-dropdown/PlatformDropDown.jsx"
+  );
+  PlatformDropdown = mod.PlatformDropdown;
+} catch {
+  // Plugin not found
+}
+
+let WhispererLogo;
+let WhispererDarkLogo;
+try {
+  const mod = await import("../../../plugins/assets/llmWhisperer/index.js");
+  WhispererLogo = mod.WhispererLogo;
+  WhispererDarkLogo = mod.LlmWhispererLogo;
+} catch {
+  // Ignore if hook not available
+}
+
+/*
+ * `Logo` is injected rather than hardcoded: the top bar is a light surface in
+ * light mode and a dark one under `.dark`, and each product ships two marks
+ * (white ink / dark ink) instead of one recolourable SVG -- the brand accent
+ * dots are baked in, so a blanket `fill` override would flatten them.
+ */
+const CustomLogo = ({ onClick, className, Logo }) => {
+  // Use Ant Design Image and config.logoUrl
+  if (config.logoUrl) {
+    return (
+      <Image
+        src={config.logoUrl}
+        preview={false}
+        className={className}
+        onClick={onClick}
+        alt="logo"
+        width={120}
+        style={{
+          cursor: onClick ? "pointer" : undefined,
+          background: "transparent",
+        }}
+        onError={() => {
+          // If image fails to load, component will re-render and use UnstractLogo
+          // since we'll set config.logoUrl to null
+          if (config.logoUrl) {
+            // Only modify if it's not already null to avoid infinite re-renders
+            config.logoUrl = null;
+          }
+        }}
+      />
+    );
+  }
+  return <Logo className={className} onClick={onClick} />;
+};
+// `APIHubLogo`/`WhispererLogo` are the WHITE-ink marks (named for the dark bar
+// they were drawn for); `APIHubDarkLogo`/`LlmWhispererLogo` are the dark-ink
+// ones. Both are pulled so the bar can pick by theme.
+let APIHubLogo;
+let APIHubDarkLogo;
+try {
+  const mod = await import("../../../plugins/assets/verticals/index.js");
+  APIHubLogo = mod.APIHubLogo;
+  APIHubDarkLogo = mod.APIHubDarkLogo;
+} catch {
+  // Ignore if hook not available
+}
+
+let unstractSubscriptionPlan;
+let unstractSubscriptionPlanStore;
+let UNSTRACT_SUBSCRIPTION_PLANS;
+let UnstractPricingMenuLink;
+try {
+  unstractSubscriptionPlanStore = await import(
+    "../../../plugins/store/unstract-subscription-plan-store"
+  );
+  const constantsMod = await import(
+    "../../../plugins/unstract-subscription/helper/constants"
+  );
+  UNSTRACT_SUBSCRIPTION_PLANS = constantsMod.UNSTRACT_SUBSCRIPTION_PLANS;
+  const menuMod = await import(
+    "../../../plugins/unstract-subscription/components/UnstractPricingMenuLink.jsx"
+  );
+  UnstractPricingMenuLink = menuMod.UnstractPricingMenuLink;
+} catch {
+  // Plugin unavailable.
+}
+
+function TopNavBar({ isSimpleLayout, topNavBarOptions }) {
   const navigate = useNavigate();
   const { sessionDetails } = useSessionStore();
-  const { orgName, remainingTrialDays, allOrganization, orgId } =
-    sessionDetails;
+  const { orgName, allOrganization, orgId, isLoggedIn } = sessionDetails;
   const baseUrl = getBaseUrl();
-  const onBoardUrl = baseUrl + `/${orgName}/onboard`;
+  const onBoardUrl = `${baseUrl}/${orgName}/onboard`;
   const logout = useLogout();
   const [showOnboardBanner, setShowOnboardBanner] = useState(false);
+  const [reviewPageHeader, setReviewPageHeader] = useState("");
   const { setAlertDetails } = useAlertStore();
   const handleException = useExceptionHandler();
+  const location = useLocation();
 
+  if (selectedProductStore?.useSelectedProductStore) {
+    selectedProduct = selectedProductStore.useSelectedProductStore(
+      (state) => state?.selectedProduct,
+    );
+  }
+
+  try {
+    if (unstractSubscriptionPlanStore?.useUnstractSubscriptionPlanStore) {
+      unstractSubscriptionPlan =
+        unstractSubscriptionPlanStore?.useUnstractSubscriptionPlanStore(
+          (state) => state?.unstractSubscriptionPlan,
+        );
+    }
+  } catch {
+    // Plugin hook may throw during initialization
+  }
+
+  const shouldDisableRouting = useMemo(() => {
+    if (!unstractSubscriptionPlan || !UNSTRACT_SUBSCRIPTION_PLANS) {
+      return false;
+    }
+
+    return unstractSubscriptionPlan?.remainingDays <= 0;
+  }, [unstractSubscriptionPlan]);
+
+  // Detect product from URL path as a fallback when selectedProduct is not set
+  // (e.g., incognito/unauthenticated users visiting verticals pages)
+  const isVerticalsRoute = location.pathname.startsWith("/verticals");
+  const effectiveProduct =
+    selectedProduct || (isVerticalsRoute ? "verticals" : null);
+  const isUnstract = !(effectiveProduct && effectiveProduct !== "unstract");
+  const isAPIHub = effectiveProduct === "verticals";
+  const isStaff = sessionDetails?.isStaff || sessionDetails?.is_staff;
+  const isOpenSource = orgName === "mock_org";
+
+  // `.topNav` is `--card`: white in light mode, near-black under `.dark`.
+  // `sessionDetails.currentTheme` is the app's single source of truth for the
+  // theme (App.jsx only mirrors it onto next-themes), so the mark follows it.
+  // In OSS the two plugin logos are undefined either way; the render guards.
+  const isDarkTheme = sessionDetails?.currentTheme === THEME.DARK;
+  const ProductLogo = isDarkTheme ? UnstractLogo : UnstractBlackLogo;
+  const APIHubBarLogo = isDarkTheme ? APIHubLogo : APIHubDarkLogo;
+  const WhispererBarLogo = isDarkTheme ? WhispererLogo : WhispererDarkLogo;
+
+  // Check user role and whether the onboarding is incomplete
   useEffect(() => {
-    setShowOnboardBanner(!onboardCompleted(sessionDetails?.adapters));
+    const { role } = sessionDetails;
+    const isReviewer = role === "unstract_reviewer";
+    const isSupervisor = role === "unstract_supervisor";
+
+    setShowOnboardBanner(
+      !onboardCompleted(sessionDetails?.adapters) &&
+        !isReviewer &&
+        !isSupervisor,
+    );
   }, [sessionDetails]);
 
-  const cascadeOptions = allOrganization.map((org) => {
-    return {
-      key: org?.id,
-      label:
-        org?.id === sessionDetails?.orgId ? (
-          <div
-            onClick={() =>
-              setAlertDetails({
-                type: "error",
-                content: `You are already in ${org?.display_name}`,
-              })
-            }
-          >
-            {org?.display_name}
-          </div>
-        ) : (
-          <ConfirmModal
-            handleConfirm={() => handleContinue(org?.id)}
-            content={`Want to switch to ${org?.display_name} `}
-          >
-            <div>{org?.display_name}</div>
-          </ConfirmModal>
-        ),
-    };
-  });
+  // Determine review page header
+  useEffect(() => {
+    const pathSegments = location.pathname.split("review");
+    if (pathSegments.length > 1) {
+      if (pathSegments[1].includes("/approve")) {
+        setReviewPageHeader("Approve");
+      } else if (pathSegments[1].includes("/download_and_sync")) {
+        setReviewPageHeader("Download and Sync Manager");
+      } else {
+        setReviewPageHeader("Review");
+      }
+    } else {
+      setReviewPageHeader(null);
+    }
+    if (location.pathname.includes("/simple_review")) {
+      setReviewPageHeader("Simple Review");
+    }
+  }, [location]);
 
-  const handleContinue = async (selectedOrg) => {
+  // Switch organization
+  const handleContinue = useCallback(async (selectedOrg) => {
+    // Read at click time: this callback is created once.
+    if (useSessionStore.getState().sessionDetails?.orgSwitchViaLogin) {
+      switchOrgViaLogin(selectedOrg);
+      return;
+    }
     const requestOptions = {
       method: "POST",
       url: `/api/v1/organization/${selectedOrg}/set`,
@@ -83,114 +244,240 @@ function TopNavBar() {
         "X-CSRFToken": sessionDetails?.csrfToken,
       },
     };
-    await axios(requestOptions)
-      .then(() => {
-        window.location.reload();
-      })
-      .catch((err) => {
-        setAlertDetails(handleException(err));
-      });
-  };
+    try {
+      await axios(requestOptions);
+      navigate("/");
+      window.location.reload();
+    } catch (err) {
+      setAlertDetails(handleException(err));
+    }
+  }, []);
 
-  // Dropdown items
-  const items = [
-    {
-      key: "1",
-      label: (
-        <Button
-          onClick={() => navigate(`/${orgName}/profile`)}
-          className="logout-button"
-        >
-          Profile
-        </Button>
-      ),
-    },
-    {
-      key: "2",
-      label: (
-        <Button onClick={logout} className="logout-button">
-          Logout
-        </Button>
-      ),
-    },
-    allOrganization.length > 1 && {
-      key: "3",
-      label: (
-        <Dropdown
-          placeholder="Switch Organization"
-          menu={{
-            items: cascadeOptions,
-            selectable: true,
-            selectedKeys: [orgId],
-            className: "switch-org-menu",
-          }}
-          placement="left"
-        >
-          <div>Switch Org</div>
-        </Dropdown>
-      ),
-    },
-  ];
+  // Prepare org list for switching
+  const cascadeOptions = useMemo(() => {
+    return allOrganization?.map((org) => {
+      const isCurrentOrg = org?.id === sessionDetails?.orgId;
+      return {
+        key: org?.id,
+        /*
+         * Both actions sit on the menu item, not inside its label: the item is
+         * what the keyboard focuses, and Radix turns Enter/Space on it into a
+         * click on the item itself, which never reaches a descendant's handler.
+         */
+        onClick: isCurrentOrg
+          ? () =>
+              setAlertDetails({
+                type: "error",
+                content: `You are already in ${org?.display_name}`,
+              })
+          : () =>
+              openConfirm({
+                title: "Are you sure?",
+                content: `Want to switch to ${org?.display_name}?`,
+                okText: "Confirm",
+                cancelText: "Cancel",
+                onOk: () => handleContinue(org?.id),
+              }),
+        label: org?.display_name,
+      };
+    });
+  }, [allOrganization, handleContinue]);
+
+  // Build dropdown menu items
+  const items = useMemo(() => {
+    const handleLogin = () => {
+      const baseUrl = getBaseUrl();
+      const newURL = baseUrl + "/api/v1/login";
+      window.location.href = newURL;
+    };
+
+    const handleClick = isLoggedIn ? logout : handleLogin;
+    const icon = isLoggedIn ? <LogOut /> : <LogIn />;
+    const label = isLoggedIn ? "Logout" : "Login";
+
+    return [
+      // Profile
+      isUnstract &&
+        !isSimpleLayout && {
+          key: "1",
+          label: (
+            <Button
+              onClick={() => navigate(`/${orgName}/profile`)}
+              className="logout-button"
+              disabled={shouldDisableRouting}
+              type="text"
+            >
+              <User /> Profile
+            </Button>
+          ),
+        },
+      // Switch Organization
+      allOrganization?.length > 1 && {
+        key: "3",
+        label: (
+          <Dropdown
+            placeholder="Switch Organization"
+            menu={{
+              items: cascadeOptions,
+              selectable: true,
+              selectedKeys: [orgId],
+              className: "switch-org-menu",
+            }}
+            placement="left"
+          >
+            {/*
+             * The org list opens on pointerdown; the click that follows would
+             * otherwise select this row of the parent menu, which closes that
+             * menu and unmounts the org list with it.
+             */}
+            <div
+              className="ant-dropdown-trigger switch-org-trigger"
+              onClick={(event) => event.stopPropagation()}
+              onKeyDown={(event) => event.stopPropagation()}
+            >
+              <UserRoundCog /> Switch Org
+            </div>
+          </Dropdown>
+        ),
+      },
+      // Pricing
+      isUnstract &&
+        UnstractPricingMenuLink &&
+        sessionDetails?.isAdmin &&
+        !sessionDetails?.provider && {
+          key: "7",
+          label: <UnstractPricingMenuLink orgName={orgName} />,
+        },
+      // Custom Plans
+      isUnstract &&
+        isStaff &&
+        !isOpenSource && {
+          key: "8",
+          label: (
+            <Button
+              onClick={() => navigate(`/${orgName}/admin/custom-plans`)}
+              className="logout-button"
+              type="text"
+            >
+              <Settings /> Custom Plans
+            </Button>
+          ),
+        },
+      // Login/Logout
+      {
+        key: "2",
+        label: (
+          <Button
+            onClick={handleClick}
+            icon={icon}
+            className="logout-button"
+            type="text"
+          >
+            {label}
+          </Button>
+        ),
+      },
+    ].filter(Boolean);
+  }, [
+    isUnstract,
+    isSimpleLayout,
+    allOrganization,
+    cascadeOptions,
+    orgName,
+    orgId,
+    shouldDisableRouting,
+  ]);
 
   // Function to get the initials from the user name
-  const getInitials = (name) => {
+  const getInitials = useCallback((name) => {
     const names = name?.split(" ");
-    const initials = names
+    return names
       ?.map((n) => n.charAt(0))
       ?.join("")
       ?.toUpperCase();
-    return initials;
-  };
+  }, []);
 
   return (
     <Row align="middle" className="topNav">
-      <Col span={4}>
-        <UnstractLogo className="topbar-logo" />
-      </Col>
-      <Col span={16} className="top-nav-alert-col">
-        {showOnboardBanner && (
-          <Alert
-            type="error"
-            message={
-              <>
-                <span className="top-nav-alert-msg">
-                  Your setup process is incomplete. Now, that&apos;s a bummer!
-                </span>
-                <a
-                  href={onBoardUrl}
-                  size="small"
-                  type="text"
-                  className="top-nav-alert-link"
-                >
-                  Complete it to start using Unstract
-                </a>
-              </>
+      <Col span={6} className="platform-switch-container">
+        {/* The cloud product switcher carries its own product mark. */}
+        {PlatformDropdown ? (
+          <PlatformDropdown />
+        ) : isUnstract ? (
+          <CustomLogo
+            className="topbar-logo cursor-pointer"
+            Logo={ProductLogo}
+            onClick={() =>
+              navigate(`/${sessionDetails?.orgName}/${homePagePath}`)
             }
-            showIcon
           />
+        ) : isAPIHub ? (
+          APIHubBarLogo && <APIHubBarLogo className="topbar-logo" />
+        ) : (
+          WhispererBarLogo && <WhispererBarLogo className="topbar-logo" />
+        )}
+        {reviewPageHeader && (
+          <span className="page-identifier">
+            <span className="custom-tools-header-v-divider" />
+            <span className="page-heading">{reviewPageHeader}</span>
+          </span>
         )}
       </Col>
+
+      {isSimpleLayout ? (
+        <Col span={14} />
+      ) : (
+        <Col span={14} className="top-nav-alert-col">
+          {isUnstract && showOnboardBanner && (
+            <Alert
+              type="error"
+              message={
+                <>
+                  <span className="top-nav-alert-msg">
+                    Your setup process is incomplete. Now, that&apos;s a bummer!
+                  </span>
+                  <a href={onBoardUrl} className="top-nav-alert-link">
+                    Complete it to start using Unstract
+                  </a>
+                </>
+              }
+              showIcon
+            />
+          )}
+        </Col>
+      )}
+
       <Col span={4}>
         <Row justify="end" align="middle">
-          <Space>
-            {TrialDaysInfo && (
-              <TrialDaysInfo remainingTrialDays={remainingTrialDays} />
-            )}
-            <Dropdown menu={{ items }} placement="bottomLeft" arrow>
-              <div className="top-navbar-dp">
-                {sessionDetails?.picture ? (
-                  <Image
-                    className="navbar-img"
-                    height="100%"
-                    width="100%"
-                    preview={false}
-                    src={sessionDetails?.picture}
-                  />
-                ) : (
-                  <Typography.Text className="initials">
-                    {getInitials(sessionDetails?.name)}
-                  </Typography.Text>
-                )}
+          <Space size={6}>
+            {topNavBarOptions}
+            {isUnstract && TrialDaysInfo && <TrialDaysInfo />}
+            <Dropdown
+              menu={{ items, className: "user-profile-menu" }}
+              placement="bottomLeft"
+              arrow
+              className="top-navbar-dp"
+            >
+              <div
+                className="top-navbar-avatar-menu"
+                data-testid="top-navbar-avatar-menu"
+              >
+                <div className="top-navbar-dp">
+                  {sessionDetails?.picture ? (
+                    <Image
+                      className="navbar-img"
+                      height="100%"
+                      width="100%"
+                      preview={false}
+                      src={sessionDetails?.picture}
+                    />
+                  ) : (
+                    <Typography.Text className="initials">
+                      {getInitials(sessionDetails?.name)}
+                    </Typography.Text>
+                  )}
+                </div>
+                <ChevronDown className="top-navbar-avatar-chevron" />
               </div>
             </Dropdown>
           </Space>
@@ -199,5 +486,16 @@ function TopNavBar() {
     </Row>
   );
 }
+
+TopNavBar.propTypes = {
+  isSimpleLayout: PropTypes.bool,
+  topNavBarOptions: PropTypes.node,
+};
+
+CustomLogo.propTypes = {
+  onClick: PropTypes.func.isRequired,
+  className: PropTypes.string.isRequired,
+  Logo: PropTypes.elementType.isRequired,
+};
 
 export { TopNavBar };

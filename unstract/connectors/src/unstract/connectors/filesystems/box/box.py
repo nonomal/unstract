@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from typing import Any
 
@@ -24,7 +25,7 @@ class BoxFS(UnstractFileSystem):
                 settings_dict = json.loads(settings["box_app_settings"])
                 if not isinstance(settings_dict, dict):
                     raise ConnectorError(
-                        "Box app settings is expected to be a valid JSON",
+                        "Box app settings should be a valid JSON.",
                         treat_as_user_message=True,
                     )
             except JSONDecodeError as e:
@@ -35,7 +36,9 @@ class BoxFS(UnstractFileSystem):
         try:
             oauth = JWTAuth.from_settings_dictionary(settings_dict)
             root_id = 0
-            self.box_fs = BoxFileSystem(oauth=oauth, root_id=root_id)
+            self.box_fs = BoxFileSystem(
+                oauth=oauth, root_id=root_id, use_listings_cache=False
+            )
         except ValueError as e:
             raise ConnectorError(
                 f"Error initialising from Box app settings: {e}",
@@ -110,10 +113,84 @@ class BoxFS(UnstractFileSystem):
     def get_fsspec_fs(self) -> BoxFileSystem:
         return self.box_fs
 
+    def extract_metadata_file_hash(self, metadata: dict[str, Any]) -> str | None:
+        """Extracts a unique file hash from metadata.
+
+        Args:
+            metadata (dict): Metadata dictionary obtained from fsspec.
+
+        Returns:
+            Optional[str]: The file hash in hexadecimal format or None if not found.
+        """
+        logger.error(f"[Box] File hash not found for the metadata: {metadata}")
+        return None
+
+    def is_dir_by_metadata(self, metadata: dict[str, Any]) -> bool:
+        """Check if the given path is a directory.
+
+        Args:
+            metadata (dict): Metadata dictionary obtained from fsspec or cloud API.
+
+        Returns:
+            bool: True if the path is a directory, False otherwise.
+        """
+        return metadata.get("type") == "directory"
+
+    def extract_modified_date(self, metadata: dict[str, Any]) -> datetime | None:
+        """Extract the last modified date from metadata.
+
+        Args:
+            metadata: File metadata dictionary from Box/fsspec.
+
+        Returns:
+            A timezone-aware datetime (UTC) or None if not available.
+        """
+        # Common Box/fsspec keys in order of specificity
+        value = (
+            metadata.get("modified_at")
+            or metadata.get("content_modified_at")
+            or metadata.get("modified")
+            or metadata.get("last_modified")
+            or metadata.get("updated_at")
+            or metadata.get("updated")
+            or metadata.get("client_modified")
+            or metadata.get("server_modified")
+            or metadata.get("mtime")
+        )
+        if value is None:
+            return None
+        try:
+            if isinstance(value, datetime):
+                dt = value if value.tzinfo else value.replace(tzinfo=UTC)
+                return dt.astimezone(UTC)
+            if isinstance(value, (int, float)):
+                return datetime.fromtimestamp(value, tz=UTC)
+            if isinstance(value, str):
+                # Normalize 'Z' suffix to '+00:00' for fromisoformat compatibility
+                v = value.strip().replace("Z", "+00:00")
+                dt = datetime.fromisoformat(v)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                return dt.astimezone(UTC)
+        except (ValueError, TypeError) as e:
+            logger.debug(
+                "[Box] Failed to parse modified date (keys=%s): %s",
+                list(metadata.keys()),
+                e,
+            )
+        return None
+
     def test_credentials(self) -> bool:
         """To test credentials for the Box connector."""
+        is_dir = False
         try:
-            self.get_fsspec_fs().isdir("/")
+            is_dir = bool(self.get_fsspec_fs().isdir("/"))
         except Exception as e:
-            raise ConnectorError(str(e))
+            raise ConnectorError(
+                f"Error from Box while testing connection: {str(e)}"
+            ) from e
+        if not is_dir:
+            raise ConnectorError(
+                "Unable to connect to Box, please check the connection settings."
+            )
         return True

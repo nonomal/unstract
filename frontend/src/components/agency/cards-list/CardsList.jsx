@@ -1,8 +1,11 @@
-import { CloseOutlined } from "@ant-design/icons";
-import { Card, Col, Progress, Row, Typography } from "antd";
+import { X } from "lucide-react";
 import PropTypes from "prop-types";
 import { useRef } from "react";
 import { useDrag, useDrop } from "react-dnd";
+import { Col, Row } from "@/components/ui/shims/antd-layout";
+import { Progress } from "@/components/ui/shims/antd-leaves";
+import { Card } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useAlertStore } from "../../../store/alert-store";
@@ -48,7 +51,7 @@ const CardsList = ({ step, index, activeTool, moveItem }) => {
       })
       .catch((err) => {
         setAlertDetails(
-          handleException(err, "Failed to delete the tool instance")
+          handleException(err, "Failed to delete the tool instance"),
         );
       });
   };
@@ -161,7 +164,7 @@ const CardsList = ({ step, index, activeTool, moveItem }) => {
                         handleConfirm={() => deleteStep()}
                         content="Want to delete this step"
                       >
-                        <CloseOutlined />
+                        <X />
                       </ConfirmModal>
                     </div>
                   )}
@@ -184,4 +187,5 @@ CardsList.propTypes = {
   activeTool: PropTypes.string.isRequired,
   moveItem: PropTypes.func.isRequired,
 };
+
 export { CardsList };

@@ -1,48 +1,340 @@
+import asyncio
 import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
-from unstract.connectors.filesystems.minio.minio import MinioFS
+import pytest
+from botocore.exceptions import ClientError
+from fsspec.implementations.dirfs import DirFileSystem
+from s3fs.core import S3FileSystem
+from s3fs.errors import translate_boto_error
+from unstract.connectors.exceptions import ConnectorError
+from unstract.connectors.filesystems.minio.exceptions import s3_error_code
+from unstract.connectors.filesystems.minio.minio import (
+    MinioFS,
+    _AccessFilteredS3FileSystem,
+)
+from unstract.connectors.filesystems.ucs.ucs import UnstractCloudStorage
 
 
 class TestMinoFS(unittest.TestCase):
-    @unittest.skip("")
-    def test_s3(self) -> None:
-        self.assertEqual(MinioFS.requires_oauth(), False)
-        access_key = os.environ.get("AWS_ACCESS_KEY_ID")
-        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
-        bucket_name = os.environ.get(
-            "FREE_STORAGE_AWS_BUCKET_NAME", "pandora-user-storage"
-        )
-        s3 = MinioFS(
-            {
-                "key": access_key,
-                "secret": secret_key,
-                "bucket": bucket_name,
-                "path": "/",
-                "endpoint_url": "https://s3.amazonaws.com",
-            }
-        )
-
-        print(s3.get_fsspec_fs().ls("pandora-user-storage"))
-
-    # @unittest.skip("Minio is not running")
+    @pytest.mark.integration
+    @unittest.skipUnless(
+        os.environ.get("MINIO_ACCESS_KEY_ID")
+        and os.environ.get("MINIO_SECRET_ACCESS_KEY"),
+        "Integration test requires a live MinIO and MINIO_ACCESS_KEY_ID + MINIO_SECRET_ACCESS_KEY",
+    )
     def test_minio(self) -> None:
+        # Endpoint from the rig's testcontainers MinIO via MINIO_ENDPOINT_URL;
+        # falls back to the local platform MinIO for manual runs.
         self.assertEqual(MinioFS.requires_oauth(), False)
-        access_key = os.environ.get("MINIO_ACCESS_KEY_ID")
-        secret_key = os.environ.get("MINIO_SECRET_ACCESS_KEY")
-        print(access_key, secret_key)
-        bucket_name = os.environ.get("FREE_STORAGE_AWS_BUCKET_NAME", "minio-test")
-        s3 = MinioFS(
-            {
-                "key": access_key,
-                "secret": secret_key,
-                "bucket": bucket_name,
-                "endpoint_url": "http://localhost:9000",
-                "path": "/minio-test",
-            }
-        )
+        endpoint_url = os.environ.get("MINIO_ENDPOINT_URL", "http://localhost:9000")
+        bucket = "rig-minio-test"
 
-        print(s3.get_fsspec_fs().ls("/minio-test"))  # type:ignore
+        # UN-3487: bucket is now required, so the connector can no longer
+        # discover it via a root bucket listing — bootstrap it directly.
+        bootstrap_fs = S3FileSystem(
+            key=os.environ["MINIO_ACCESS_KEY_ID"],
+            secret=os.environ["MINIO_SECRET_ACCESS_KEY"],
+            client_kwargs={"endpoint_url": endpoint_url},
+        )
+        if not bootstrap_fs.exists(bucket):
+            bootstrap_fs.mkdir(bucket)
+
+        fs = MinioFS(
+            {
+                "key": os.environ["MINIO_ACCESS_KEY_ID"],
+                "secret": os.environ["MINIO_SECRET_ACCESS_KEY"],
+                "endpoint_url": endpoint_url,
+                "bucket": bucket,
+            }
+        ).get_fsspec_fs()
+        # A live connection to the bucket-scoped root must succeed, without
+        # needing (or being able) to see any other bucket.
+        fs.ls("")
+
+
+def _translated_error(code: str) -> BaseException:
+    """Mirror what s3fs `_call_s3` actually raises in production.
+
+    s3fs routes every raise through `translate_boto_error`, which converts
+    `ClientError` into `PermissionError` / `FileNotFoundError` / `OSError`
+    with the original `ClientError` preserved as `__cause__`. Tests must
+    raise the translated form or they won't exercise the real catch path.
+    """
+    ce = ClientError({"Error": {"Code": code, "Message": code}}, "ListObjectsV2")
+    translated: BaseException = translate_boto_error(ce)
+    return translated
+
+
+class TestAccessFilteredS3FileSystem(unittest.TestCase):
+    """Unit tests for the per-bucket access filter in _AccessFilteredS3FileSystem.
+
+    These tests don't need a live MinIO/S3. They bypass
+    `_AccessFilteredS3FileSystem.__init__` and monkey-patch `_call_s3` /
+    `S3FileSystem._lsbuckets` to exercise the override end-to-end. If s3fs
+    renames or re-signatures either internal, these tests fail loudly in
+    CI instead of silently reverting to the unfiltered parent behavior.
+    """
+
+    def _make_fs(self) -> _AccessFilteredS3FileSystem:
+        # Bypass __init__ to avoid touching the network / event loop.
+        return _AccessFilteredS3FileSystem.__new__(_AccessFilteredS3FileSystem)
+
+    def test_accessible_bucket_is_kept(self) -> None:
+        fs = self._make_fs()
+        with patch.object(fs, "_call_s3", new=AsyncMock(return_value={})):
+            self.assertTrue(asyncio.run(fs._is_bucket_accessible("allowed")))
+
+    def test_access_denied_bucket_is_dropped(self) -> None:
+        # s3fs translates `AccessDenied` → `PermissionError`; the filter
+        # must still drop the bucket by recovering the code from `__cause__`.
+        fs = self._make_fs()
+        with patch.object(
+            fs,
+            "_call_s3",
+            new=AsyncMock(side_effect=_translated_error("AccessDenied")),
+        ):
+            self.assertFalse(asyncio.run(fs._is_bucket_accessible("denied")))
+
+    def test_no_such_bucket_is_dropped(self) -> None:
+        # Race: bucket deleted between `list_buckets` and probe → `NoSuchBucket`
+        # (translated to `FileNotFoundError`). Drop it rather than surface.
+        fs = self._make_fs()
+        with patch.object(
+            fs,
+            "_call_s3",
+            new=AsyncMock(side_effect=_translated_error("NoSuchBucket")),
+        ):
+            self.assertFalse(asyncio.run(fs._is_bucket_accessible("deleted")))
+
+    def test_permanent_redirect_bucket_is_dropped(self) -> None:
+        # Connector pins one endpoint_url; cross-region buckets are unreachable
+        # via this connector regardless of IAM, so drop them rather than fail
+        # later with [Errno 78] on click.
+        fs = self._make_fs()
+        with patch.object(
+            fs,
+            "_call_s3",
+            new=AsyncMock(side_effect=_translated_error("PermanentRedirect")),
+        ):
+            self.assertFalse(asyncio.run(fs._is_bucket_accessible("other-region")))
+
+    def test_illegal_location_constraint_bucket_is_dropped(self) -> None:
+        # Companion to PermanentRedirect: same cross-region condition surfaced
+        # as a 400 instead of a 301. Guards against a future edit reverting
+        # only one of the two cross-region entries in BUCKET_PROBE_DISPOSITION.
+        fs = self._make_fs()
+        with patch.object(
+            fs,
+            "_call_s3",
+            new=AsyncMock(
+                side_effect=_translated_error("IllegalLocationConstraintException")
+            ),
+        ):
+            self.assertFalse(asyncio.run(fs._is_bucket_accessible("wrong-region")))
+
+    def test_throttling_retries_then_fails_open(self) -> None:
+        fs = self._make_fs()
+
+        async def fake_call(_action: str, **_kwargs: object) -> dict[str, object]:
+            raise _translated_error("SlowDown")
+
+        call = AsyncMock(side_effect=fake_call)
+        with (
+            patch.object(fs, "_call_s3", new=call),
+            patch("asyncio.sleep", new=AsyncMock(return_value=None)),
+        ):
+            self.assertTrue(asyncio.run(fs._is_bucket_accessible("throttled")))
+        self.assertEqual(call.await_count, 2)  # initial + one retry
+
+    def test_throttling_then_denied_on_retry_is_dropped(self) -> None:
+        fs = self._make_fs()
+        codes = ["SlowDown", "AccessDenied"]
+
+        async def fake_call(_action: str, **_kwargs: object) -> dict[str, object]:
+            raise _translated_error(codes.pop(0))
+
+        with (
+            patch.object(fs, "_call_s3", new=AsyncMock(side_effect=fake_call)),
+            patch("asyncio.sleep", new=AsyncMock(return_value=None)),
+        ):
+            self.assertFalse(asyncio.run(fs._is_bucket_accessible("slow-then-denied")))
+
+    def test_throttling_then_unknown_on_retry_propagates(self) -> None:
+        # Unknown error on retry (e.g. credentials expire mid-probe) must NOT
+        # be silently swallowed — it has to surface as a real failure.
+        fs = self._make_fs()
+        codes = ["SlowDown", "SomeWeirdUnknownCode"]
+
+        async def fake_call(_action: str, **_kwargs: object) -> dict[str, object]:
+            raise _translated_error(codes.pop(0))
+
+        with (
+            patch.object(fs, "_call_s3", new=AsyncMock(side_effect=fake_call)),
+            patch("asyncio.sleep", new=AsyncMock(return_value=None)),
+        ):
+            with self.assertRaises(OSError):
+                asyncio.run(fs._is_bucket_accessible("slow-then-mystery"))
+
+    def test_unknown_error_propagates(self) -> None:
+        # Unknown codes must NOT be silently hidden on first probe either.
+        fs = self._make_fs()
+        with patch.object(
+            fs,
+            "_call_s3",
+            new=AsyncMock(side_effect=_translated_error("SomeWeirdUnknownCode")),
+        ):
+            with self.assertRaises(OSError):
+                asyncio.run(fs._is_bucket_accessible("mystery"))
+
+    def test_request_time_too_skewed_propagates(self) -> None:
+        # Clock skew is system-wide, not bucket-level; it must surface so
+        # `handle_s3fs_exception` can show the clock-skew message.
+        fs = self._make_fs()
+        with patch.object(
+            fs,
+            "_call_s3",
+            new=AsyncMock(side_effect=_translated_error("RequestTimeTooSkewed")),
+        ):
+            with self.assertRaises(PermissionError):
+                asyncio.run(fs._is_bucket_accessible("any-bucket"))
+
+    def test_lsbuckets_override_wires_to_filter(self) -> None:
+        # Regression guard for s3fs signature drift on `_lsbuckets`/`_call_s3`.
+        fs = self._make_fs()
+        parent_buckets = [{"name": "allowed"}, {"name": "denied"}]
+
+        async def fake_call(_action: str, **kwargs: object) -> dict[str, object]:
+            if kwargs.get("Bucket") == "denied":
+                raise _translated_error("AccessDenied")
+            return {}
+
+        with (
+            patch(
+                "unstract.connectors.filesystems.minio.minio.S3FileSystem._lsbuckets",
+                new=AsyncMock(return_value=parent_buckets),
+            ),
+            patch.object(fs, "_call_s3", new=AsyncMock(side_effect=fake_call)),
+        ):
+            result = asyncio.run(fs._lsbuckets(refresh=True))
+        self.assertEqual([b["name"] for b in result], ["allowed"])
+
+    def test_default_fs_class_is_filtered(self) -> None:
+        # MinioFS defaults to the access-filtered filesystem; subclasses can opt out.
+        self.assertIs(MinioFS._FS_CLASS, _AccessFilteredS3FileSystem)
+
+    def test_ucs_opts_out_of_access_filter(self) -> None:
+        # UCS credentials are expected to have full access, so the per-bucket
+        # probe must be skipped. Guards against a future refactor dropping
+        # the `_FS_CLASS = S3FileSystem` override in ucs.py.
+        self.assertIs(UnstractCloudStorage._FS_CLASS, S3FileSystem)
+        self.assertIsNot(UnstractCloudStorage._FS_CLASS, _AccessFilteredS3FileSystem)
+
+    def test_error_code_walks_context_when_cause_absent(self) -> None:
+        # Guards against future wrapper layers that use implicit exception
+        # chaining (`raise X` inside an `except`). The original `ClientError`
+        # lands on `__context__`, not `__cause__` — the helper must still
+        # recover the disposition code or we silently propagate AccessDenied.
+        client_exc = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "AccessDenied"}},
+            "ListObjectsV2",
+        )
+        try:
+            try:
+                raise client_exc
+            except ClientError:
+                # Implicit chaining: no `from` clause, so ClientError lands
+                # on __context__ of the OSError below.
+                raise OSError("translated")  # noqa: B904
+        except OSError as outer:
+            self.assertEqual(s3_error_code(outer), "AccessDenied")
+
+
+class TestMinioFSBucketRestriction(unittest.TestCase):
+    """Unit tests for UN-3487: `bucket` is required and enforced on MinioFS.
+
+    All tests construct `MinioFS`/`UnstractCloudStorage` directly — no
+    network calls happen until an actual fsspec method is invoked.
+    """
+
+    def test_missing_bucket_raises(self) -> None:
+        with self.assertRaises(ConnectorError):
+            MinioFS({"key": "k", "secret": "s", "endpoint_url": "http://x"})
+
+    def test_blank_bucket_raises(self) -> None:
+        with self.assertRaises(ConnectorError):
+            MinioFS({"bucket": "   ", "key": "k", "secret": "s"})
+
+    def test_bucket_is_stored(self) -> None:
+        fs = MinioFS({"bucket": "team-a-data", "key": "k", "secret": "s"})
+        self.assertEqual(fs.bucket, "team-a-data")
+
+    def test_get_fsspec_fs_scopes_to_bucket(self) -> None:
+        fs = MinioFS({"bucket": "team-a-data", "key": "k", "secret": "s"})
+        scoped = fs.get_fsspec_fs()
+        self.assertIsInstance(scoped, DirFileSystem)
+        self.assertEqual(scoped.path, "team-a-data")
+        self.assertIs(scoped.fs, fs.s3)
+
+    def test_walk_results_are_relative_to_the_bucket(self) -> None:
+        # Each walk entry's own `name` field must come back bucket-relative,
+        # not as the wrapped fs's raw, bucket-prefixed key (UN-3487). This is
+        # what workflow-execution file discovery reads (it walks, the UI
+        # browser lists) — a name still carrying the bucket here is what
+        # doubles the prefix at the point a discovered file gets opened.
+        # fsspec 2026.x's `DirFileSystem.walk()` does this itself; this test
+        # guards against a regression either upstream or in `MinioFS`.
+        #
+        # Matches fsspec's real shape (verified against AbstractFileSystem.
+        # walk): the dict is keyed by bare basename already; only each
+        # entry's own `name` field carries the full, bucket-qualified path.
+        fs = MinioFS({"bucket": "unstract", "key": "k", "secret": "s"})
+
+        def fake_walk(path: str, detail: bool = True, **kwargs: object):
+            yield (
+                "unstract/e2e-in",
+                {},
+                {"probe.txt": {"name": "unstract/e2e-in/probe.txt", "type": "file"}},
+            )
+
+        with patch.object(fs.s3, "walk", side_effect=fake_walk):
+            root, dirs, files = next(fs.get_fsspec_fs().walk("e2e-in", detail=True))
+        self.assertEqual(root, "e2e-in")
+        self.assertEqual(list(files.keys()), ["probe.txt"])
+        self.assertEqual(files["probe.txt"]["name"], "e2e-in/probe.txt")
+
+    def test_walk_default_detail_false_is_untouched(self) -> None:
+        # fsspec's own default is detail=False, which yields bare basename
+        # lists, not dicts. The relpath fix must not assume dict shape, or
+        # any caller using the plain walk() contract gets an AttributeError.
+        fs = MinioFS({"bucket": "unstract", "key": "k", "secret": "s"})
+
+        def fake_walk(path: str, **kwargs: object):
+            yield ("unstract/e2e-in", [], ["probe.txt"])
+
+        with patch.object(fs.s3, "walk", side_effect=fake_walk):
+            root, dirs, files = next(fs.get_fsspec_fs().walk("e2e-in"))
+        self.assertEqual(root, "e2e-in")
+        self.assertEqual(files, ["probe.txt"])
+
+    def test_scoped_root_listing_never_reaches_lsbuckets(self) -> None:
+        # The security-relevant assertion: ls("") on a bucket-scoped
+        # connector must resolve to listing that one bucket's contents,
+        # never the account-wide bucket enumeration `_lsbuckets` performs.
+        fs = MinioFS({"bucket": "team-a-data", "key": "k", "secret": "s"})
+        with patch.object(fs.s3, "ls", return_value=[]) as mock_ls:
+            fs.get_fsspec_fs().ls("")
+        mock_ls.assert_called_once_with("team-a-data", detail=True)
+
+    def test_ucs_does_not_require_bucket(self) -> None:
+        # UCS restricts access via its own `path` setting instead.
+        ucs = UnstractCloudStorage({"key": "k", "secret": "s", "path": "some/path"})
+        self.assertEqual(ucs.bucket, "")
+
+    def test_ucs_get_fsspec_fs_is_unscoped(self) -> None:
+        ucs = UnstractCloudStorage({"key": "k", "secret": "s", "path": "some/path"})
+        self.assertIs(ucs.get_fsspec_fs(), ucs.s3)
 
 
 if __name__ == "__main__":

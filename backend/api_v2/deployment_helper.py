@@ -1,0 +1,791 @@
+import logging
+import uuid
+from io import BytesIO
+from typing import Any
+from urllib.parse import urlencode, urlparse
+
+import requests
+from api_key_usage.recorder import record_key_use
+from configuration.config_registry import ConfigurationRegistry
+from configuration.models import Configuration
+from django.conf import settings
+from django.core.files.uploadedfile import InMemoryUploadedFile, UploadedFile
+from global_api_deployment_key.models import GlobalApiDeploymentKey
+from platform_audit.actions import TargetType
+from plugins.workflow_manager.workflow_v2.api_hub_usage_utils import APIHubUsageUtil
+from rest_framework.request import Request
+from rest_framework.serializers import Serializer
+from rest_framework.utils.serializer_helpers import ReturnDict
+from tags.models import Tag
+from usage_v2.helper import UsageHelper
+from utils.constants import Account, CeleryQueue
+from utils.local_context import StateStore
+from workflow_manager.endpoint_v2.destination import DestinationConnector
+from workflow_manager.endpoint_v2.result_cache_utils import ResultCacheUtils
+from workflow_manager.endpoint_v2.source import SourceConnector
+from workflow_manager.utils.pipeline_utils import PipelineUtils
+from workflow_manager.workflow_v2.dto import ExecutionResponse
+from workflow_manager.workflow_v2.enums import ExecutionStatus
+from workflow_manager.workflow_v2.execution import WorkflowExecutionServiceHelper
+from workflow_manager.workflow_v2.models import Workflow, WorkflowExecution
+from workflow_manager.workflow_v2.workflow_helper import WorkflowHelper
+
+from api_v2.api_key_validator import BaseAPIKeyValidator
+from api_v2.dto import DeploymentExecutionDTO
+from api_v2.exceptions import (
+    ApiKeyCreateException,
+    APINotFound,
+    InactiveAPI,
+    InvalidAPIRequest,
+    PresignedURLFetchError,
+    UnauthorizedKey,
+)
+from api_v2.key_helper import KeyHelper
+from api_v2.models import APIDeployment, APIKey
+from api_v2.rate_limiter import APIDeploymentRateLimiter
+from api_v2.serializers import APIExecutionResponseSerializer
+from api_v2.utils import APIDeploymentUtils
+
+logger = logging.getLogger(__name__)
+
+
+class DeploymentHelper(BaseAPIKeyValidator):
+    @staticmethod
+    def validate_parameters(request: Request, **kwargs: Any) -> None:
+        """Validate api_name for API deployments."""
+        api_name = kwargs.get("api_name") or request.data.get("api_name")
+        org_name = kwargs.get("org_name") or request.data.get("org_name")
+        if not api_name:
+            raise InvalidAPIRequest("Missing params api_name")
+        # Set organization in state store for API
+        StateStore.set(Account.ORGANIZATION_ID, org_name)
+
+    @staticmethod
+    def validate_and_process(
+        self: Any, request: Request, func: Any, api_key: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Fetch API deployment and validate API key."""
+        api_name = kwargs.get("api_name") or request.data.get("api_name")
+        api_deployment = DeploymentHelper.get_deployment_by_api_name(api_name=api_name)
+        global_key = DeploymentHelper.validate_api(
+            api_deployment=api_deployment, api_key=api_key
+        )
+
+        deployment_execution_dto = DeploymentExecutionDTO(
+            api=api_deployment, api_key=api_key, global_key=global_key
+        )
+        kwargs["deployment_execution_dto"] = deployment_execution_dto
+        return func(self, request, *args, **kwargs)
+
+    @staticmethod
+    def validate_api(
+        api_deployment: APIDeployment | None, api_key: str
+    ) -> GlobalApiDeploymentKey | None:
+        """Validate API deployment and API key.
+
+        Tries deployment-specific key first. If that fails, falls back to
+        Global API Deployment Key validation.
+
+        Args:
+            api_deployment: The API deployment instance
+            api_key: The bearer token value
+
+        Returns:
+            The authorizing ``GlobalApiDeploymentKey`` when the request was
+            authenticated via a global key, else ``None`` (deployment-specific
+            key). Returning the key (not a bool) preserves audit identity and
+            lets the request serializer check a member-created key's profiles.
+
+        Raises:
+            APINotFound: If deployment not found
+            InactiveAPI: If deployment is inactive
+            UnauthorizedKey: If key validation fails
+        """
+        if not api_deployment:
+            raise APINotFound()
+        if not api_deployment.is_active:
+            raise InactiveAPI()
+
+        try:
+            KeyHelper.validate_api_key(api_key=api_key, instance=api_deployment)
+            return None
+        except UnauthorizedKey:
+            logger.debug(
+                "Deployment-specific key auth failed for API '%s'; falling back "
+                "to global API deployment key validation.",
+                api_deployment.api_name,
+            )
+            global_key = KeyHelper.validate_global_api_deployment_key(
+                api_key=api_key, api_deployment=api_deployment
+            )
+            record_key_use(
+                key_type=TargetType.GLOBAL_API_DEPLOYMENT_KEY,
+                key_id=global_key.id,
+                organization_id=global_key.organization_id,
+                api_deployment_id=api_deployment.id,
+            )
+            logger.info(
+                "API '%s' authorized via global API deployment key '%s' (%s).",
+                api_deployment.api_name,
+                global_key.name,
+                global_key.id,
+            )
+            return global_key
+
+    @staticmethod
+    def validate_and_get_workflow(workflow_id: str) -> Workflow:
+        """Validate that the specified workflow_id exists in the Workflow
+        model.
+        """
+        return WorkflowHelper.get_workflow_by_id(workflow_id)
+
+    @staticmethod
+    def get_api_by_id(api_id: str) -> APIDeployment | None:
+        return APIDeploymentUtils.get_api_by_id(api_id=api_id)
+
+    @staticmethod
+    def construct_status_endpoint(api_endpoint: str, execution_id: str) -> str:
+        """Construct a complete status endpoint URL by appending the
+        execution_id as a query parameter.
+
+        Args:
+            api_endpoint (str): The base API endpoint.
+            execution_id (str): The execution ID to be included as
+                a query parameter.
+
+        Returns:
+            str: The complete status endpoint URL.
+        """
+        query_parameters = urlencode({"execution_id": execution_id})
+        complete_endpoint = f"/{api_endpoint}?{query_parameters}"
+        return complete_endpoint
+
+    @staticmethod
+    def get_deployment_by_api_name(
+        api_name: str,
+    ) -> APIDeployment | None:
+        """Get and return the APIDeployment object by api_name."""
+        try:
+            api: APIDeployment = APIDeployment.objects.get(api_name=api_name)
+            return api
+        except APIDeployment.DoesNotExist:
+            return None
+
+    @staticmethod
+    def create_api_key(serializer: Serializer, request: Request) -> APIKey:
+        """To make API key for an API.
+
+        Args:
+            serializer (Serializer): Request serializer
+
+        Raises:
+            ApiKeyCreateException: Exception
+        """
+        api_deployment: APIDeployment = serializer.instance
+        try:
+            api_key: APIKey = KeyHelper.create_api_key(api_deployment, request)
+            return api_key
+        except Exception as error:
+            logger.error(f"Error while creating API key error: {str(error)}")
+            api_deployment.delete()
+            logger.info("Deleted the deployment instance")
+            raise ApiKeyCreateException()
+
+    @classmethod
+    def execute_workflow(
+        cls,
+        organization_name: str,
+        api: APIDeployment,
+        file_objs: list[UploadedFile],
+        timeout: int,
+        include_metadata: bool = False,
+        include_metrics: bool = False,
+        include_extracted_text: bool = False,
+        use_file_history: bool = False,
+        tag_names: list[str] = [],
+        llm_profile_id: str | None = None,
+        hitl_queue_name: str | None = None,
+        hitl_packet_id: str | None = None,
+        custom_data: dict[str, Any] | None = None,
+        request_headers=None,
+        execution_id: str | None = None,
+    ) -> ReturnDict:
+        """Execute workflow by api.
+
+        Args:
+            organization_name (str): organization name
+            api (APIDeployment): api model object
+            file_obj (UploadedFile): input file
+            use_file_history (bool): Use FileHistory table to return results on already
+                processed files. Defaults to False
+            tag_names (list(str)): list of tag names
+            llm_profile_id (str, optional): LLM profile ID for overriding tool settings
+            hitl_queue_name (str, optional): Custom queue name for manual review
+            hitl_packet_id (str, optional): Packet ID for packet-based review
+            custom_data (dict[str, Any], optional): JSON data for custom_data variable replacement in prompts
+            execution_id (str, optional): Pre-generated execution ID for rate limiting.
+                If None, a new UUID will be generated.
+
+        Returns:
+            ReturnDict: execution status/ result
+
+        Note:
+            Rate limiting is handled at the view layer. This method should be called
+            after rate limit checks have passed, with a pre-acquired execution_id.
+        """
+        # Use provided execution_id or generate one (for backward compatibility)
+        if execution_id is None:
+            execution_id = str(uuid.uuid4())
+
+        workflow_id = api.workflow.id
+        pipeline_id = api.id
+        if hitl_queue_name:
+            logger.info(
+                f"API execution with HITL: hitl_queue_name={hitl_queue_name}, api_name={api.api_name}"
+            )
+        tags = Tag.bulk_get_or_create(tag_names=tag_names)
+        workflow_execution = WorkflowExecutionServiceHelper.create_workflow_execution(
+            workflow_id=workflow_id,
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+            mode=WorkflowExecution.Mode.QUEUE,
+            tags=tags,
+            total_files=len(file_objs),
+        )
+        execution_id = workflow_execution.id
+
+        # Store API hub headers for usage tracking (enterprise feature)
+        if request_headers:
+            try:
+                # Extract and normalize API hub headers
+                normalized_headers = APIHubUsageUtil.extract_api_hub_headers(
+                    request_headers
+                )
+
+                if normalized_headers:
+                    # Cache headers for later usage tracking by file execution tasks
+                    success = APIHubUsageUtil.cache_api_hub_headers(
+                        str(execution_id), normalized_headers
+                    )
+                    if not success:
+                        logger.warning(
+                            f"Failed to cache API hub headers for execution {execution_id}"
+                        )
+                else:
+                    logger.debug(
+                        "No API hub subscription headers found in request headers"
+                    )
+            except Exception as e:
+                # Log but don't fail the API execution for header caching issues
+                logger.debug(
+                    f"API hub header caching failed for execution {execution_id}: {e}"
+                )
+
+        # Staging runs synchronously, before async dispatch. Scope it to its own
+        # try/except so a failure marks the still-PENDING execution ERROR (else the
+        # row is orphaned and the UI shows the run as stuck), and so error-marking
+        # never runs in the post-dispatch path where it could overwrite the status
+        # of an already-running execution.
+        try:
+            hash_values_of_files = SourceConnector.add_input_file_to_api_storage(
+                pipeline_id=pipeline_id,
+                workflow_id=workflow_id,
+                execution_id=execution_id,
+                file_objs=file_objs,
+                use_file_history=use_file_history,
+            )
+        except Exception as error:
+            # Isolate the DB error-marking so cleanup still runs if it raises.
+            try:
+                WorkflowExecutionServiceHelper.update_execution_err(
+                    str(execution_id), str(error)
+                )
+            except Exception:
+                logger.exception(f"Failed to mark execution {execution_id} as ERROR")
+
+            # Async job never started — release the rate limit slot and clean up.
+            # The id string, never the model instance: release_slot builds its
+            # Redis key from what it is passed, so an instance silently removes
+            # nothing and leaves the slot held for its full TTL.
+            APIDeploymentRateLimiter.release_slot(
+                str(api.organization.organization_id), str(execution_id)
+            )
+            DestinationConnector.delete_api_storage_dir(
+                workflow_id=workflow_id, execution_id=execution_id
+            )
+            return APIExecutionResponseSerializer(
+                ExecutionResponse(
+                    workflow_id=workflow_id,
+                    execution_id=execution_id,
+                    execution_status=ExecutionStatus.ERROR.value,
+                    error=str(error),
+                )
+            ).data
+
+        # Nothing was staged, so nothing will be dispatched to write a status
+        # back. Terminalise here or the execution is stranded in PENDING.
+        if not hash_values_of_files:
+            # Isolated so the slot and staging dir are released even if it raises.
+            execution = None
+            terminalise_error: str | None = None
+            try:
+                execution = WorkflowExecutionServiceHelper.update_execution_completed(
+                    str(execution_id),
+                    total_files=len(file_objs),
+                    failed_files=len(file_objs),
+                )
+            except Exception as error:
+                logger.exception(f"Failed to mark execution {execution_id} as COMPLETED")
+                # Reported, so the caller is not given a bare failure with no reason.
+                terminalise_error = str(error)
+
+            APIDeploymentRateLimiter.release_slot(
+                str(api.organization.organization_id), str(execution_id)
+            )
+            DestinationConnector.delete_api_storage_dir(
+                workflow_id=workflow_id, execution_id=execution_id
+            )
+            api_results = ResultCacheUtils.get_api_results(
+                workflow_id=str(workflow_id), execution_id=str(execution_id)
+            )
+            if execution is not None:
+                # Separate blocks: independent obligations, so a failure in one
+                # must not silence the other.
+                try:
+                    # This response carries the results, so mark them consumed or a
+                    # later GET /status serves them again.
+                    WorkflowHelper.set_result_acknowledge(execution)
+                except Exception:
+                    logger.exception(
+                        f"Failed to acknowledge results for execution {execution_id}"
+                    )
+
+                try:
+                    # Terminalising here bypasses the usual notifier, so subscribers
+                    # would otherwise hear nothing.
+                    PipelineUtils.update_pipeline_status(
+                        pipeline_id=pipeline_id, workflow_execution=execution
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to notify subscribers for execution {execution_id}"
+                    )
+
+            # The stored status, not an assumed COMPLETED: the row may be missing
+            # or the guard may have refused the change.
+            return APIExecutionResponseSerializer(
+                ExecutionResponse(
+                    workflow_id=workflow_id,
+                    execution_id=execution_id,
+                    execution_status=(
+                        execution.status if execution else ExecutionStatus.ERROR.value
+                    ),
+                    error=terminalise_error,
+                    result=api_results,
+                )
+            ).data
+
+        try:
+            result = WorkflowHelper.execute_workflow_async(
+                workflow_id=workflow_id,
+                pipeline_id=pipeline_id,
+                hash_values_of_files=hash_values_of_files,
+                timeout=timeout,
+                execution_id=execution_id,
+                queue=CeleryQueue.CELERY_API_DEPLOYMENTS,
+                use_file_history=use_file_history,
+                llm_profile_id=llm_profile_id,
+                hitl_queue_name=hitl_queue_name,
+                hitl_packet_id=hitl_packet_id,
+                custom_data=custom_data,
+            )
+            result.status_api = DeploymentHelper.construct_status_endpoint(
+                api_endpoint=api.api_endpoint, execution_id=execution_id
+            )
+            # Ensure workflow identification keys are always in item metadata
+            organization = api.organization if api else None
+            org_id = str(organization.organization_id) if organization else ""
+            cls._enrich_result_with_workflow_metadata(result, organization_id=org_id)
+            # Check if highlight data should be removed using configuration registry
+            enable_highlight = False  # Safe default if the key is unavailable (e.g., OSS)
+            if ConfigurationRegistry.is_config_key_available(
+                "ENABLE_HIGHLIGHT_API_DEPLOYMENT"
+            ):
+                enable_highlight = Configuration.get_value_by_organization(
+                    config_key="ENABLE_HIGHLIGHT_API_DEPLOYMENT",
+                    organization=organization,
+                )
+            if not enable_highlight:
+                result.remove_result_metadata_keys(["highlight_data"])
+                if not include_extracted_text:
+                    result.remove_result_metadata_keys(["extracted_text"])
+            if include_extracted_text:
+                result.promote_extracted_text()
+            if include_metadata or include_metrics:
+                cls._enrich_result_with_usage_metadata(result)
+            if not include_metadata:
+                result.remove_inner_result_metadata()
+            if not include_metrics:
+                result.remove_result_metrics()
+        except Exception as error:
+            # Dispatch failures are marked ERROR internally by execute_workflow_async;
+            # post-dispatch failures (enrichment/config) must not overwrite a running
+            # execution's status, so only release the slot and clean up storage here.
+            APIDeploymentRateLimiter.release_slot(
+                str(api.organization.organization_id), str(execution_id)
+            )
+
+            # Clean up storage
+            DestinationConnector.delete_api_storage_dir(
+                workflow_id=workflow_id, execution_id=execution_id
+            )
+            result = ExecutionResponse(
+                workflow_id=workflow_id,
+                execution_id=execution_id,
+                execution_status=ExecutionStatus.ERROR.value,
+                error=str(error),
+            )
+        return APIExecutionResponseSerializer(result).data
+
+    @staticmethod
+    def _enrich_item_inner_metadata(
+        item: dict, file_exec_id: str, usage_helper: Any
+    ) -> None:
+        """Inject per-model usage breakdown into item['result']['metadata']."""
+        inner_result = item.get("result")
+        if not isinstance(inner_result, dict):
+            return
+        metadata = inner_result.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+        usage_by_model = usage_helper.get_usage_by_model(file_exec_id)
+        if usage_by_model:
+            metadata.update(usage_by_model)
+
+    @staticmethod
+    def _enrich_item_top_metadata(
+        item: dict, file_exec_id: str, usage_helper: Any
+    ) -> None:
+        """Inject aggregated usage totals into item['metadata']['usage']."""
+        item_metadata = item.get("metadata")
+        if not isinstance(item_metadata, dict):
+            return
+        aggregated = usage_helper.get_aggregated_token_count(file_exec_id)
+        if aggregated:
+            aggregated["file_execution_id"] = file_exec_id
+            item_metadata["usage"] = aggregated
+
+    @staticmethod
+    def _enrich_result_with_usage_metadata(result: ExecutionResponse) -> None:
+        """Enrich each file result's metadata with usage data.
+
+        For each file_execution_id:
+        1. Injects per-model cost arrays (extraction_llm, challenge_llm,
+           embedding) into item["result"]["metadata"].
+        2. Injects aggregated usage totals into item["metadata"]["usage"],
+           matching the legacy response format.
+        """
+        if not isinstance(result.result, list):
+            return
+
+        for item in result.result:
+            if not isinstance(item, dict):
+                continue
+            file_exec_id = item.get("file_execution_id")
+            if not file_exec_id:
+                continue
+            DeploymentHelper._enrich_item_inner_metadata(item, file_exec_id, UsageHelper)
+            DeploymentHelper._enrich_item_top_metadata(item, file_exec_id, UsageHelper)
+
+    @staticmethod
+    def _enrich_item_workflow_metadata(
+        item: dict,
+        file_exec_id: str,
+        fe_lookup: dict,
+        workflow_execution: Any,
+        organization_id: str,
+        tag_names: list[str],
+    ) -> None:
+        """Populate workflow identification keys into item['metadata']."""
+        if not isinstance(item.get("metadata"), dict):
+            item["metadata"] = {}
+        metadata = item["metadata"]
+        fe = fe_lookup.get(str(file_exec_id))
+        we = fe.workflow_execution if fe else workflow_execution
+        if fe:
+            metadata.setdefault("source_name", fe.file_name)
+            metadata.setdefault("source_hash", fe.file_hash or "")
+            metadata.setdefault("file_execution_id", str(fe.id))
+            metadata.setdefault("total_elapsed_time", fe.execution_time)
+        if we:
+            metadata.setdefault("workflow_id", str(we.workflow_id))
+            metadata.setdefault("execution_id", str(we.id))
+            metadata.setdefault(
+                "workflow_start_time",
+                we.created_at.timestamp() if we.created_at else None,
+            )
+        metadata.setdefault("organization_id", organization_id)
+        metadata.setdefault("tags", tag_names)
+
+    @staticmethod
+    def _enrich_result_with_workflow_metadata(
+        result: ExecutionResponse,
+        organization_id: str,
+    ) -> None:
+        """Ensure workflow identification keys are always present in item metadata.
+
+        Uses setdefault() — fills in MISSING keys only, never overwrites
+        values already present from the workers cache.
+        """
+        if not isinstance(result.result, list):
+            return
+
+        # 1. Collect file_execution_ids
+        file_exec_ids = [
+            item.get("file_execution_id")
+            for item in result.result
+            if isinstance(item, dict) and item.get("file_execution_id")
+        ]
+        if not file_exec_ids:
+            return
+
+        # 2. Batch query (single JOIN query for all file executions)
+        # Local import to avoid circular dependency:
+        # deployment_helper → file_execution.models → workflow_v2.models
+        #   → workflow_v2.models.execution → api_v2.models
+        from workflow_manager.file_execution.models import WorkflowFileExecution
+
+        fe_lookup = {
+            str(fe.id): fe
+            for fe in WorkflowFileExecution.objects.filter(
+                id__in=file_exec_ids
+            ).select_related("workflow_execution")
+        }
+
+        # 3. Get execution-level data (tags) — one M2M query
+        workflow_execution = None
+        tag_names: list[str] = []
+        if fe_lookup:
+            first_fe = next(iter(fe_lookup.values()))
+            workflow_execution = first_fe.workflow_execution
+            tag_names = list(workflow_execution.tags.values_list("name", flat=True))
+
+        # 4. Enrich each item
+        for item in result.result:
+            if not isinstance(item, dict):
+                continue
+            file_exec_id = item.get("file_execution_id")
+            if not file_exec_id:
+                continue
+            DeploymentHelper._enrich_item_workflow_metadata(
+                item=item,
+                file_exec_id=file_exec_id,
+                fe_lookup=fe_lookup,
+                workflow_execution=workflow_execution,
+                organization_id=organization_id,
+                tag_names=tag_names,
+            )
+
+    @staticmethod
+    def get_execution_status(execution_id: str) -> ExecutionResponse:
+        """Current status of api execution.
+
+        Args:
+            execution_id (str): execution id
+
+        Returns:
+            ReturnDict: status/result of execution
+        """
+        execution_response: ExecutionResponse = WorkflowHelper.get_status_of_async_task(
+            execution_id=execution_id
+        )
+        return execution_response
+
+    @staticmethod
+    def process_completed_execution(
+        response: ExecutionResponse,
+        deployment_execution_dto: Any,
+        include_metadata: bool,
+        include_metrics: bool,
+        include_extracted_text: bool = False,
+    ) -> None:
+        """Enrich and clean up the response for a completed execution."""
+        api_deployment = deployment_execution_dto.api
+        organization = api_deployment.organization if api_deployment else None
+        org_id = str(organization.organization_id) if organization else ""
+        DeploymentHelper._enrich_result_with_workflow_metadata(
+            response, organization_id=org_id
+        )
+        enable_highlight = False
+        if ConfigurationRegistry.is_config_key_available(
+            "ENABLE_HIGHLIGHT_API_DEPLOYMENT"
+        ):
+            enable_highlight = Configuration.get_value_by_organization(
+                config_key="ENABLE_HIGHLIGHT_API_DEPLOYMENT",
+                organization=organization,
+            )
+        if not enable_highlight:
+            response.remove_result_metadata_keys(["highlight_data"])
+            if not include_extracted_text:
+                response.remove_result_metadata_keys(["extracted_text"])
+        if include_extracted_text:
+            response.promote_extracted_text()
+        if include_metadata or include_metrics:
+            DeploymentHelper._enrich_result_with_usage_metadata(response)
+        if not include_metadata:
+            response.remove_inner_result_metadata()
+        if not include_metrics:
+            response.remove_result_metrics()
+
+    @staticmethod
+    def fetch_presigned_file(url: str) -> InMemoryUploadedFile:
+        """Fetch a file from a presigned URL and convert it to an uploaded file.
+
+        Args:
+            url (str): The presigned URL to fetch the file from
+
+        Returns:
+            InMemoryUploadedFile: The fetched file as an uploaded file object
+
+        Raises:
+            PresignedURLFetchError: If the file cannot be fetched
+        """
+        parsed_url = urlparse(url)
+        sanitized_url = parsed_url._replace(query="").geturl()  # For logging
+        file_stream = None
+
+        try:
+            max_bytes = settings.API_DEPL_PRESIGNED_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+
+            file_stream = BytesIO()
+            downloaded = 0
+            content_type = ""  # Default content type
+
+            # Download the file with streaming
+            with requests.get(
+                url, stream=True, timeout=(5, 30), allow_redirects=False
+            ) as resp:
+                resp.raise_for_status()
+
+                # Store content type for later use
+                content_type = resp.headers.get("Content-Type", "")
+
+                # Check Content-Length header if available
+                content_length = resp.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > max_bytes:
+                            raise PresignedURLFetchError(
+                                url=sanitized_url,
+                                error_message=f"File too large ({content_length} bytes). Max allowed: {max_bytes} bytes",
+                                status_code=413,  # Payload Too Large
+                            )
+                    except ValueError:
+                        # Non-integer Content-Length; ignore and fall back to stream enforcement
+                        pass
+
+                # Stream the body with an upper bound to prevent memory exhaustion
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise PresignedURLFetchError(
+                            url=sanitized_url,
+                            error_message=f"File exceeds maximum allowed size of {max_bytes} bytes",
+                            status_code=413,  # Payload Too Large
+                        )
+
+                    file_stream.write(chunk)
+
+                # Reset stream position to beginning for reading
+                file_stream.seek(0)
+
+            # Extract filename from URL path
+            filename = (
+                parsed_url.path.split("/")[-1] if parsed_url.path else "unknown_file"
+            )
+
+            # Use octet-stream for generic or missing content types
+            if content_type in ["", "application/octet-stream", "binary/octet-stream"]:
+                content_type = "application/octet-stream"
+                logger.warning(
+                    f"Could not detect MIME type for file '{filename}' from URL '{sanitized_url}'"
+                )
+
+            logger.info(
+                f"Fetched file '{filename}' with MIME type '{content_type}' from presigned URL {sanitized_url}"
+            )
+
+            # Create InMemoryUploadedFile with proper stream management
+            uploaded_file = InMemoryUploadedFile(
+                file=file_stream,
+                field_name="file",
+                name=filename,
+                content_type=content_type,
+                size=downloaded,
+                charset=None,
+            )
+
+            # Don't close file_stream here as InMemoryUploadedFile takes ownership
+            # The stream will be closed when uploaded_file.close() is called
+            file_stream = None
+            return uploaded_file
+
+        except requests.RequestException as e:
+            if (
+                isinstance(e, requests.exceptions.HTTPError)
+                and hasattr(e, "response")
+                and e.response is not None
+            ):
+                status_code = e.response.status_code
+                error_msg = f"{e.response.status_code} {e.response.reason}"
+            elif isinstance(
+                e, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)
+            ):
+                status_code = 504  # Gateway Timeout
+                error_msg = f"Request timed out: {str(e)}"
+                logger.error(f"Timeout error fetching presigned URL {sanitized_url}: {e}")
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                status_code = 502  # Bad Gateway
+                error_msg = f"Connection error: {str(e)}"
+                logger.error(
+                    f"Connection error fetching presigned URL {sanitized_url}: {e}"
+                )
+            else:
+                status_code = 400
+                error_msg = str(e)
+                logger.error(f"Error fetching presigned URL {sanitized_url}: {e}")
+
+            raise PresignedURLFetchError(
+                url=sanitized_url, error_message=error_msg, status_code=status_code
+            )
+
+        finally:
+            if file_stream:
+                try:
+                    file_stream.close()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to close file stream during cleanup for '{filename}': {str(e)}"
+                    )
+
+    @staticmethod
+    def load_presigned_files(
+        presigned_urls: list[str], file_objs: list[UploadedFile]
+    ) -> None:
+        """Load files from presigned URLs and append them to file_objs.
+
+        This method processes each URL individually, fetches the file,
+        and adds it to the provided file_objs list.
+
+        Note: URL validation is assumed to be already done by the serializer.
+
+        Args:
+            presigned_urls (list[str]): List of presigned URLs to fetch files from
+            file_objs (list[UploadedFile]): List to append the fetched files to
+        """
+        for url in presigned_urls:
+            uploaded_file = DeploymentHelper.fetch_presigned_file(url)
+            file_objs.append(uploaded_file)

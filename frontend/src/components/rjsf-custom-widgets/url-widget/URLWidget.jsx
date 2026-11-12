@@ -1,20 +1,29 @@
-import { Form, Input } from "antd";
 import PropTypes from "prop-types";
+import { Input } from "@/components/ui/shims/antd-inputs";
 
-const URLWidget = ({ id, value, onChange, rawErrors }) => {
+import { RjsfWidgetLayout } from "../../../layouts/rjsf-widget-layout/RjsfWidgetLayout";
+
+const URLWidget = (props) => {
+  const { id, value, onChange, label, schema, required, readonly } = props;
+  const description = schema?.description || "";
   const handleURLChange = (event) => {
     onChange(event.target.value);
   };
 
-  const hasError = rawErrors && rawErrors.length > 0;
-
   return (
-    <Form.Item
-      style={{ width: "100%" }}
-      validateStatus={hasError ? "error" : ""}
+    <RjsfWidgetLayout
+      label={label}
+      description={description}
+      required={required}
     >
-      <Input type="url" id={id} value={value} onChange={handleURLChange} />
-    </Form.Item>
+      <Input
+        type="url"
+        id={id}
+        value={value}
+        onChange={handleURLChange}
+        disabled={readonly}
+      />
+    </RjsfWidgetLayout>
   );
 };
 
@@ -22,7 +31,10 @@ URLWidget.propTypes = {
   id: PropTypes.string.isRequired,
   value: PropTypes.string,
   onChange: PropTypes.func.isRequired,
-  rawErrors: PropTypes.array,
+  label: PropTypes.string.isRequired,
+  schema: PropTypes.object.isRequired,
+  required: PropTypes.bool,
+  readonly: PropTypes.bool.isRequired,
 };
 
 export { URLWidget };

@@ -1,0 +1,543 @@
+import logging
+import uuid
+from typing import Any
+
+from account_v2.models import User
+from adapter_processor_v2.models import AdapterInstance
+from django.conf import settings
+from django.db import IntegrityError
+from plugins import get_plugin
+
+from prompt_studio.lookup_utils import validate_lookups_for_export
+from prompt_studio.prompt_profile_manager_v2.models import ProfileManager
+from prompt_studio.prompt_studio_core_v2.models import CustomTool
+from prompt_studio.prompt_studio_core_v2.prompt_studio_helper import PromptStudioHelper
+from prompt_studio.prompt_studio_output_manager_v2.models import (
+    PromptStudioOutputManager,
+)
+from prompt_studio.prompt_studio_v2.models import ToolStudioPrompt
+from unstract.tool_registry.dto import Properties, Spec, Tool
+
+from .constants import JsonSchemaKey, PromptStudioRegistryKeys
+from .exceptions import (
+    EmptyToolExportError,
+    InternalError,
+    InValidCustomToolError,
+    ToolSaveError,
+)
+from .models import PromptStudioRegistry
+from .serializers import PromptStudioRegistrySerializer
+
+logger = logging.getLogger(__name__)
+
+
+class PromptStudioRegistryHelper:
+    """Class to register custom tools to tool studio registry.
+
+    By default the exported tools will be private and will be executed
+    with the help of a proto tool.
+    """
+
+    @staticmethod
+    def _resolve_challenge_llm_id(tool: CustomTool) -> str:
+        """Resolve the adapter ID to seed as challenge_llm's spec default.
+
+        Mirrors the precedence frame_export_json already uses: the tool's own
+        challenge_llm FK, else the project default profile's LLM.
+
+        Args:
+            tool (CustomTool): Saved tool data
+
+        Returns:
+            str: Adapter instance ID of the challenger LLM
+        """
+        if tool.challenge_llm:
+            return str(tool.challenge_llm.id)
+        return str(ProfileManager.get_default_llm_profile(tool).llm.id)
+
+    @staticmethod
+    def frame_spec(tool: CustomTool) -> Spec:
+        """Method to return spec of the Custom tool.
+
+        Args:
+            tool (CustomTool): Saved tool data
+
+        Returns:
+            dict: spec dict
+        """
+        # A "type": "string" property with no spec default is seeded into tool
+        # instance metadata as "" (ToolUtils.get_default_settings). Because
+        # challenge_llm declares adapterType, the instance schema carries an
+        # enum of real adapter IDs, which "" can never satisfy - so deployment
+        # validation rejected the freshly seeded instance, regardless of whether
+        # LLMChallenge was enabled (the seeding never consulted that flag).
+        #
+        # Seed the resolved LLM instead of leaving it empty. adapterType stays
+        # declared unconditionally: it is the sole discriminator in
+        # Spec.get_adapter_properties() (tool-registry dto.py), so dropping it
+        # would take challenge_llm out of every adapter-aware path - the
+        # challenge_llm_adapter_id writes that runtime actually reads
+        # (structure_tool_task.py), the settings-form adapter dropdown, and the
+        # lazy adapter-id migration check.
+        challenge_llm_property: dict[str, Any] = {
+            "type": "string",
+            "title": "Challenger LLM",
+            "adapterType": "LLM",
+            "description": "LLM to use for LLMChallenge",
+            "adapterIdKey": "challenge_llm_adapter_id",
+            "default": PromptStudioRegistryHelper._resolve_challenge_llm_id(tool),
+        }
+
+        properties = {
+            "challenge_llm": challenge_llm_property,
+            "enable_challenge": {
+                "type": "boolean",
+                "title": "Enable LLMChallenge",
+                "default": False,
+                "description": "Enables LLMChallenge",
+            },
+            "summarize_as_source": {
+                "type": "boolean",
+                "title": "Enable SummarizedExtraction",
+                "default": False,
+                "description": "Enables SummarizedExtraction",
+            },
+            "single_pass_extraction_mode": {
+                "type": "boolean",
+                "title": "Enable SinglePass Extraction",
+                "default": False,
+                "description": "Enables SinglePass Extraction",
+            },
+            "enable_highlight": {
+                "type": "boolean",
+                "title": "Enable highlight",
+                "default": False,
+                "description": "Enables highlight",
+            },
+            "enable_word_confidence": {
+                "type": "boolean",
+                "title": "Enable word confidence",
+                "default": False,
+                "description": "Enables word-level confidence (depends on enable_highlight)",
+            },
+        }
+
+        spec = Spec(
+            title=str(tool.tool_id),
+            description=tool.description,
+            required=[JsonSchemaKey.CHALLENGE_LLM],
+            properties=properties,
+        )
+        return spec
+
+    @staticmethod
+    def frame_properties(tool: CustomTool) -> Properties:
+        """Method to return properties of the tool.
+
+        Args:
+            tool (CustomTool): Saved custom tool data.
+
+        Returns:
+            dict: Properties dict
+        """
+        # TODO: Update for new architecture
+        tool_props = Properties(
+            display_name=tool.tool_name,
+            function_name=str(tool.tool_id),
+            description=tool.description,
+        )
+        return tool_props
+
+    @staticmethod
+    def get_tool_by_prompt_registry_id(
+        prompt_registry_id: str,
+    ) -> Tool | None:
+        """Gets the `Tool` associated with a prompt registry ID if it exists.
+
+        Args:
+            prompt_registry_id (str): Prompt registry ID to fetch for
+
+        Returns:
+            Optional[Tool]: The `Tool` exported from Prompt Studio
+        """
+        try:
+            prompt_registry_tool = PromptStudioRegistry.objects.get(pk=prompt_registry_id)
+        # Suppress all exceptions to allow processing
+        except Exception as e:
+            logger.warning(
+                f"Error while fetching for prompt registry ID {prompt_registry_id}: {e} "
+            )
+            return None
+        return Tool(
+            tool_uid=prompt_registry_tool.prompt_registry_id,
+            properties=Properties.from_dict(prompt_registry_tool.tool_property),
+            spec=Spec.from_dict(prompt_registry_tool.tool_spec),
+            icon=prompt_registry_tool.icon,
+            image_url=settings.STRUCTURE_TOOL_IMAGE_URL,
+            image_name=settings.STRUCTURE_TOOL_IMAGE_NAME,
+            image_tag=settings.STRUCTURE_TOOL_IMAGE_TAG,
+        )
+
+    @staticmethod
+    def get_resolved_settings(prompt_registry_id: str) -> dict[str, Any]:
+        """Return the settings export already resolved for this exported tool.
+
+        ``frame_export_json`` resolves adapter-valued settings at export time -
+        notably ``challenge_llm``, which falls back to the default profile's LLM
+        when the project set none - and stores them under
+        ``tool_metadata[tool_settings]``. ``Tool`` (built from ``tool_spec`` /
+        ``tool_property``) does not carry them, so callers that only have a
+        ``Tool`` cannot see the resolved values.
+
+        Returns an empty dict when the registry row is missing or carries no
+        settings, so callers can treat "no resolved settings" as a no-op.
+        """
+        # `ToolInstance.tool_id` is a free-form CharField and registry tools use
+        # slugs ("classify", "text_extractor"), which a UUID pk lookup would
+        # reject. Screening them out here keeps this a silent no-op for every
+        # non-Prompt-Studio tool instead of logging on a fully normal path.
+        # Checked inline rather than via `ToolInstanceHelper.is_uuid_format`:
+        # `tool_instance_v2.tool_processor` already imports this module at
+        # module level, so importing back into `tool_instance_v2` would cycle.
+        try:
+            uuid.UUID(str(prompt_registry_id))
+        except ValueError:
+            return {}
+        try:
+            # Only `tool_metadata` is needed, and it is the largest column on the
+            # row - the full JSONB blob of every prompt and output. Fetching just
+            # that column avoids pulling the rest a second time, since the caller
+            # has already loaded this row to build the `Tool`.
+            metadata = PromptStudioRegistry.objects.values_list(
+                "tool_metadata", flat=True
+            ).get(pk=prompt_registry_id)
+        except PromptStudioRegistry.DoesNotExist:
+            # A UUID-shaped tool_id with no registry row - e.g. an agentic tool
+            # in cloud. Expected, so this stays at debug.
+            logger.debug(
+                f"No prompt studio registry entry for {prompt_registry_id}; "
+                "no resolved settings to apply"
+            )
+            return {}
+        return (metadata or {}).get(JsonSchemaKey.TOOL_SETTINGS, {}) or {}
+
+    @staticmethod
+    def update_or_create_psr_tool(
+        custom_tool: CustomTool,
+        shared_with_org: bool,
+        user_ids: set[int],
+        force_export: bool,
+    ) -> PromptStudioRegistry:
+        """Updates or creates the PromptStudioRegistry record.
+
+        This appears as a separate tool in the workflow and is mapped
+        1:1 with the `CustomTool`.
+
+        Args:
+            custom_tool (CustomTool): The instance of the custom tool to be updated
+                or created.
+            shared_with_org (bool): Flag indicating whether the tool is shared with
+                the organization.
+            user_ids (set[int]): A set of user IDs to whom the tool is shared.
+            force_export (bool): Indicates if the export is being forced.
+
+
+        Raises:
+            ToolSaveError
+            InternalError
+
+        Returns:
+            obj: PromptStudioRegistry instance that was updated or created
+        """
+        try:
+            properties: Properties = PromptStudioRegistryHelper.frame_properties(
+                tool=custom_tool
+            )
+            spec: Spec = PromptStudioRegistryHelper.frame_spec(tool=custom_tool)
+            prompts: list[ToolStudioPrompt] = PromptStudioHelper.fetch_prompt_from_tool(
+                tool_id=custom_tool.tool_id
+            )
+            metadata = PromptStudioRegistryHelper.frame_export_json(
+                tool=custom_tool, prompts=prompts, force_export=force_export
+            )
+
+            obj: PromptStudioRegistry
+            created: bool
+            obj, created = PromptStudioRegistry.objects.update_or_create(
+                custom_tool=custom_tool,
+                created_by=custom_tool.created_by,
+                defaults={
+                    "name": custom_tool.tool_name,
+                    "tool_property": properties.to_dict(),
+                    "tool_spec": spec.to_dict(),
+                    "tool_metadata": metadata,
+                    "icon": custom_tool.icon,
+                    "description": custom_tool.description,
+                },
+            )
+            if created:
+                logger.info(f"PSR {obj.prompt_registry_id} was created")
+            else:
+                logger.info(f"PSR {obj.prompt_registry_id} was updated")
+            obj.modified_by = custom_tool.modified_by
+            obj.shared_to_org = shared_with_org
+            if not shared_with_org:
+                obj.shared_users.clear()
+                obj.shared_users.add(*user_ids)
+                # Mirror the source tool's access: its direct viewers and its
+                # owners (creator + co-owners, UN-2202).
+                obj.shared_users.add(*[u.id for u in custom_tool.viewers()])
+                obj.shared_users.add(*[u.id for u in custom_tool.owners()])
+            else:
+                obj.shared_users.clear()
+            obj.save()
+            return obj
+        except IntegrityError as error:
+            logger.error(
+                f"Integrity Error - Error occurred while exporting custom tool : {error}"
+            )
+            raise ToolSaveError
+
+    @staticmethod
+    def frame_export_json(
+        tool: CustomTool,
+        prompts: list[ToolStudioPrompt],
+        force_export: bool,
+    ) -> dict[str, Any]:
+        export_metadata = {}
+
+        prompt_grammer = tool.prompt_grammer
+        grammar_list = []
+        grammer_dict = {}
+        outputs: list[dict[str, Any]] = []
+        output: dict[str, Any] = {}
+        invalidated_prompts: list[str] = []
+        invalidated_outputs: list[str] = []
+
+        if not prompts:
+            raise EmptyToolExportError()
+
+        if prompt_grammer:
+            for word, synonyms in prompt_grammer.items():
+                synonyms = prompt_grammer[word]
+                grammer_dict[JsonSchemaKey.WORD] = word
+                grammer_dict[JsonSchemaKey.SYNONYMS] = synonyms
+                grammar_list.append(grammer_dict)
+                grammer_dict = {}
+
+        export_metadata[JsonSchemaKey.NAME] = tool.tool_name
+        export_metadata[JsonSchemaKey.DESCRIPTION] = tool.description
+        export_metadata[JsonSchemaKey.AUTHOR] = tool.author
+        export_metadata[JsonSchemaKey.TOOL_ID] = str(tool.tool_id)
+
+        default_llm_profile = ProfileManager.get_default_llm_profile(tool)
+        challenge_llm_instance: AdapterInstance | None = tool.challenge_llm
+        challenge_llm: str | None = None
+        # Using default profile manager llm if challenge_llm is None
+        if challenge_llm_instance:
+            challenge_llm = str(challenge_llm_instance.id)
+        else:
+            challenge_llm = str(default_llm_profile.llm.id)
+
+        embedding_suffix = ""
+        adapter_id = ""
+        vector_db = str(default_llm_profile.vector_store.id)
+        embedding_model = str(default_llm_profile.embedding_model.id)
+        llm = str(default_llm_profile.llm.id)
+        x2text = str(default_llm_profile.x2text.id)
+
+        # Tool settings
+        tool_settings = {}
+        tool_settings[JsonSchemaKey.SUMMARIZE_PROMPT] = tool.summarize_prompt
+        tool_settings[JsonSchemaKey.SUMMARIZE_AS_SOURCE] = tool.summarize_as_source
+        tool_settings[JsonSchemaKey.PREAMBLE] = tool.preamble
+        tool_settings[JsonSchemaKey.POSTAMBLE] = tool.postamble
+        tool_settings[JsonSchemaKey.GRAMMAR] = grammar_list
+        tool_settings[JsonSchemaKey.LLM] = llm
+        tool_settings[JsonSchemaKey.X2TEXT_ADAPTER] = x2text
+        tool_settings[JsonSchemaKey.VECTOR_DB] = vector_db
+        tool_settings[JsonSchemaKey.EMBEDDING] = embedding_model
+        tool_settings[JsonSchemaKey.CHUNK_SIZE] = default_llm_profile.chunk_size
+        tool_settings[JsonSchemaKey.CHUNK_OVERLAP] = default_llm_profile.chunk_overlap
+        tool_settings[JsonSchemaKey.ENABLE_CHALLENGE] = tool.enable_challenge
+        tool_settings[JsonSchemaKey.CHALLENGE_LLM] = challenge_llm
+        tool_settings[JsonSchemaKey.ENABLE_SINGLE_PASS_EXTRACTION] = (
+            tool.single_pass_extraction_mode
+        )
+        tool_settings[JsonSchemaKey.ENABLE_HIGHLIGHT] = tool.enable_highlight
+        tool_settings[JsonSchemaKey.ENABLE_WORD_CONFIDENCE] = tool.enable_word_confidence
+        tool_settings[JsonSchemaKey.PLATFORM_POSTAMBLE] = getattr(
+            settings, JsonSchemaKey.PLATFORM_POSTAMBLE.upper(), ""
+        )
+        tool_settings[JsonSchemaKey.WORD_CONFIDENCE_POSTAMBLE] = getattr(
+            settings, JsonSchemaKey.WORD_CONFIDENCE_POSTAMBLE.upper(), ""
+        )
+
+        # Validate only what will actually be exported — NOTES / inactive
+        # prompts never run, so incomplete lookups on them shouldn't fail export.
+        exportable_prompts = [
+            p for p in prompts if p.prompt_type != JsonSchemaKey.NOTES and p.active
+        ]
+        lookup_configs, lookup_error = validate_lookups_for_export(exportable_prompts)
+        if lookup_error:
+            raise InValidCustomToolError(lookup_error)
+
+        for prompt in prompts:
+            if prompt.prompt_type == JsonSchemaKey.NOTES or not prompt.active:
+                continue
+
+            if not prompt.prompt:
+                invalidated_prompts.append(prompt.prompt_key)
+                continue
+
+            if not prompt.profile_manager:
+                prompt.profile_manager = default_llm_profile
+
+            if not force_export:
+                prompt_output = PromptStudioOutputManager.objects.filter(
+                    tool_id=tool.tool_id,
+                    prompt_id=prompt.prompt_id,
+                    profile_manager=prompt.profile_manager,
+                ).all()
+                if not prompt_output:
+                    invalidated_outputs.append(prompt.prompt_key)
+                    continue
+
+            vector_db = str(prompt.profile_manager.vector_store.id)
+            embedding_model = str(prompt.profile_manager.embedding_model.id)
+            llm = str(prompt.profile_manager.llm.id)
+            x2text = str(prompt.profile_manager.x2text.id)
+            adapter_id = str(prompt.profile_manager.embedding_model.adapter_id)
+            embedding_suffix = adapter_id.split("|")[0]
+
+            output[JsonSchemaKey.PROMPT] = prompt.prompt
+            output[JsonSchemaKey.ACTIVE] = prompt.active
+            output[JsonSchemaKey.REQUIRED] = prompt.required
+            output[JsonSchemaKey.CHUNK_SIZE] = prompt.profile_manager.chunk_size
+            output[JsonSchemaKey.VECTOR_DB] = vector_db
+            output[JsonSchemaKey.EMBEDDING] = embedding_model
+            output[JsonSchemaKey.X2TEXT_ADAPTER] = x2text
+            output[JsonSchemaKey.CHUNK_OVERLAP] = prompt.profile_manager.chunk_overlap
+            output[JsonSchemaKey.LLM] = llm
+            output[JsonSchemaKey.PREAMBLE] = tool.preamble
+            output[JsonSchemaKey.POSTAMBLE] = tool.postamble
+            output[JsonSchemaKey.GRAMMAR] = grammar_list
+            output[JsonSchemaKey.TYPE] = prompt.enforce_type
+            output[JsonSchemaKey.NAME] = prompt.prompt_key
+            output[JsonSchemaKey.RETRIEVAL_STRATEGY] = (
+                prompt.profile_manager.retrieval_strategy
+            )
+            output[JsonSchemaKey.SIMILARITY_TOP_K] = (
+                prompt.profile_manager.similarity_top_k
+            )
+            output[JsonSchemaKey.SECTION] = prompt.profile_manager.section
+            output[JsonSchemaKey.REINDEX] = prompt.profile_manager.reindex
+            output[JsonSchemaKey.EMBEDDING_SUFFIX] = embedding_suffix
+            # Webhook postprocessing settings
+            output[JsonSchemaKey.ENABLE_POSTPROCESSING_WEBHOOK] = (
+                prompt.enable_postprocessing_webhook
+            )
+            output[JsonSchemaKey.POSTPROCESSING_WEBHOOK_URL] = (
+                prompt.postprocessing_webhook_url
+            )
+            prompt_id_str = str(prompt.prompt_id)
+            if prompt_id_str in lookup_configs:
+                output["lookup_config"] = lookup_configs[prompt_id_str]
+            # Retaining the old fields in condition
+            # for backward compatibility. To be removed in future.
+            if (
+                prompt.enforce_type == PromptStudioRegistryKeys.TABLE
+                or prompt.enforce_type == PromptStudioRegistryKeys.RECORD
+                or prompt.enforce_type == PromptStudioRegistryKeys.LINE_ITEM
+            ):
+                payload_modifier_plugin = get_plugin("payload_modifier")
+                if payload_modifier_plugin:
+                    modifier_service = payload_modifier_plugin["service_class"]()
+                    output = modifier_service.update(
+                        output=output,
+                        tool_id=tool.tool_id,
+                        prompt_id=prompt.prompt_id,
+                        prompt=prompt.prompt,
+                    )
+            elif prompt.enforce_type == PromptStudioRegistryKeys.AGENTIC_TABLE:
+                payload_modifier_plugin = get_plugin("payload_modifier")
+                if payload_modifier_plugin:
+                    modifier_service = payload_modifier_plugin["service_class"]()
+                    output = modifier_service.export_agentic_table_settings(
+                        output=output,
+                        tool_id=tool.tool_id,
+                        prompt_id=prompt.prompt_id,
+                    )
+
+            outputs.append(output)
+            output = {}
+            vector_db = ""
+            embedding_suffix = ""
+            adapter_id = ""
+            llm = ""
+            embedding_model = ""
+
+        if not outputs:
+            raise EmptyToolExportError()
+
+        if invalidated_prompts:
+            raise InValidCustomToolError(
+                f"Cannot export tool. Prompt(s): {', '.join(invalidated_prompts)} "
+                "are empty. Please enter a valid prompt."
+            )
+        if not force_export and invalidated_outputs:
+            raise InValidCustomToolError(
+                detail="Cannot export tool. Prompt(s):"
+                f" {', '.join(invalidated_outputs)}"
+                " were not run. Please run them before exporting.",
+                code="warning",
+            )
+        export_metadata[JsonSchemaKey.TOOL_SETTINGS] = tool_settings
+        export_metadata[JsonSchemaKey.OUTPUTS] = outputs
+        return export_metadata
+
+    @staticmethod
+    def fetch_json_for_registry(user: User) -> list[dict[str, Any]]:
+        try:
+            # filter the Prompt studio registry based on the users and org flag
+            prompt_studio_tools = PromptStudioRegistry.objects.list_tools(user)
+            pi_serializer = PromptStudioRegistrySerializer(
+                instance=prompt_studio_tools, many=True
+            )
+        except Exception as error:
+            logger.error(f"Error occured while fetching tool for tool_id: {error}")
+            raise InternalError()
+        tool_metadata: dict[str, Any] = {}
+        tool_list = []
+        for prompts in pi_serializer.data:
+            tool_metadata[JsonSchemaKey.NAME] = prompts.get(JsonSchemaKey.NAME)
+            tool_metadata[JsonSchemaKey.DESCRIPTION] = prompts.get(
+                JsonSchemaKey.DESCRIPTION
+            )
+            tool_metadata[JsonSchemaKey.ICON] = prompts.get(JsonSchemaKey.ICON)
+            tool_metadata[JsonSchemaKey.FUNCTION_NAME] = prompts.get(
+                JsonSchemaKey.PROMPT_REGISTRY_ID
+            )
+            # Back-reference to the Prompt Studio project that produced this
+            # entry. `function_name` is the registry UUID, so without this the
+            # only correlator left is `name`, which is ambiguous when two
+            # projects share one.
+            #
+            # Read from the `custom_tool` FK column and published as
+            # `prompt_studio_tool_id`. Not `tool_id`: consumers of this listing
+            # also POST to `tool_instance/`, where `tool_id` means the tool's
+            # *function name* (`ToolInstance.tool_id`), so that key already has
+            # an incompatible meaning in the same call path.
+            #
+            # Stringified so the value does not depend on DRF's renderer to
+            # leave this dict, and so it compares like-for-like against
+            # `function_name`, which DRF's UUIDField already renders as a str.
+            # `fetch_tools_descriptions` emits no such key at all, so consumers
+            # must treat a missing key and `None` alike.
+            custom_tool_id = prompts.get(JsonSchemaKey.CUSTOM_TOOL)
+            tool_metadata[JsonSchemaKey.PROMPT_STUDIO_TOOL_ID] = (
+                str(custom_tool_id) if custom_tool_id is not None else None
+            )
+            tool_list.append(tool_metadata)
+            tool_metadata = {}
+        return tool_list

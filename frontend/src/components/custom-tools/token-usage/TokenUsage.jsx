@@ -1,6 +1,6 @@
-import { Tag, Tooltip } from "antd";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { formatNumberWithCommas } from "../../../helpers/GetStaticData";
 import { useTokenUsageStore } from "../../../store/token-usage-store";
 
 /**
@@ -9,7 +9,7 @@ import { useTokenUsageStore } from "../../../store/token-usage-store";
  * @param {string} tokenUsageId - The token usage ID to fetch token usage for.
  * @return {JSX.Element} - The TokenUsage component.
  */
-function TokenUsage({ tokenUsageId }) {
+function TokenUsage({ tokenUsageId, isLoading }) {
   const [tokens, setTokens] = useState({});
   const { tokenUsage } = useTokenUsageStore();
 
@@ -23,20 +23,22 @@ function TokenUsage({ tokenUsageId }) {
     setTokens(tokenUsage[tokenUsageId]); // Update tokens state with the token usage data for the given tokenUsageId
   }, [tokenUsage, tokenUsageId]);
 
-  // If no tokens data is available, render nothing
-  if (!tokens || !Object.keys(tokens)?.length) {
-    return <></>;
+  // BE returns all-null fields when no Usage rows match; treat as empty.
+  if (
+    !tokens ||
+    !Object.keys(tokens)?.length ||
+    isLoading ||
+    tokens?.total_tokens == null
+  ) {
+    return "NA";
   }
 
-  return (
-    <Tooltip title="Total Token Count">
-      <Tag color="#2db7f5">{`Tokens: ${tokens?.total_tokens}`}</Tag>
-    </Tooltip>
-  );
+  return formatNumberWithCommas(tokens?.total_tokens);
 }
 
 TokenUsage.propTypes = {
-  tokenUsageId: PropTypes.string.isRequired,
+  tokenUsageId: PropTypes.string,
+  isLoading: PropTypes.bool,
 };
 
 export { TokenUsage };

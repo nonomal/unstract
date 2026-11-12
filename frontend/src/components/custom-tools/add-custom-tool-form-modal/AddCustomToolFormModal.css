@@ -1,15 +1,27 @@
 /* Styles for AddCustomToolForm */
 
 .add-cus-tool-header {
-    font-size: 16px;
-    font-weight: bold;
+  font-size: 16px;
+  font-weight: bold;
 }
 
 .add-cus-tool-gap {
-    margin-bottom: 16px;
+  margin-bottom: 16px;
 }
 
-.emoji-modal .ant-modal-content {
-    padding: 0;
-    width: fit-content;
-  }
+/*
+ * The emoji picker is a Popover, not a Modal — the old
+ * `.emoji-modal .ant-modal-content` selector matched nothing after the
+ * migration.
+ *
+ * The picker brings its own chrome and sizing, so the popover must not add
+ * padding (shadcn's PopoverContent defaults to `p-4`) or the bubble is padded
+ * on all sides and pushed wider than the viewport allows.
+ */
+.emoji-modal.emoji-modal {
+  /* Doubled selector for specificity: this competes with Tailwind's `p-4`
+   * utility on PopoverContent, and a single class ties with it on
+   * specificity — leaving the winner down to source order. */
+  padding: 0;
+  width: fit-content;
+}

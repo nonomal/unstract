@@ -1,6 +1,5 @@
 {
-  "title": "MariaDB database",
-  "description": "Designed with a patented new architecture to handle all aspects of data and analytics",
+  "title": "MariaDB Database",
   "type": "object",
   "required": [
     "connectorName",
@@ -41,6 +40,12 @@
       "title": "Password",
       "format": "password",
       "default": ""
+    },
+    "sslEnabled": {
+      "type": "boolean",
+      "title": "Enable SSL",
+      "description": "Toggle TLS/SSL for the client connection. Enable if your server enforces TLS; disable if your environment requires plain connections.",
+      "default": false
     }
   }
 }

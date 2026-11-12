@@ -33,6 +33,11 @@ class LogStage(Enum):
     BUILD = "BUILD"
     TOOL = "TOOL"
     RUN = "RUN"
+    SOURCE = "SOURCE"
+    DESTINATION = "DESTINATION"
+    INITIALIZE = "INITIALIZE"
+    FINALIZE = "FINALIZE"
+    PROCESSING = "PROCESSING"
 
 
 class LogState(Enum):
@@ -92,6 +97,8 @@ class LogType(Enum):
     UPDATE = "UPDATE"
 
 
+# TODO: Use Enum from SDK instead
 class LogLevel(Enum):
     INFO = "INFO"
     ERROR = "ERROR"
+    WARN = "WARN"

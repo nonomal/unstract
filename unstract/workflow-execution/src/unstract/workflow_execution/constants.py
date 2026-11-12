@@ -14,12 +14,43 @@ class ToolRuntimeVariable:
     PLATFORM_HOST = "PLATFORM_SERVICE_HOST"
     PLATFORM_PORT = "PLATFORM_SERVICE_PORT"
     PLATFORM_SERVICE_API_KEY = "PLATFORM_SERVICE_API_KEY"
-    PROMPT_HOST = "PROMPT_HOST"
-    PROMPT_PORT = "PROMPT_PORT"
     X2TEXT_HOST = "X2TEXT_HOST"
     X2TEXT_PORT = "X2TEXT_PORT"
-    ADAPTER_LLMW_POLL_INTERVAL = "ADAPTER_LLMW_POLL_INTERVAL"
-    ADAPTER_LLMW_MAX_POLLS = "ADAPTER_LLMW_MAX_POLLS"
+    ADAPTER_LLMW_WAIT_TIMEOUT = "ADAPTER_LLMW_WAIT_TIMEOUT"
+    EXECUTION_BY_TOOL = "EXECUTION_BY_TOOL"
+    WORKFLOW_EXECUTION_DIR_PREFIX = "WORKFLOW_EXECUTION_DIR_PREFIX"
+    API_EXECUTION_DIR_PREFIX = "API_EXECUTION_DIR_PREFIX"
+    REDIS_HOST = "REDIS_HOST"
+    REDIS_PORT = "REDIS_PORT"
+    REDIS_USER = "REDIS_USER"
+    REDIS_PASSWORD = "REDIS_PASSWORD"
+    REDIS_SENTINEL_MODE = "REDIS_SENTINEL_MODE"
+    REDIS_SENTINEL_MASTER_NAME = "REDIS_SENTINEL_MASTER_NAME"
+    # UN-4123 — TLS settings for tool containers, which build their own Redis
+    # client (sdk1 metrics). Same allowlist trap as the sidecar's.
+    REDIS_DB = "REDIS_DB"
+    REDIS_SSL = "REDIS_SSL"
+    REDIS_SSL_CERT_REQS = "REDIS_SSL_CERT_REQS"
+    # Forwarded as a PATH, and nothing mounts a CA into the tool container: only the
+    # shared logs volume is. It therefore works only for an image that bakes the
+    # CA in at this path — otherwise load_verify_locations() raises on a file
+    # that is not there. Kept forwarded so the baked-in case is configurable;
+    # the caveat is spelled out in runner/sample.env.
+    REDIS_SSL_CA_CERTS = "REDIS_SSL_CA_CERTS"
+    # The ONLY way back from the on-by-default hostname verification that UN-4123
+    # introduced. An endpoint whose certificate SAN does not match how it is
+    # addressed (an IP, an internal CNAME) needs it set to false platform-wide —
+    # and without it here, these processes alone would keep verifying and fail the
+    # handshake while everything else recovered.
+    REDIS_SSL_CHECK_HOSTNAME = "REDIS_SSL_CHECK_HOSTNAME"
+    REDIS_URL = "REDIS_URL"
+    # Read by _resolve_health_check_interval in this same client, so the
+    # documented "set it to 0 to restore the old behaviour" lever has to reach
+    # here too — otherwise these processes silently keep the 30s default.
+    REDIS_HEALTH_CHECK_INTERVAL = "REDIS_HEALTH_CHECK_INTERVAL"
+    # Single-database deployments move the sdk1 metrics keys off db 1; the tool
+    # builds its own client, so the choice has to reach it through this allowlist.
+    METRICS_REDIS_DB = "METRICS_REDIS_DB"
 
 
 class WorkflowFileType:
@@ -33,8 +64,15 @@ class MetaDataKey:
     SOURCE_HASH = "source_hash"
     WORKFLOW_ID = "workflow_id"
     EXECUTION_ID = "execution_id"
+    FILE_EXECUTION_ID = "file_execution_id"
     ORGANIZATION_ID = "organization_id"
     TOOL_METADATA = "tool_metadata"
+    TAGS = "tags"
+    LLM_PROFILE_ID = "llm_profile_id"
+    TOTAL_ELAPSED_TIME = "total_elapsed_time"
+    WORKFLOW_START_TIME = "workflow_start_time"
+    USER_DATA = "user_data"
+    CUSTOM_DATA = "custom_data"
 
 
 class ToolMetadataKey:

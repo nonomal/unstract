@@ -1,0 +1,654 @@
+"""Internal API views for Prompt Studio IDE callbacks.
+
+These endpoints are called by the ide_callback worker (via InternalAPIClient)
+to perform Django ORM operations that were previously done directly in the
+backend callback tasks. Moving these behind HTTP keeps the worker image
+free of Django dependencies.
+
+Security note: @csrf_exempt is safe here because these endpoints are
+internal-only (called by backend workers via service-to-service HTTP,
+not by browsers). They are bound to the internal URL namespace and are
+not exposed to end users.
+"""
+
+import json
+import logging
+import uuid
+
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from rest_framework import status
+
+# 50 MB — agentic table extraction output with highlight coordinates
+# can exceed Django's default 2.5 MB DATA_UPLOAD_MAX_MEMORY_SIZE.
+# Dense tables (1000+ rows with per-cell coordinates) can reach 10-20 MB.
+_PROMPT_OUTPUT_MAX_BODY = 50 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
+
+_ERR_INVALID_JSON = "Invalid JSON"
+
+
+def _resolve_profile(profile_manager_id):
+    """Return ``(profile, None)``, or ``(None, JsonResponse)`` when it is absent.
+
+    ``ProfileManager.objects`` is org-scoped on ``vector_store__organization``,
+    so a miss here has the same two causes as a missing document — the row is
+    gone, or the org scope hides it from this caller — and neither is fixed by
+    trying again. A malformed id raises Django's ``ValidationError`` while the
+    query is built, which is just as permanent.
+
+    Left to the generic ``except Exception`` these all became a 500, which the
+    worker's client retries three times with a 1s backoff factor: ~7s of worker
+    sleep on a condition no retry can change. 404 is outside that retry set.
+    """
+    from django.core.exceptions import ValidationError
+
+    from prompt_studio.prompt_profile_manager_v2.models import ProfileManager
+
+    try:
+        return ProfileManager.objects.get(pk=profile_manager_id), None
+    except (ProfileManager.DoesNotExist, ValidationError):
+        logger.error(
+            "Profile manager %s not found or not visible in the current " "organization.",
+            profile_manager_id,
+        )
+        return None, JsonResponse(
+            {"success": False, "error": "Profile manager not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+
+def _parse_json_body(request):
+    """Parse JSON from request body, returning (data, None) or (None, JsonResponse)."""
+    try:
+        return json.loads(request.body), None
+    except json.JSONDecodeError:
+        return None, JsonResponse(
+            {"success": False, "error": _ERR_INVALID_JSON},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+def _validated_uuids(raw_ids, field_name):
+    """``raw_ids`` parsed as UUIDs, or ``(None, JsonResponse)`` for a 400.
+
+    These are UUID columns, so a non-UUID entry makes ``filter()`` raise
+    Django's ``ValidationError`` while the query is being *built* — before any
+    row-count check downstream can notice. That lands in the generic
+    ``except Exception`` and returns a 500, which the worker's client retries
+    three times with backoff on a value no retry can change. Same reasoning as
+    ``_resolve_profile``: fail outside the {500,502,503,504} retry set.
+
+    ``utils.uuid_validation.validated_uuid`` is the equivalent for the DRF
+    views and is deliberately not reused here: it raises DRF's
+    ``ValidationError``, and nothing maps that to a response in a plain Django
+    view, so it would reach that same ``except Exception`` and 500 for a new
+    reason.
+    """
+    if not isinstance(raw_ids, (list, tuple)):
+        # A non-sequence here would raise TypeError on the loop below, outside
+        # any handler, so it has to be rejected rather than iterated.
+        return None, JsonResponse(
+            {
+                "success": False,
+                "error": (
+                    f"'{field_name}' must be a JSON array, got "
+                    f"{type(raw_ids).__name__}."
+                ),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    parsed = []
+    for raw in raw_ids:
+        try:
+            parsed.append(uuid.UUID(str(raw)))
+        except (ValueError, AttributeError, TypeError):
+            return None, JsonResponse(
+                {
+                    "success": False,
+                    "error": f"'{field_name}' must contain only valid UUIDs.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    return parsed, None
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def prompt_output(request):
+    """Persist prompt execution output via OutputManagerHelper.
+
+    Expected JSON payload:
+    {
+        "run_id": str,
+        "prompt_ids": [str, ...],
+        "outputs": dict,
+        "document_id": str,
+        "is_single_pass_extract": bool,
+        "profile_manager_id": str | null,
+        "metadata": dict
+    }
+
+    Uses ``request.read()`` instead of ``request.body`` to bypass
+    Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` check.  Agentic table
+    extraction output with highlight coordinates can exceed the default
+    2.5 MB limit; this view enforces its own 50 MB cap instead.
+    """
+    content_length = int(request.META.get("CONTENT_LENGTH") or 0)
+    if content_length > _PROMPT_OUTPUT_MAX_BODY:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": (
+                    f"Request body too large ({content_length} bytes, "
+                    f"limit {_PROMPT_OUTPUT_MAX_BODY})"
+                ),
+            },
+            status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        )
+    try:
+        data = json.loads(request.read())
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {"success": False, "error": _ERR_INVALID_JSON},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    run_id = data.get("run_id", "")
+    prompt_ids = data.get("prompt_ids", [])
+    outputs = data.get("outputs", {})
+    document_id = data.get("document_id", "")
+    is_single_pass = data.get("is_single_pass_extract", False)
+    profile_manager_id = data.get("profile_manager_id")
+    metadata = data.get("metadata", {})
+
+    if not prompt_ids or not document_id:
+        return JsonResponse(
+            {"success": False, "error": "prompt_ids and document_id are required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Both of these are indexed by key inside OutputManagerHelper.
+    # handle_prompt_output_update: `metadata` at its lines 135-139 (context,
+    # challenge_data, highlight_data, confidence_data, word_confidence_data,
+    # all unconditional and reached before the `if not prompts` early exit),
+    # and `outputs` at line 179. A non-mapping in either raises AttributeError
+    # deep in the helper and surfaces as an opaque 500.
+    #
+    # Reachable from ordinary traffic, not just a malformed client: single-pass
+    # extraction passes the LLM's parsed JSON straight through as `outputs`,
+    # and the repair returns a list whenever the model adds commentary or
+    # answers in prose. Rejecting both here with a reason means no executor can
+    # 500 the backend this way (UN-4017).
+    for field_name, value in (("outputs", outputs), ("metadata", metadata)):
+        if not isinstance(value, dict):
+            return JsonResponse(
+                {
+                    "success": False,
+                    "error": (
+                        f"{field_name} must be a JSON object, got "
+                        f"{type(value).__name__}. A JSON array is valid JSON "
+                        "but cannot be indexed by key."
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    # Both reach a UUID column below — prompt_ids the filter, document_id the
+    # DocumentManager lookup inside handle_prompt_output_update — so both are
+    # parsed before the query is built rather than after it raises. Ordered
+    # last among the 400s so the shape checks above keep reporting first; the
+    # only constraint is that this runs before the ORM does.
+    prompt_ids, err = _validated_uuids(prompt_ids, "prompt_ids")
+    if err:
+        return err
+    document_ids, err = _validated_uuids([document_id], "document_id")
+    if err:
+        return err
+    document_id = document_ids[0]
+
+    try:
+        from prompt_studio.prompt_studio_output_manager_v2.output_manager_helper import (
+            OutputManagerHelper,
+        )
+        from prompt_studio.prompt_studio_v2.models import ToolStudioPrompt
+
+        prompts = list(
+            ToolStudioPrompt.objects.filter(prompt_id__in=prompt_ids).order_by(
+                "sequence_number"
+            )
+        )
+
+        # ``ToolStudioPrompt.objects`` is org-scoped on the nullable
+        # ``tool_id__organization``, so this filter can return fewer prompts
+        # than were asked for — or none. handle_prompt_output_update early-exits
+        # on an empty list, so the endpoint would answer 200 with an empty body
+        # and the worker, which never reads the body on success, would discard
+        # every prompt output for the run. Same reasoning as extraction_status
+        # below: fail loudly, and outside the client's {500,502,503,504} retry
+        # set, because no retry resolves a prompt the scope hides.
+        requested = set(prompt_ids)
+        if len(prompts) != len(requested):
+            # Both sides are uuid.UUID: prompt_ids was parsed above and
+            # prompt_id is a UUIDField, so the difference below is real.
+            resolved = {p.prompt_id for p in prompts}
+            logger.error(
+                "prompt_output: %d of %d prompts resolved for document %s; "
+                "unresolved=%s. Refusing to persist a partial run.",
+                len(prompts),
+                len(requested),
+                document_id,
+                sorted(str(p) for p in requested - resolved),
+            )
+            return JsonResponse(
+                {
+                    "success": False,
+                    "error": (
+                        "One or more prompts were not found or are not visible "
+                        "in the current organization"
+                    ),
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        response = OutputManagerHelper.handle_prompt_output_update(
+            run_id=run_id,
+            prompts=prompts,
+            outputs=outputs,
+            document_id=document_id,
+            is_single_pass_extract=is_single_pass,
+            profile_manager_id=profile_manager_id,
+            metadata=metadata,
+        )
+        return JsonResponse({"success": True, "data": response})
+
+    except Exception as e:
+        logger.exception("prompt_output internal API failed")
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def index_update(request):
+    """Update IndexManager after successful indexing.
+
+    Expected JSON payload:
+    {
+        "document_id": str,
+        "profile_manager_id": str,
+        "doc_id": str,
+        "is_summary": bool (optional, default false)
+    }
+    """
+    data, err = _parse_json_body(request)
+    if err:
+        return err
+
+    document_id = data.get("document_id", "")
+    profile_manager_id = data.get("profile_manager_id", "")
+    doc_id = data.get("doc_id", "")
+    is_summary = data.get("is_summary", False)
+
+    if not document_id or not profile_manager_id or not doc_id:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "document_id, profile_manager_id, and doc_id are required",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        from prompt_studio.prompt_studio_index_manager_v2.prompt_studio_index_helper import (
+            PromptStudioIndexHelper,
+        )
+
+        profile_manager, err = _resolve_profile(profile_manager_id)
+        if err:
+            return err
+        PromptStudioIndexHelper.handle_index_manager(
+            document_id=document_id,
+            profile_manager=profile_manager,
+            doc_id=doc_id,
+            is_summary=is_summary,
+        )
+        return JsonResponse({"success": True})
+
+    except Exception as e:
+        logger.exception("index_update internal API failed")
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def extraction_status(request):
+    """Mark IndexManager.extraction_status for a document+profile pair.
+
+    Called by the ide_callback worker after a successful ide_index run so
+    that subsequent Answer Prompt dispatches can short-circuit extraction
+    via PromptStudioIndexHelper.check_extraction_status.
+
+    Expected JSON payload:
+    {
+        "document_id": str,
+        "profile_manager_id": str,
+        "x2text_config_hash": str,
+        "enable_highlight": bool,
+        "extracted": bool (optional, default true),
+        "error_message": str | null (optional)
+    }
+    """
+    data, err = _parse_json_body(request)
+    if err:
+        return err
+
+    document_id = data.get("document_id", "")
+    profile_manager_id = data.get("profile_manager_id", "")
+    x2text_config_hash = data.get("x2text_config_hash", "")
+    enable_highlight = data.get("enable_highlight", False)
+    extracted = data.get("extracted", True)
+    error_message = data.get("error_message")
+
+    if not document_id or not profile_manager_id or not x2text_config_hash:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": (
+                    "document_id, profile_manager_id, and x2text_config_hash "
+                    "are required"
+                ),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        from prompt_studio.prompt_studio_index_manager_v2.prompt_studio_index_helper import (
+            ExtractionStatusResult,
+            PromptStudioIndexHelper,
+        )
+
+        profile_manager, err = _resolve_profile(profile_manager_id)
+        if err:
+            return err
+        result = PromptStudioIndexHelper.mark_extraction_status(
+            document_id=document_id,
+            profile_manager=profile_manager,
+            x2text_config_hash=x2text_config_hash,
+            enable_highlight=enable_highlight,
+            extracted=extracted,
+            error_message=error_message,
+        )
+        # A 200 on anything but OK is indistinguishable from a write that
+        # landed: the worker only wraps this call in try/except and never reads
+        # the body, so the status would be silently dropped and every later
+        # Answer Prompt would re-run the full extraction. Non-2xx makes the
+        # worker's existing handler log it.
+        #
+        # The two failures need different statuses. The client retries
+        # {500, 502, 503, 504} three times with a 1s backoff factor, so a
+        # document that is gone would burn four round trips and ~7s of worker
+        # sleep on a condition no retry can change. 404 is outside that set.
+        #
+        # Matched member by member with no wildcard branch: a fourth member
+        # added later raises here instead of being absorbed into the 500 case.
+        if result is not ExtractionStatusResult.OK:
+            logger.error(
+                "extraction_status not recorded for document %s profile %s (%s)",
+                document_id,
+                profile_manager_id,
+                result.value,
+            )
+        match result:
+            case ExtractionStatusResult.OK:
+                return JsonResponse({"success": True})
+            case ExtractionStatusResult.DOCUMENT_MISSING:
+                return JsonResponse(
+                    {"success": False, "error": "Document not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            case ExtractionStatusResult.WRITE_FAILED:
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "error": "Extraction status could not be recorded",
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            case unhandled:
+                raise AssertionError(f"Unhandled ExtractionStatusResult: {unhandled!r}")
+
+    except Exception as e:
+        logger.exception("extraction_status internal API failed")
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def indexing_status(request):
+    """Update document indexing cache status (mark indexed or remove).
+
+    Expected JSON payload:
+    {
+        "action": "mark_indexed" | "remove",
+        "org_id": str,
+        "user_id": str,
+        "doc_id_key": str,
+        "doc_id": str (required when action == "mark_indexed")
+    }
+    """
+    data, err = _parse_json_body(request)
+    if err:
+        return err
+
+    action = data.get("action", "")
+    org_id = data.get("org_id", "")
+    user_id = data.get("user_id", "")
+    doc_id_key = data.get("doc_id_key", "")
+
+    if not action or not org_id or not user_id or not doc_id_key:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "action, org_id, user_id, doc_id_key are required",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        from prompt_studio.prompt_studio_core_v2.document_indexing_service import (
+            DocumentIndexingService,
+        )
+
+        if action == "mark_indexed":
+            doc_id = data.get("doc_id", "")
+            if not doc_id:
+                return JsonResponse(
+                    {"success": False, "error": "doc_id required for mark_indexed"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            DocumentIndexingService.mark_document_indexed(
+                org_id=org_id, user_id=user_id, doc_id_key=doc_id_key, doc_id=doc_id
+            )
+        elif action == "remove":
+            DocumentIndexingService.remove_document_indexing(
+                org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+            )
+        else:
+            return JsonResponse(
+                {"success": False, "error": f"Unknown action: {action}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return JsonResponse({"success": True})
+
+    except Exception as e:
+        logger.exception("indexing_status internal API failed")
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@require_http_methods(["GET"])
+def profile_detail(request, profile_id):
+    """Return profile manager details needed by the worker for summary indexing.
+
+    Returns vector_store, embedding_model, x2text adapter IDs and chunk_overlap.
+    """
+    try:
+        profile, err = _resolve_profile(profile_id)
+        if err:
+            return err
+        return JsonResponse(
+            {
+                "success": True,
+                "data": {
+                    "profile_id": str(profile.profile_id),
+                    "vector_store_id": str(profile.vector_store_id),
+                    "embedding_model_id": str(profile.embedding_model_id),
+                    "x2text_id": str(profile.x2text_id),
+                    "chunk_overlap": profile.chunk_overlap,
+                    "chunk_size": profile.chunk_size,
+                },
+            }
+        )
+
+    except Exception as e:
+        logger.exception("profile_detail internal API failed")
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def hubspot_notify(request):
+    """Fire a HubSpot event for a given user.
+
+    Expected JSON payload:
+    {
+        "user_id": str,
+        "event_name": str,
+        "is_first_for_org": bool,
+        "action_label": str
+    }
+    """
+    data, err = _parse_json_body(request)
+    if err:
+        return err
+
+    user_id = data.get("user_id", "")
+    event_name = data.get("event_name", "")
+    is_first_for_org = data.get("is_first_for_org", False)
+    action_label = data.get("action_label", "")
+
+    if not user_id or not event_name:
+        return JsonResponse(
+            {"success": False, "error": "user_id and event_name are required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        from django.contrib.auth import get_user_model
+        from utils.hubspot_notify import notify_hubspot_event
+
+        user_model = get_user_model()
+        user = user_model.objects.get(pk=user_id)
+        notify_hubspot_event(
+            user=user,
+            event_name=event_name,
+            is_first_for_org=is_first_for_org,
+            action_label=action_label,
+        )
+        return JsonResponse({"success": True})
+
+    except Exception as e:
+        logger.warning("hubspot_notify internal API failed: %s", e)
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def summary_index_key(request):
+    """Compute summary doc_id hash server-side.
+
+    This requires PromptIdeBaseTool (Django ORM + SDK1) which is only
+    available on the backend image, not the workers image.
+
+    Expected JSON payload:
+    {
+        "summary_profile_id": str,
+        "summarize_file_path": str,
+        "org_id": str
+    }
+    """
+    data, err = _parse_json_body(request)
+    if err:
+        return err
+
+    summary_profile_id = data.get("summary_profile_id", "")
+    summarize_file_path = data.get("summarize_file_path", "")
+    org_id = data.get("org_id", "")
+
+    if not summary_profile_id or not summarize_file_path or not org_id:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "summary_profile_id, summarize_file_path, and org_id are required",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        from utils.file_storage.constants import FileStorageKeys
+
+        from prompt_studio.prompt_studio_core_v2.prompt_ide_base_tool import (
+            PromptIdeBaseTool,
+        )
+        from unstract.sdk1.constants import LogLevel
+        from unstract.sdk1.file_storage.constants import StorageType
+        from unstract.sdk1.file_storage.env_helper import EnvHelper
+        from unstract.sdk1.utils.indexing import IndexingUtils
+
+        profile, err = _resolve_profile(summary_profile_id)
+        if err:
+            return err
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        util = PromptIdeBaseTool(log_level=LogLevel.INFO, org_id=org_id)
+        doc_id = IndexingUtils.generate_index_key(
+            vector_db=str(profile.vector_store_id),
+            embedding=str(profile.embedding_model_id),
+            x2text=str(profile.x2text_id),
+            chunk_size="0",
+            chunk_overlap=str(profile.chunk_overlap),
+            file_path=summarize_file_path,
+            fs=fs_instance,
+            tool=util,
+        )
+        return JsonResponse({"success": True, "data": {"doc_id": doc_id}})
+
+    except Exception as e:
+        logger.exception("summary_index_key internal API failed")
+        return JsonResponse(
+            {"success": False, "error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

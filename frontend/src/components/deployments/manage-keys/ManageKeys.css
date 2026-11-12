@@ -1,17 +1,31 @@
 .keys-table {
-    height: 350px;
-    overflow-y: auto;
+  height: 350px;
+  overflow-y: auto;
 }
 
 .new-key-btn {
-    margin-top: 10px;
-    margin-bottom: 10px;
+  margin-top: 10px;
+  margin-bottom: 10px;
 }
 
 .cursorPointer {
-    cursor: pointer;
+  cursor: pointer;
 }
 
 .actions {
-    margin-right: 10px;
+  margin-right: 10px;
+}
+
+/* API keys are credentials: a shared user sees the controls, greyed. */
+.actions[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Wide enough for a full UUID key, so revealing it does not move the eye
+   button sideways. */
+.manage-keys__key {
+  display: inline-block;
+  min-width: 36ch;
+  font-family: monospace;
 }

@@ -1,10 +1,14 @@
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 from redis import Redis
+
+from unstract.core.pubsub_helper import LogPublisher
 from unstract.tool_registry import ToolRegistry
 from unstract.tool_sandbox import ToolSandbox
+from unstract.tool_sandbox.dto import RunnerContainerRunResponse
+from unstract.tool_sandbox.exceptions import ToolNotFoundInRegistryError
 from unstract.workflow_execution.constants import ToolExecution
 from unstract.workflow_execution.constants import ToolRuntimeVariable as ToolRV
 from unstract.workflow_execution.dto import ToolInstance, WorkflowDto
@@ -14,8 +18,6 @@ from unstract.workflow_execution.exceptions import (
     ToolExecutionException,
     ToolNotFoundException,
 )
-
-from unstract.core.pubsub_helper import LogPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -35,30 +37,35 @@ class ToolsUtils:
         self.platform_service_api_key = platform_service_api_key
         self.workflow_id = workflow.id
         self.ignore_processed_entities = ignore_processed_entities
-        self.messaging_channel: Optional[str] = None
+        self.messaging_channel: str | None = None
         self.platform_service_host = ToolsUtils.get_env(
             ToolRV.PLATFORM_HOST, raise_exception=True
         )
         self.platform_service_port = ToolsUtils.get_env(
             ToolRV.PLATFORM_PORT, raise_exception=True
         )
-        self.prompt_host = ToolsUtils.get_env(ToolRV.PROMPT_HOST, raise_exception=True)
-        self.prompt_port = ToolsUtils.get_env(ToolRV.PROMPT_PORT, raise_exception=True)
         self.x2text_host = ToolsUtils.get_env(ToolRV.X2TEXT_HOST, raise_exception=True)
         self.x2text_port = ToolsUtils.get_env(ToolRV.X2TEXT_PORT, raise_exception=True)
-        self.llmw_poll_interval = ToolsUtils.get_env(
-            ToolRV.ADAPTER_LLMW_POLL_INTERVAL, raise_exception=False
+        self.llmw_wait_timeout = ToolsUtils.get_env(
+            ToolRV.ADAPTER_LLMW_WAIT_TIMEOUT, raise_exception=False
         )
-        self.llmw_max_polls = ToolsUtils.get_env(
-            ToolRV.ADAPTER_LLMW_MAX_POLLS, raise_exception=False
+        self.redis_host = ToolsUtils.get_env(ToolRV.REDIS_HOST, raise_exception=True)
+        self.redis_port = ToolsUtils.get_env(ToolRV.REDIS_PORT, raise_exception=True)
+        self.redis_user = ToolsUtils.get_env(ToolRV.REDIS_USER, raise_exception=True)
+        self.redis_password = ToolsUtils.get_env(
+            ToolRV.REDIS_PASSWORD, raise_exception=True
+        )
+        self.redis_sentinel_mode = ToolsUtils.get_env(
+            ToolRV.REDIS_SENTINEL_MODE, raise_exception=False
+        )
+        self.redis_sentinel_master_name = ToolsUtils.get_env(
+            ToolRV.REDIS_SENTINEL_MASTER_NAME, raise_exception=False
         )
 
     def set_messaging_channel(self, messaging_channel: str) -> None:
         self.messaging_channel = messaging_channel
 
-    def load_tools(
-        self, tool_instances: list[ToolInstance]
-    ) -> dict[str, dict[str, Any]]:
+    def load_tools(self, tool_instances: list[ToolInstance]) -> dict[str, dict[str, Any]]:
         """Load and check all required tools.
 
         Args:
@@ -168,48 +175,47 @@ class ToolsUtils:
 
     def run_tool(
         self,
+        file_execution_id: str,
         tool_sandbox: ToolSandbox,
-    ) -> Any:
-        return self.run_tool_with_retry(tool_sandbox)
+    ) -> RunnerContainerRunResponse | None:
+        return self.run_tool_with_retry(file_execution_id, tool_sandbox)
 
     def run_tool_with_retry(
         self,
+        file_execution_id: str,
         tool_sandbox: ToolSandbox,
         max_retries: int = ToolExecution.MAXIMUM_RETRY,
-    ) -> Any:
-        error: Optional[dict[str, Any]] = None
+    ) -> RunnerContainerRunResponse | None:
         for retry_count in range(max_retries):
             try:
-                response = tool_sandbox.run_tool()
+                response = tool_sandbox.run_tool(file_execution_id, retry_count)
                 if response:
-                    result: dict[str, Any] = response.get("result", {})
-                    return result
+                    return response
                 logger.warning(
-                    f"ToolExecutionException - Retrying "
-                    f"({retry_count + 1}/{max_retries})"
+                    f"ToolExecutionException - Retrying ({retry_count + 1}/{max_retries})"
                 )
+            except ToolNotFoundInRegistryError:
+                # Don't retry configuration errors - tool image is not available
+                logger.error("Tool image not found in container registry - not retrying")
+                raise
             except Exception as e:
-                logger.warning(
-                    f"Exception - Retrying ({retry_count + 1}/{max_retries}): "
-                    f"{str(e)}"
-                )
-
-        logger.warning(
-            f"Operation failed after {max_retries} " f"retries, error: {error}"
-        )
+                if retry_count < max_retries - 1:
+                    logger.warning(
+                        f"Exception - Retrying ({retry_count + 1}/{max_retries}): {str(e)}"
+                    )
+                else:
+                    logger.warning(
+                        f"Operation failed after '{max_retries}' retries, error: {e}"
+                    )
+                    raise e
         return None
 
-    def get_tool_environment_variables(
-        self, project_settings: Optional[dict[str, Any]] = None
-    ) -> dict[str, Any]:
+    def get_tool_environment_variables(self) -> dict[str, Any]:
         """Obtain a dictionary of env variables required by a tool.
 
         This combines the user defined envs (coming from project_settings)
         as well as the env variables that are platform specific into
         one key-value store.
-
-        Args:
-            project_settings (Optional[dict[str, Any]]): User defined settings
 
         Returns:
             dict[str, Any]: Dict of env variables for a tool
@@ -218,22 +224,41 @@ class ToolsUtils:
             ToolRV.PLATFORM_HOST: self.platform_service_host,
             ToolRV.PLATFORM_PORT: self.platform_service_port,
             ToolRV.PLATFORM_SERVICE_API_KEY: self.platform_service_api_key,
-            ToolRV.PROMPT_HOST: self.prompt_host,
-            ToolRV.PROMPT_PORT: self.prompt_port,
             ToolRV.X2TEXT_HOST: self.x2text_host,
             ToolRV.X2TEXT_PORT: self.x2text_port,
+            ToolRV.EXECUTION_BY_TOOL: True,
+            ToolRV.REDIS_HOST: self.redis_host,
+            ToolRV.REDIS_PORT: self.redis_port,
+            ToolRV.REDIS_USER: self.redis_user,
+            ToolRV.REDIS_PASSWORD: self.redis_password,
+            ToolRV.REDIS_SENTINEL_MODE: self.redis_sentinel_mode or "False",
+            ToolRV.REDIS_SENTINEL_MASTER_NAME: self.redis_sentinel_master_name
+            or "mymaster",
+            # UN-4123: only the keys actually set, so an unset var leaves the tool's
+            # environment unchanged instead of gaining an empty string that
+            # os.getenv() would read as configured.
+            **{
+                name: os.environ[name]
+                for name in (
+                    ToolRV.REDIS_DB,
+                    ToolRV.REDIS_SSL,
+                    ToolRV.REDIS_SSL_CERT_REQS,
+                    ToolRV.REDIS_SSL_CA_CERTS,
+                    ToolRV.REDIS_SSL_CHECK_HOSTNAME,
+                    ToolRV.REDIS_URL,
+                    ToolRV.REDIS_HEALTH_CHECK_INTERVAL,
+                    ToolRV.METRICS_REDIS_DB,
+                )
+                if os.environ.get(name)
+            },
         }
         # For async LLM Whisperer extraction
-        if self.llmw_poll_interval:
-            platform_vars[ToolRV.ADAPTER_LLMW_POLL_INTERVAL] = self.llmw_poll_interval
-        if self.llmw_max_polls:
-            platform_vars[ToolRV.ADAPTER_LLMW_MAX_POLLS] = self.llmw_max_polls
-        if not project_settings:
-            project_settings = {}
-        return {**project_settings, **platform_vars}
+        if self.llmw_wait_timeout:
+            platform_vars[ToolRV.ADAPTER_LLMW_WAIT_TIMEOUT] = self.llmw_wait_timeout
+        return platform_vars
 
     @staticmethod
-    def get_env(env_key: str, raise_exception: bool = False) -> Optional[str]:
+    def get_env(env_key: str, raise_exception: bool = False) -> str | None:
         """Gets the value against an environment variable.
 
         Args:
@@ -248,6 +273,6 @@ class ToolsUtils:
             Optional[str]: Value for the env variable
         """
         env_value = os.environ.get(env_key)
-        if (env_value is None or env_value == "") and raise_exception:
+        if (env_value is None) and raise_exception:
             raise MissingEnvVariable(f"Env variable {env_key} is required")
         return env_value

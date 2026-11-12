@@ -1,20 +1,19 @@
-import { ArrowLeftOutlined, CaretRightOutlined } from "@ant-design/icons";
-import {
-  Button,
-  Col,
-  Collapse,
-  Form,
-  Input,
-  Row,
-  Select,
-  Space,
-  Typography,
-  theme,
-} from "antd";
+import { ArrowLeft, ChevronDown, ChevronRight, Settings } from "lucide-react";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Form } from "@/components/ui/shims/antd-form";
+import { Input, Select } from "@/components/ui/shims/antd-inputs";
+import { Col, Row, Space } from "@/components/ui/shims/antd-layout";
+import { Collapse } from "@/components/ui/shims/antd-overlays";
+import { Typography } from "@/components/ui/shims/antd-typography";
+import { cn } from "@/lib/utils";
 
-import { getBackendErrorDetail } from "../../../helpers/GetStaticData";
+import {
+  getBackendErrorDetail,
+  usableAdapters,
+} from "../../../helpers/GetStaticData";
+import { fetchAllPages } from "../../../helpers/pagination";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import { useAlertStore } from "../../../store/alert-store";
@@ -24,6 +23,8 @@ import { CustomButton } from "../../widgets/custom-button/CustomButton";
 import SpaceWrapper from "../../widgets/space-wrapper/SpaceWrapper";
 import "./AddLlmProfile.css";
 import usePostHogEvents from "../../../hooks/usePostHogEvents";
+import { useRetrievalStrategies } from "../../../hooks/useRetrievalStrategies";
+import RetrievalStrategyModal from "../retrieval-strategy-modal/RetrievalStrategyModal";
 
 function AddLlmProfile({
   editLlmProfileId,
@@ -36,6 +37,7 @@ function AddLlmProfile({
   const [resetForm, setResetForm] = useState(false);
   const [backendErrors, setBackendErrors] = useState(null);
   const [retrievalItems, setRetrievalItems] = useState([]);
+  const [hasLoadedFromApi, setHasLoadedFromApi] = useState(false);
   const [llmItems, setLlmItems] = useState([]);
   const [vectorDbItems, setVectorDbItems] = useState([]);
   const [embeddingItems, setEmbeddingItems] = useState([]);
@@ -44,35 +46,58 @@ function AddLlmProfile({
   const [loading, setLoading] = useState(false);
   const [modalTitle, setModalTitle] = useState("");
   const [areAdaptersReady, setAreAdaptersReady] = useState(false);
+  const [isRetrievalModalVisible, setIsRetrievalModalVisible] = useState(false);
   const { sessionDetails } = useSessionStore();
-  const { details, getDropdownItems, llmProfiles, updateCustomTool } =
-    useCustomToolStore();
+  const { details, llmProfiles, updateCustomTool } = useCustomToolStore();
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
-  const { token } = theme.useToken();
+  // P4: antd's theme token replaced by the Midnight Bloom CSS variable.
+  const token = { colorBgContainer: "var(--card)" };
   const handleException = useExceptionHandler();
   const { setPostHogCustomEvent } = usePostHogEvents();
-  const panelStyle = {
-    marginBottom: 16,
+  const { getStrategies } = useRetrievalStrategies();
+
+  const editedProfile = llmProfiles?.find(
+    (item) => item?.profile_id === editLlmProfileId,
+  );
+
+  const adapterOptions = (items, field) => {
+    const id = editedProfile?.[`${field}_id`];
+    if (!id || items?.some((item) => item?.value === id)) {
+      return items;
+    }
+    return [
+      ...items,
+      { value: id, label: editedProfile?.[field], disabled: true },
+    ];
   };
 
   useEffect(() => {
     setAdaptorProfilesDropdown();
-    const data = getDropdownItems("retrieval_strategy");
-    if (!data) {
-      return;
-    }
-    const items = Object.keys(data).map((name) => {
-      return {
-        value: data[name],
-      };
-    });
-    setRetrievalItems(items);
-
-    return () => {
-      setEditLlmProfileId(null);
-    };
   }, []);
+
+  // Load retrieval strategies when tool_id is available (only once)
+  useEffect(() => {
+    if (details?.tool_id && !hasLoadedFromApi) {
+      const loadStrategies = async () => {
+        try {
+          const strategies = await getStrategies(details.tool_id);
+          const items =
+            strategies?.map((strategy) => ({
+              value: strategy?.key,
+              label: strategy?.title,
+            })) || [];
+          setRetrievalItems(items);
+          setHasLoadedFromApi(true);
+        } catch (error) {
+          console.error("Error loading retrieval strategies:", error);
+          setHasLoadedFromApi(true);
+        }
+      };
+
+      loadStrategies();
+    }
+  }, [details?.tool_id, hasLoadedFromApi]); // getStrategies intentionally omitted to prevent infinite re-renders
 
   useEffect(() => {
     if (editLlmProfileId) {
@@ -83,9 +108,9 @@ function AddLlmProfile({
     setFormDetails({
       profile_name: "",
       llm: "",
-      chunk_size: 1024,
+      chunk_size: 0,
       vector_store: "",
-      chunk_overlap: 128,
+      chunk_overlap: 0,
       embedding_model: "",
       x2text: "",
       retrieval_strategy: "simple",
@@ -105,38 +130,18 @@ function AddLlmProfile({
 
     setModalTitle("Edit LLM Profile");
 
-    const llmProfileDetails = [...llmProfiles].find(
-      (item) => item?.profile_id === editLlmProfileId
-    );
-
-    const llmItem = llmItems.find(
-      (item) => item?.label === llmProfileDetails?.llm
-    );
-
-    const vectorDbItem = vectorDbItems.find(
-      (item) => item?.label === llmProfileDetails?.vector_store
-    );
-
-    const embeddingItem = embeddingItems.find(
-      (item) => item?.label === llmProfileDetails?.embedding_model
-    );
-
-    const x2TextItem = x2TextItems.find(
-      (item) => item?.label === llmProfileDetails?.x2text
-    );
-
     setResetForm(true);
     setFormDetails({
-      profile_name: llmProfileDetails?.profile_name,
-      llm: llmItem?.value || null,
-      chunk_size: llmProfileDetails?.chunk_size,
-      vector_store: vectorDbItem?.value || null,
-      chunk_overlap: llmProfileDetails?.chunk_overlap,
-      embedding_model: embeddingItem?.value || null,
-      x2text: x2TextItem?.value || null,
-      retrieval_strategy: llmProfileDetails?.retrieval_strategy,
-      similarity_top_k: llmProfileDetails?.similarity_top_k,
-      section: llmProfileDetails?.section,
+      profile_name: editedProfile?.profile_name,
+      llm: editedProfile?.llm_id || null,
+      chunk_size: editedProfile?.chunk_size,
+      vector_store: editedProfile?.vector_store_id || null,
+      chunk_overlap: editedProfile?.chunk_overlap,
+      embedding_model: editedProfile?.embedding_model_id || null,
+      x2text: editedProfile?.x2text_id || null,
+      retrieval_strategy: editedProfile?.retrieval_strategy,
+      similarity_top_k: editedProfile?.similarity_top_k,
+      section: editedProfile?.section,
       prompt_studio_tool: details?.tool_id,
     });
     setActiveKey(true);
@@ -144,7 +149,7 @@ function AddLlmProfile({
 
   useEffect(() => {
     if (resetForm) {
-      form.resetFields();
+      form.setFieldsValue(formDetails);
       setResetForm(false);
     }
   }, [formDetails]);
@@ -171,7 +176,7 @@ function AddLlmProfile({
     setBackendErrors((prevErrors) => {
       if (prevErrors) {
         const updatedErrors = prevErrors.errors.filter(
-          (error) => error.attr !== changedFieldName
+          (error) => error.attr !== changedFieldName,
         );
         return { ...prevErrors, errors: updatedErrors };
       }
@@ -180,74 +185,48 @@ function AddLlmProfile({
   };
 
   const setAdaptorProfilesDropdown = () => {
-    const requestOptions = {
-      method: "GET",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter`,
-    };
+    fetchAllPages(axiosPrivate, {
+      url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/`,
+    })
+      .then((data) => {
+        const llm = [];
+        const vectorDb = [];
+        const embedding = [];
+        const x2Text = [];
 
-    axiosPrivate(requestOptions)
-      .then((res) => {
-        const data = res?.data;
-
-        data.forEach((item) => {
+        usableAdapters(data).forEach((item) => {
+          const option = { value: item?.id, label: item?.adapter_name };
           if (item?.adapter_type === "LLM") {
-            setLlmItems((prev) => {
-              const newItems = [...prev];
-              newItems.push({
-                value: item?.id,
-                label: item?.adapter_name,
-              });
-              return newItems;
-            });
-          }
-          if (item?.adapter_type === "VECTOR_DB") {
-            setVectorDbItems((prev) => {
-              const newItems = [...prev];
-              newItems.push({
-                value: item?.id,
-                label: item?.adapter_name,
-              });
-              return newItems;
-            });
-          }
-          if (item?.adapter_type === "EMBEDDING") {
-            setEmbeddingItems((prev) => {
-              const newItems = [...prev];
-              newItems.push({
-                value: item?.id,
-                label: item?.adapter_name,
-              });
-              return newItems;
-            });
-          }
-          if (item?.adapter_type === "X2TEXT") {
-            setX2TextItems((prev) => {
-              const newItems = [...prev];
-              newItems.push({
-                value: item?.id,
-                label: item?.adapter_name,
-              });
-              return newItems;
-            });
+            llm.push(option);
+          } else if (item?.adapter_type === "VECTOR_DB") {
+            vectorDb.push(option);
+          } else if (item?.adapter_type === "EMBEDDING") {
+            embedding.push(option);
+          } else if (item?.adapter_type === "X2TEXT") {
+            x2Text.push(option);
           }
         });
+
+        setLlmItems(llm);
+        setVectorDbItems(vectorDb);
+        setEmbeddingItems(embedding);
+        setX2TextItems(x2Text);
         setAreAdaptersReady(true);
       })
       .catch((err) => {
         setAlertDetails(
           handleException(
             err,
-            "Failed to get the dropdown list for LLM Adaptors"
-          )
+            "Failed to get the dropdown list for LLM Adapters",
+          ),
         );
       });
   };
 
-  const getItems = (panelStyle) => [
+  const getItems = () => [
     {
       key: "1",
       label: "Advanced Settings",
-      style: panelStyle,
       children: (
         <div>
           <Form.Item
@@ -260,7 +239,35 @@ function AddLlmProfile({
             }
             help={getBackendErrorDetail("retrieval_strategy", backendErrors)}
           >
-            <Select options={retrievalItems} />
+            <button
+              type="button"
+              className="retrieval-strategy-selector"
+              onClick={handleRetrievalModalOpen}
+              aria-label="Select retrieval strategy"
+              aria-expanded={isRetrievalModalVisible}
+              aria-haspopup="dialog"
+            >
+              <span
+                className={`retrieval-strategy-text ${
+                  formDetails.retrieval_strategy
+                    ? "retrieval-strategy-text--selected"
+                    : "retrieval-strategy-text--placeholder"
+                }`}
+              >
+                {formDetails.retrieval_strategy
+                  ? retrievalItems.find(
+                      (item) => item.value === formDetails.retrieval_strategy,
+                    )?.label || "Select retrieval strategy"
+                  : "Select retrieval strategy"}
+              </span>
+              <div className="retrieval-strategy-actions">
+                <Settings
+                  className="retrieval-strategy-settings-icon"
+                  title="Configure retrieval strategy"
+                />
+                <ChevronDown className="retrieval-strategy-dropdown-icon" />
+              </div>
+            </button>
           </Form.Item>
           <Form.Item
             label="Matching count limit (similarity top-k)"
@@ -303,7 +310,7 @@ function AddLlmProfile({
         setPostHogCustomEvent("intent_success_ps_new_llm_profile", {
           info: "Clicked on 'Add' button",
         });
-      } catch (err) {
+      } catch (_err) {
         // If an error occurs while setting custom posthog event, ignore it and continue
       }
     }
@@ -324,7 +331,7 @@ function AddLlmProfile({
         let newLlmProfiles = [...llmProfiles];
         if (editLlmProfileId) {
           newLlmProfiles = [...llmProfiles].map((item) =>
-            item?.profile_id === editLlmProfileId ? data : item
+            item?.profile_id === editLlmProfileId ? data : item,
           );
         } else {
           newLlmProfiles.push(data);
@@ -333,10 +340,23 @@ function AddLlmProfile({
           llmProfiles: newLlmProfiles,
         };
         updateCustomTool(updatedState);
-        setAlertDetails({
-          type: "success",
-          content: "Saved successfully",
-        });
+        // Single alert: the store holds one alertDetails object, so two
+        // synchronous calls would batch and only the last would render.
+        // vision_warning is a backend-computed advisory (image output
+        // mode with an LLM that may not support vision); absent in OSS.
+        if (data?.vision_warning) {
+          setAlertDetails({
+            type: "warning",
+            title: "Saved — check LLM compatibility",
+            content: data.vision_warning,
+            duration: 10,
+          });
+        } else {
+          setAlertDetails({
+            type: "success",
+            content: "Saved successfully",
+          });
+        }
 
         if (newLlmProfiles?.length === 1) {
           // Set the first LLM profile as default
@@ -357,7 +377,14 @@ function AddLlmProfile({
   };
 
   const handleCaretIcon = (isActive) => {
-    return <CaretRightOutlined rotate={isActive ? 90 : 0} />;
+    // `rotate` was an antd icon-font prop; lucide ships SVGs and ignores it, so
+    // the caret stayed pointing right and the panel read as collapsed while
+    // open. Tailwind's transform does what the prop used to.
+    return (
+      <ChevronRight
+        className={cn("transition-transform", isActive && "rotate-90")}
+      />
+    );
   };
 
   const handleLlmChangeForTokens = async (value) => {
@@ -384,8 +411,8 @@ function AddLlmProfile({
         setAlertDetails(
           handleException(
             err,
-            "Failed to get chunk size information for the requested LLM. Please proceed with a sane default."
-          )
+            "Failed to get chunk size information for the requested LLM. Please proceed with a sane default.",
+          ),
         );
       });
   };
@@ -401,8 +428,36 @@ function AddLlmProfile({
     return tokenSize;
   }
 
+  const handleRetrievalModalOpen = () => {
+    setIsRetrievalModalVisible(true);
+  };
+
+  const handleRetrievalStrategySelect = (strategy) => {
+    const strategyLabel =
+      retrievalItems.find((item) => item.value === strategy)?.label || strategy;
+    form.setFieldsValue({ retrieval_strategy: strategy });
+    setFormDetails({ ...formDetails, retrieval_strategy: strategy });
+    setIsRetrievalModalVisible(false);
+
+    // Clear any existing backend errors for this field
+    setBackendErrors((prevErrors) => {
+      if (prevErrors) {
+        const updatedErrors = prevErrors.errors.filter(
+          (error) => error.attr !== "retrieval_strategy",
+        );
+        return { ...prevErrors, errors: updatedErrors };
+      }
+      return null;
+    });
+
+    setAlertDetails({
+      type: "success",
+      content: `Retrieval strategy set to: ${strategyLabel}`,
+    });
+  };
+
   return (
-    <div className="settings-body-pad-top">
+    <div className="add-llm-profile-body">
       <Form
         form={form}
         layout="vertical"
@@ -413,7 +468,7 @@ function AddLlmProfile({
         <SpaceWrapper>
           <div>
             <Button size="small" type="text" onClick={() => setIsAddLlm(false)}>
-              <ArrowLeftOutlined />
+              <ArrowLeft />
             </Button>
             <Typography.Text className="add-cus-tool-header">
               {modalTitle}
@@ -454,7 +509,8 @@ function AddLlmProfile({
                   help={getBackendErrorDetail("llm", backendErrors)}
                 >
                   <Select
-                    options={llmItems}
+                    showSearch
+                    options={adapterOptions(llmItems, "llm")}
                     onSelect={handleLlmChangeForTokens}
                   />
                 </Form.Item>
@@ -509,7 +565,10 @@ function AddLlmProfile({
                   }
                   help={getBackendErrorDetail("vector_store", backendErrors)}
                 >
-                  <Select options={vectorDbItems} />
+                  <Select
+                    showSearch
+                    options={adapterOptions(vectorDbItems, "vector_store")}
+                  />
                 </Form.Item>
               </Col>
               <Col span={1} />
@@ -551,7 +610,10 @@ function AddLlmProfile({
               }
               help={getBackendErrorDetail("embedding_model", backendErrors)}
             >
-              <Select options={embeddingItems} />
+              <Select
+                showSearch
+                options={adapterOptions(embeddingItems, "embedding_model")}
+              />
             </Form.Item>
             <Form.Item
               label="Text Extractor"
@@ -568,21 +630,28 @@ function AddLlmProfile({
               }
               help={getBackendErrorDetail("x2text", backendErrors)}
             >
-              <Select options={x2TextItems} />
+              <Select
+                showSearch
+                options={adapterOptions(x2TextItems, "x2text")}
+              />
             </Form.Item>
             <Collapse
+              className="add-llm-profile-advanced"
               expandIcon={({ isActive }) => handleCaretIcon(isActive)}
               size="small"
               style={{
                 background: token.colorBgContainer,
               }}
-              items={getItems(panelStyle)}
+              items={getItems()}
               activeKey={activeKey && "1"}
               onChange={handleCollapse}
             />
           </div>
         </SpaceWrapper>
-        <Form.Item className="display-flex-right">
+        <Form.Item
+          className="display-flex-right add-llm-profile-footer"
+          style={{ backgroundColor: token.colorBgContainer }}
+        >
           <Space>
             <CustomButton type="primary" htmlType="submit" loading={loading}>
               {editLlmProfileId ? "Update" : "Add"}
@@ -590,6 +659,14 @@ function AddLlmProfile({
           </Space>
         </Form.Item>
       </Form>
+
+      <RetrievalStrategyModal
+        visible={isRetrievalModalVisible}
+        onCancel={() => setIsRetrievalModalVisible(false)}
+        onOk={handleRetrievalStrategySelect}
+        currentStrategy={formDetails.retrieval_strategy}
+        loading={false}
+      />
     </div>
   );
 }

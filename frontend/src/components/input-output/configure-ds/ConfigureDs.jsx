@@ -1,18 +1,19 @@
-import { Col, Row } from "antd";
+import { Info } from "lucide-react";
 import PropTypes from "prop-types";
 import { createRef, useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
-
-import { sourceTypes } from "../../../helpers/GetStaticData.js";
+import { Col, Row } from "@/components/ui/shims/antd-layout";
+import { Popover } from "@/components/ui/shims/antd-overlays";
+import { saasOnlyErrorProps } from "../../../helpers/PostHogDeployment";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
+import usePostHogEvents from "../../../hooks/usePostHogEvents.js";
+import useRequestUrl from "../../../hooks/useRequestUrl";
 import { RjsfFormLayout } from "../../../layouts/rjsf-form-layout/RjsfFormLayout.jsx";
 import { useAlertStore } from "../../../store/alert-store";
 import { useSessionStore } from "../../../store/session-store";
 import { OAuthDs } from "../../oauth-ds/oauth-ds/OAuthDs.jsx";
 import { CustomButton } from "../../widgets/custom-button/CustomButton.jsx";
 import "./ConfigureDs.css";
-import usePostHogEvents from "../../../hooks/usePostHogEvents.js";
 
 function ConfigureDs({
   spec,
@@ -25,18 +26,17 @@ function ConfigureDs({
   addNewItem,
   type,
   editItemId,
-  sourceType,
-  handleUpdate,
-  connDetails,
+  isConnector,
   metadata,
   selectedSourceName,
-  connType,
+  selectedDocUrl,
 }) {
   const formRef = createRef(null);
   const axiosPrivate = useAxiosPrivate();
   const [isTcSuccessful, setIsTcSuccessful] = useState(false);
   const [isTcLoading, setIsTcLoading] = useState(false);
   const [isSubmitApiLoading, setIsSubmitApiLoading] = useState(false);
+
   const [cacheKey, setCacheKey] = useState("");
   const [status, setStatus] = useState("");
   const { sessionDetails } = useSessionStore();
@@ -49,8 +49,81 @@ function ConfigureDs({
     posthogConnectorAddedEventText,
     setPostHogCustomEvent,
   } = usePostHogEvents();
+  const { getUrl } = useRequestUrl();
 
-  const { id } = useParams();
+  const captureAdapterResult = (eventName, result, errorMessage) => {
+    if (isConnector) {
+      return;
+    }
+    setPostHogCustomEvent(eventName, {
+      adapter_type: type,
+      adapter_name: selectedSourceName,
+      is_edit: Boolean(editItemId),
+      result,
+      ...saasOnlyErrorProps(errorMessage),
+    });
+  };
+
+  const oauthCacheKey = `oauth-cachekey-${selectedSourceId}`;
+  const oauthStatusKey = `oauth-status-${selectedSourceId}`;
+
+  // Determine if this is a new or existing connector
+  const hasOAuthCredentials =
+    metadata && (metadata.access_token || (metadata.provider && metadata.uid));
+  const isExistingConnector = Boolean(editItemId || hasOAuthCredentials);
+
+  // Determine if OAuth authentication method is selected
+  const isOAuthMethodSelected = () => {
+    if (!oAuthProvider?.length) {
+      return false;
+    }
+    // Check if auth_type is set to a non-OAuth value
+    const data = formData || {};
+    // If auth_type exists and is not "oauth", then OAuth is not selected
+    if (data.auth_type && data.auth_type !== "oauth") {
+      return false;
+    }
+    return true;
+  };
+
+  // Initialize OAuth state from localStorage after keys are available
+  useEffect(() => {
+    if (!oAuthProvider?.length) {
+      return;
+    }
+
+    // Initialize cache key
+    const storedCacheKey = localStorage.getItem(oauthCacheKey);
+    if (storedCacheKey) {
+      setCacheKey(storedCacheKey);
+    }
+
+    // Initialize status from connector-specific key only
+    const storedStatus = localStorage.getItem(oauthStatusKey);
+    if (storedStatus) {
+      setStatus(storedStatus);
+    }
+  }, [oauthCacheKey, oauthStatusKey, oAuthProvider, selectedSourceId]);
+
+  // Wrapper functions to persist OAuth state to localStorage
+  const handleSetCacheKey = (key) => {
+    // Only handle OAuth operations for OAuth-enabled connectors
+    if (!oAuthProvider?.length) {
+      return;
+    }
+    setCacheKey(key);
+    localStorage.setItem(oauthCacheKey, key);
+  };
+
+  const handleSetStatus = (newStatus) => {
+    // Only handle OAuth operations for OAuth-enabled connectors
+    if (!oAuthProvider?.length) {
+      return;
+    }
+    setStatus(newStatus);
+    // Store only in connector-specific location to prevent contamination
+    localStorage.setItem(oauthStatusKey, newStatus);
+  };
 
   useEffect(() => {
     if (isTcSuccessful) {
@@ -59,71 +132,98 @@ function ConfigureDs({
   }, [formData]);
 
   useEffect(() => {
-    const { connector_id: connectorId } = connDetails || {};
-
-    // Check if connectorId matches selectedSourceId and metadata is available
-    const shouldSetMetadata = connectorId === selectedSourceId && metadata;
-    if (!shouldSetMetadata) return;
-
-    // Set formData based on the condition
-    setFormData(metadata);
-  }, [selectedSourceId]);
-
-  const isFormValid = () => {
-    if (formRef) {
-      formRef?.current?.validateFields((errors, values) => {
-        if (errors) {
-          return false;
-        }
-      });
+    if (!metadata) {
+      setFormData({});
+      return;
     }
-    return true;
-  };
+    setFormData(metadata);
+  }, [selectedSourceId, metadata, setFormData]);
+
+  // Clear OAuth state when switching to a different connector
+  useEffect(() => {
+    // Reset test connection success when switching connectors
+    setIsTcSuccessful(false);
+
+    // Reset local state only if current connector doesn't have stored OAuth credentials
+    const hasStoredOAuthState =
+      localStorage.getItem(oauthStatusKey) ||
+      localStorage.getItem(oauthCacheKey);
+    if (oAuthProvider?.length > 0 && !hasStoredOAuthState) {
+      setStatus("");
+      setCacheKey("");
+    }
+  }, [selectedSourceId, oauthStatusKey, oauthCacheKey]);
+
+  // Restore OAuth state when returning to a connector with stored credentials
+  useEffect(() => {
+    if (oAuthProvider?.length > 0) {
+      const storedStatus = localStorage.getItem(oauthStatusKey);
+      const storedCacheKey = localStorage.getItem(oauthCacheKey);
+
+      // Always restore stored credentials when switching to this connector
+      if (storedStatus) {
+        setStatus(storedStatus);
+      }
+      if (storedCacheKey) {
+        setCacheKey(storedCacheKey);
+      }
+    }
+  }, [selectedSourceId, oAuthProvider, oauthStatusKey, oauthCacheKey]);
+
+  // Cleanup OAuth localStorage when component unmounts (modal close)
+  useEffect(() => {
+    return () => {
+      localStorage.removeItem(oauthCacheKey);
+      localStorage.removeItem(oauthStatusKey);
+    };
+  }, [oauthCacheKey, oauthStatusKey]);
 
   const handleTestConnection = (updatedFormData) => {
     // Check if there any error in form proceed to test connection only there is no error.
-    if (!isFormValid()) {
+    if (formRef && !formRef.current?.validateForm()) {
       return;
     }
-    if (oAuthProvider?.length && (status !== "success" || !cacheKey?.length)) {
+    if (
+      oAuthProvider?.length &&
+      isOAuthMethodSelected() &&
+      (status !== "success" || !cacheKey?.length)
+    ) {
+      const providerName =
+        oAuthProvider === "google-oauth2" ? "Google" : "OAuth provider";
       setAlertDetails({
         type: "error",
-        content: "Invalid OAuth",
+        content: `OAuth authentication required. Please sign in with ${providerName} first.`,
       });
       return;
     }
 
     let body = {};
-    let url = `/api/v1/unstract/${sessionDetails?.orgId}/`;
+    let url;
 
-    if (sourceType === Object.keys(sourceTypes)[0]) {
+    if (isConnector) {
       const connectorMetadata = { ...updatedFormData };
       delete connectorMetadata.connectorName;
       body = {
         connector_id: selectedSourceId,
         connector_metadata: connectorMetadata,
       };
-      url += "test_connectors/";
+      url = getUrl("test_connectors/");
     } else {
       const adapterMetadata = { ...updatedFormData };
       delete adapterMetadata.adapterName;
       body = {
         adapter_id: selectedSourceId,
         adapter_metadata: adapterMetadata,
-        adapter_type: type.toUpperCase(),
+        adapter_type: type?.toUpperCase(),
       };
-      url += "test_adapters/";
+      url = getUrl("test_adapters/");
 
-      try {
-        setPostHogCustomEvent(posthogTcEventText[type], {
-          info: `Test connection was triggered: ${selectedSourceName}`,
-        });
-      } catch (err) {
-        // If an error occurs while setting custom posthog event, ignore it and continue
-      }
+      setPostHogCustomEvent(posthogTcEventText[type], {
+        info: `Test connection was triggered: ${selectedSourceName}`,
+      });
     }
 
-    if (oAuthProvider?.length > 0) {
+    if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
       body["connector_metadata"] = {
         ...body["connector_metadata"],
         ...{ "oauth-key": cacheKey },
@@ -145,6 +245,10 @@ function ConfigureDs({
       .then((res) => {
         const isValid = res?.data?.is_valid;
         setIsTcSuccessful(isValid);
+        captureAdapterResult(
+          "adapter_test_connection_result",
+          isValid ? "success" : "invalid",
+        );
         if (!isValid) {
           setAlertDetails({
             type: "error",
@@ -160,7 +264,13 @@ function ConfigureDs({
       .catch((err) => {
         const TestErrorMessage =
           err?.response?.data?.message || "Test connection failed";
-        setAlertDetails(handleException(err, TestErrorMessage));
+        const alert = handleException(err, TestErrorMessage);
+        captureAdapterResult(
+          "adapter_test_connection_result",
+          "error",
+          alert.content,
+        );
+        setAlertDetails(alert);
       })
       .finally(() => {
         setIsTcLoading(false);
@@ -177,32 +287,28 @@ function ConfigureDs({
     }
 
     let body = {};
-    let url = `/api/v1/unstract/${sessionDetails?.orgId}/`;
+    let url;
 
-    if (sourceType === Object.keys(sourceTypes)[0]) {
+    if (isConnector) {
       const connectorMetadata = { ...formData };
       const connectorName = connectorMetadata?.connectorName;
       delete connectorMetadata.connectorName;
+
       body = {
-        workflow: id,
-        created_by: sessionDetails?.id,
         connector_id: selectedSourceId,
         connector_metadata: connectorMetadata,
-        connector_type: type.toUpperCase(),
         connector_name: connectorName,
+        created_by: sessionDetails?.id,
       };
-      url += "connector/";
 
-      try {
-        setPostHogCustomEvent(
-          posthogConnectorAddedEventText[`${connType}:${type}`],
-          {
-            info: `Clicked on 'Submit' button`,
-            connector_name: selectedSourceName,
-          }
-        );
-      } catch (err) {
-        // If an error occurs while setting custom posthog event, ignore it and continue
+      url = getUrl("connector/");
+
+      const eventKey = type?.toUpperCase();
+      if (eventKey && posthogConnectorAddedEventText[eventKey]) {
+        setPostHogCustomEvent(posthogConnectorAddedEventText[eventKey], {
+          info: `Clicked on 'Submit' button`,
+          connector_name: selectedSourceName,
+        });
       }
     } else {
       const adapterMetadata = { ...formData };
@@ -211,28 +317,24 @@ function ConfigureDs({
       body = {
         adapter_id: selectedSourceId,
         adapter_metadata: adapterMetadata,
-        adapter_type: type.toUpperCase(),
+        adapter_type: type?.toUpperCase(),
         adapter_name: adapterName,
       };
-      url += "adapter/";
+      url = getUrl("adapter/");
 
-      try {
-        setPostHogCustomEvent(posthogSubmitEventText[type], {
-          info: "Clicked on 'Submit' button",
-          adpater_name: selectedSourceName,
-        });
-      } catch (err) {
-        // If an error occurs while setting custom posthog event, ignore it and continue
-      }
+      setPostHogCustomEvent(posthogSubmitEventText[type], {
+        info: "Clicked on 'Submit' button",
+        adpater_name: selectedSourceName,
+      });
     }
 
     let method = "POST";
     if (editItemId?.length) {
       method = "PUT";
-      url += `${editItemId}/`;
+      url = `${url}${editItemId}/`;
     }
 
-    if (oAuthProvider?.length > 0) {
+    if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
       const encodedCacheKey = encodeURIComponent(cacheKey);
       url = url + `?oauth-key=${encodedCacheKey}`;
     }
@@ -251,26 +353,27 @@ function ConfigureDs({
     axiosPrivate(requestOptions)
       .then((res) => {
         const data = res?.data;
-        if (sourceTypes.connectors.includes(type)) {
-          handleUpdate({ connector_instance: data?.id });
-          return;
-        }
+
+        // For centralized connectors or adapters
         if (data) {
           addNewItem(data, !!editItemId);
         }
-        setAlertDetails({
-          type: "success",
-          content: `Successfully ${
-            method === "POST" ? "added" : "updated"
-          } connector`,
-        });
-        if (sourceType === Object.keys(sourceTypes)[1] && method === "POST") {
+        if (!isConnector && method === "POST") {
           updateSession(type);
         }
+        captureAdapterResult("adapter_save_result", "success");
+
+        if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
+          localStorage.removeItem(oauthCacheKey);
+          localStorage.removeItem(oauthStatusKey);
+        }
+
         setOpen(false);
       })
       .catch((err) => {
-        setAlertDetails(handleException(err));
+        const alert = handleException(err);
+        captureAdapterResult("adapter_save_result", "error", alert.content);
+        setAlertDetails(alert);
       })
       .finally(() => {
         setIsSubmitApiLoading(false);
@@ -289,12 +392,27 @@ function ConfigureDs({
 
   return (
     <div className="config-layout">
-      {!isLoading && oAuthProvider?.length > 0 && (
-        <OAuthDs
-          oAuthProvider={oAuthProvider}
-          setCacheKey={setCacheKey}
-          setStatus={setStatus}
-        />
+      {selectedDocUrl && (
+        <div className="config-doc-link">
+          <Popover
+            content={
+              <div>
+                Need help?{" "}
+                <a
+                  href={selectedDocUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  See documentation.
+                </a>
+              </div>
+            }
+            trigger="click"
+            placement="bottomRight"
+          >
+            <Info className="config-doc-icon" />
+          </Popover>
+        </div>
       )}
       <RjsfFormLayout
         schema={spec}
@@ -305,6 +423,15 @@ function ConfigureDs({
         formRef={formRef}
         isStateUpdateRequired={true}
       >
+        {!isLoading && oAuthProvider?.length > 0 && isOAuthMethodSelected() && (
+          <OAuthDs
+            oAuthProvider={oAuthProvider}
+            setCacheKey={handleSetCacheKey}
+            setStatus={handleSetStatus}
+            selectedSourceId={selectedSourceId}
+            isExistingConnector={isExistingConnector}
+          />
+        )}
         <Row className="config-row">
           <Col span={12} className="config-col1">
             <CustomButton
@@ -345,12 +472,10 @@ ConfigureDs.propTypes = {
   addNewItem: PropTypes.func,
   type: PropTypes.string,
   editItemId: PropTypes.string,
-  sourceType: PropTypes.string.isRequired,
-  handleUpdate: PropTypes.func,
-  connDetails: PropTypes.object,
+  isConnector: PropTypes.bool.isRequired,
   metadata: PropTypes.object,
   selectedSourceName: PropTypes.string.isRequired,
-  connType: PropTypes.string,
+  selectedDocUrl: PropTypes.string,
 };
 
 export { ConfigureDs };

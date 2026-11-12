@@ -1,20 +1,24 @@
-import { Modal } from "antd";
+import { ArrowLeft } from "lucide-react";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Modal } from "@/components/ui/shims/antd-overlays";
 
-import { sourceTypes } from "../../../helpers/GetStaticData";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
+import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
+import useRequestUrl from "../../../hooks/useRequestUrl";
 import { useAlertStore } from "../../../store/alert-store";
-import { useSessionStore } from "../../../store/session-store";
+import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
 import { AddSource } from "../add-source/AddSource";
 import { ListOfSources } from "../list-of-sources/ListOfSources";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
-import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
+import "./AddSourceModal.css";
 
 function AddSourceModal({
   open,
   setOpen,
   type,
+  isConnector = false,
+  connectorMode,
   addNewItem,
   editItemId,
   setEditItemId,
@@ -23,28 +27,28 @@ function AddSourceModal({
   const [metadata, setMetadata] = useState({});
   const [titles, setTitles] = useState({});
   const [selectedSourceName, setSelectedSourceName] = useState("");
-  const { sessionDetails } = useSessionStore();
+  const [selectedDocUrl, setSelectedDocUrl] = useState("");
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
   const handleException = useExceptionHandler();
+  const { getUrl } = useRequestUrl();
   const [isLoading, setIsLoading] = useState(false);
   const [sourcesList, setSourcesList] = useState([]);
 
   const disabledIdsByType = {
     EMBEDDING: ["huggingface|90ec9ec2-1768-4d69-8fb1-c88b95de5e5a"],
     LLM: ["replicate|2715ce84-05af-4ab4-b8e9-67ac3211b81e"],
-    VECTOR_DB: ["milvus|3f42f6f9-4b8e-4546-95f3-22ecc9aca442"],
+    VECTOR_DB: [],
   };
 
   useEffect(() => {
     const addOrEdit = editItemId?.length ? "Edit" : "Add";
     setTitles({
-      input: addOrEdit + " Data Source",
-      output: addOrEdit + " Data Destination",
       llm: addOrEdit + " LLM",
       vector_db: addOrEdit + " Vector DB",
       embedding: addOrEdit + " Embedding",
       x2text: addOrEdit + " Text Extractor",
+      connectors: addOrEdit + " Connector",
     });
 
     if (editItemId?.length) {
@@ -58,28 +62,28 @@ function AddSourceModal({
         // A delay added in order to avoid glitch in the UI when the modal is closed.
         setSelectedSourceId(null);
         setEditItemId(null);
+        // Clear metadata to prevent stale data when adding a new connector
+        setMetadata({});
       }, 500);
     }
 
-    if (type && type !== null) {
-      getListOfSources();
-    }
+    getListOfSources();
   }, [open]);
 
   useEffect(() => {
     const selectedSource = sourcesList.find(
-      (item) => item?.id === selectedSourceId
+      (item) => item?.id === selectedSourceId,
     );
     setSelectedSourceName(selectedSource?.name);
+    setSelectedDocUrl(selectedSource?.doc_url || "");
   }, [selectedSourceId]);
 
   const getSourceDetails = () => {
-    const isConnector = sourceTypes.connectors.includes(type);
-    let url = `/api/v1/unstract/${sessionDetails?.orgId}`;
+    let url;
     if (isConnector) {
-      url += `/connector/${editItemId}/`;
+      url = getUrl(`connector/${editItemId}/`);
     } else {
-      url += `/adapter/${editItemId}/`;
+      url = getUrl(`adapter/${editItemId}/`);
     }
 
     const requestOptions = {
@@ -111,13 +115,20 @@ function AddSourceModal({
   };
 
   const getListOfSources = () => {
-    let url = `/api/v1/unstract/${sessionDetails?.orgId}`;
-    if (type && sourceTypes.connectors.includes(type)) {
-      url += `/supported_connectors/?type=${type?.toUpperCase()}`;
+    let url;
+    if (isConnector) {
+      if (connectorMode) {
+        url = getUrl(`supported_connectors/?connector_mode=${connectorMode}`);
+      } else {
+        url = getUrl(`supported_connectors/`);
+      }
     } else {
-      url += `/supported_adapters/?adapter_type=${type?.toUpperCase()}`;
+      if (!type) {
+        return;
+      }
+      url = getUrl(`supported_adapters/?adapter_type=${type.toUpperCase()}`);
     }
-    // API to get the list of adapters.
+
     const requestOptions = {
       method: "GET",
       url,
@@ -131,7 +142,7 @@ function AddSourceModal({
         const updatedSources = sources?.map((source) => ({
           ...source,
           isDisabled: disabledIdsByType[source?.adapter_type]?.includes(
-            source?.id
+            source?.id,
           ),
         }));
         setSourcesList(updatedSources || []);
@@ -144,6 +155,30 @@ function AddSourceModal({
       });
   };
 
+  const handleBack = () => {
+    setSelectedSourceId(null);
+    setMetadata(null);
+  };
+
+  const showBackButton = selectedSourceId && !editItemId;
+  const modalTitle = showBackButton ? (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+      <Button
+        type="text"
+        shape="circle"
+        size="small"
+        icon={<ArrowLeft />}
+        onClick={handleBack}
+        aria-label="Go back to source selection"
+      />
+      <span>{isConnector ? titles["connectors"] : titles[type]}</span>
+    </div>
+  ) : isConnector ? (
+    titles["connectors"]
+  ) : (
+    titles[type]
+  );
+
   return (
     <Modal
       open={open}
@@ -152,11 +187,13 @@ function AddSourceModal({
         setMetadata(null);
       }}
       maskClosable={false}
-      title={titles[type]}
+      title={modalTitle}
       width={selectedSourceId?.length ? 500 : 1100}
       centered
       footer={null}
       closable={true}
+      data-testid="add-source-modal"
+      className="add-source-modal"
     >
       {selectedSourceId ? (
         <AddSource
@@ -164,18 +201,21 @@ function AddSourceModal({
           selectedSourceName={selectedSourceName}
           setOpen={setOpen}
           type={type}
+          isConnector={isConnector}
           addNewItem={addNewItem}
           editItemId={editItemId}
           metadata={metadata}
+          selectedDocUrl={selectedDocUrl}
         />
       ) : isLoading ? (
         <SpinnerLoader />
       ) : (
         <ListOfSources
           setSelectedSourceId={setSelectedSourceId}
-          open={open}
           sourcesList={sourcesList}
           type={type}
+          isConnector={isConnector}
+          connectorMode={connectorMode}
         />
       )}
     </Modal>
@@ -186,6 +226,8 @@ AddSourceModal.propTypes = {
   open: PropTypes.bool.isRequired,
   setOpen: PropTypes.func.isRequired,
   type: PropTypes.any,
+  isConnector: PropTypes.bool,
+  connectorMode: PropTypes.string,
   addNewItem: PropTypes.func.isRequired,
   editItemId: PropTypes.string,
   setEditItemId: PropTypes.func.isRequired,

@@ -1,24 +1,27 @@
-import { CheckCircleOutlined, CopyOutlined } from "@ant-design/icons";
-import { Modal, Select, Tabs, Tooltip } from "antd";
 import Handlebars from "handlebars";
+import { CircleCheck, Copy } from "lucide-react";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { Select } from "@/components/ui/shims/antd-inputs";
+import { Modal, Tooltip } from "@/components/ui/shims/antd-overlays";
+import { Tabs } from "@/components/ui/shims/antd-structure";
+import { useAlertStore } from "../../../store/alert-store";
 
 import CodeSnippet from "./CodeSnippet.jsx";
 import "./DisplayCode.css";
 
 const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
-  const handleCloseDialog = () => {
-    setDialogOpen(false);
-  };
   const [copied, setCopied] = useState(false);
+  const { setAlertDetails } = useAlertStore();
   const [language, setLanguage] = useState("python");
   const [code, setCode] = useState("");
   const [activeTabKey, setActiveTabKey] = useState("POST");
+  const params =
+    "?execution_id=REPLACE_WITH_EXECUTION_ID&include_metadata=False";
 
-  useEffect(() => {
-    generateCode();
-  }, [url, language, activeTabKey]);
+  const handleCloseDialog = () => {
+    setDialogOpen(false);
+  };
 
   const generateCode = () => {
     if (language === "python") {
@@ -46,12 +49,12 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
         headers = {
           'Authorization': 'Bearer REPLACE_WITH_API_KEY'
         }
-        payload = {'timeout': '80'}
+        payload = {'timeout': 300, 'include_metadata': False}
         filepath = '/path/to/file'
         files=[('files',('file',open(filepath,'rb'),'application/octet-stream'))]
         response = requests.request("POST", api_url, headers=headers, data=payload, files=files)
       {{else}}
-        api_url = '{{url}}?execution_id=REPLACE_WITH_EXECUTION_ID'
+        api_url = '{{url}}{{{params}}}'
         headers = {
           'Authorization': 'Bearer REPLACE_WITH_API_KEY'
         }
@@ -62,17 +65,23 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
     code = trimIndent(code);
     const template = Handlebars.compile(code);
 
-    const pythonCode = template({ url, isPost: activeTabKey === "POST" });
+    const pythonCode = template({
+      url,
+      params,
+      isPost: activeTabKey === "POST",
+    });
     setCode(pythonCode);
   };
 
   const generateCurlCode = () => {
     let code = `{{#if isPost}}
-    curl --request POST --location '{{url}}'
-    --header 'Authorization: Bearer REPLACE_WITH_API_KEY'
-    --form 'files=@"{{pathToFile}}"' --form 'timeout="80"'
+    curl --request POST --location '{{url}}' \\
+    --header 'Authorization: Bearer REPLACE_WITH_API_KEY' \\
+    --form 'files=@"{{pathToFile}}"' \\
+    --form 'timeout=300' \\
+    --form 'include_metadata=false'
     {{else}}
-    curl --location '{{url}}?execution_id=REPLACE_WITH_EXECUTION_ID'
+    curl --location '{{url}}{{{params}}}' \\
     --header 'Authorization: Bearer REPLACE_WITH_API_KEY'
     {{/if}}
   `;
@@ -80,6 +89,7 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
     const template = Handlebars.compile(code);
     const curlCode = template({
       url,
+      params,
       isPost: activeTabKey === "POST",
       pathToFile: "/path/to/file",
     });
@@ -92,12 +102,13 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
     {{#if isPost}}
     var formdata = new FormData();
     formdata.append("files", fileInput.files[0], "file");
-    formdata.append("timeout", "80");
+    formdata.append("timeout", "300");
+    formdata.append("include_metadata", "false");
     var requestOptions = { method: 'POST', body: formdata, redirect: 'follow', headers: myHeaders };
     fetch("{{url}}", requestOptions)
     {{else}}
     var requestOptions = { method: 'GET', redirect: 'follow', headers: myHeaders};
-    fetch("{{url}}?execution_id=REPLACE_WITH_EXECUTION_ID", requestOptions)
+    fetch("{{url}}{{{params}}}", requestOptions)
     {{/if}}
     .then(response => response.text())
     .then(result => console.log(result))
@@ -106,14 +117,31 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
     code = trimIndent(code);
     const template = Handlebars.compile(code);
 
-    const jsCode = template({ url, isPost: activeTabKey === "POST" });
+    const jsCode = template({ url, params, isPost: activeTabKey === "POST" });
     setCode(jsCode);
   };
 
+  // Not useCopyToClipboard: success here is shown by the icon, not a toast.
   const handleCopyClick = () => {
-    navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    if (!navigator.clipboard) {
+      setAlertDetails({
+        type: "error",
+        content: "Clipboard not available in this browser",
+      });
+      return;
+    }
+    navigator.clipboard.writeText(code).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      },
+      (err) => {
+        setAlertDetails({
+          type: "error",
+          content: `Failed to copy: ${err?.message || "Unknown error"}`,
+        });
+      },
+    );
   };
 
   const handleTabKey = (key) => {
@@ -152,6 +180,10 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
     },
   ];
 
+  useEffect(() => {
+    generateCode();
+  }, [url, language, activeTabKey]);
+
   return (
     <Modal
       title="Code Snippets"
@@ -177,11 +209,11 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
             <button className="copyCodeBtn" onClick={handleCopyClick}>
               {copied ? (
                 <Tooltip title="Copied">
-                  <CheckCircleOutlined />
+                  <CircleCheck />
                 </Tooltip>
               ) : (
                 <Tooltip title="Copy snippet">
-                  <CopyOutlined />
+                  <Copy />
                 </Tooltip>
               )}
             </button>
@@ -189,6 +221,7 @@ const DisplayCode = ({ isDialogOpen, setDialogOpen, url }) => {
         }
         onChange={handleTabKey}
         items={TAB_ITEMS}
+        moreIcon={<></>}
       />
     </Modal>
   );

@@ -1,19 +1,20 @@
-from typing import Any, Optional
+from typing import Any
 
 from rest_framework.exceptions import APIException
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
 
-from unstract.connectors.exceptions import ConnectorBaseException
+from unstract.connectors.exceptions import ConnectorBaseException, ConnectorError
 
 
 class UnstractBaseException(APIException):
     default_detail = "Error occurred"
+    default_status_code = 500
 
     def __init__(
         self,
-        detail: Optional[str] = None,
-        core_err: Optional[ConnectorBaseException] = None,
+        detail: str | None = None,
+        core_err: ConnectorBaseException | None = None,
         **kwargs: Any,
     ) -> None:
         if detail is None:
@@ -22,10 +23,17 @@ class UnstractBaseException(APIException):
             detail = core_err.user_message
         if detail and "Name or service not known" in str(detail):
             detail = (
-                "Failed to establish a new connection: " "Name or service not known"
+                "Failed to establish a new connection. \n"
+                "Error: \n```\nName or service not known\n```"
             )
         super().__init__(detail=detail, **kwargs)
         self._core_err = core_err
+
+        # Preserve status code from ConnectorError if available
+        if isinstance(core_err, ConnectorError) and core_err.status_code is not None:
+            self.status_code = core_err.status_code
+        else:
+            self.status_code = self.default_status_code
 
 
 class LLMHelperError(Exception):
@@ -39,3 +47,15 @@ def custom_exception_handler(exc, context) -> Response:  # type: ignore
         response.data["status_code"] = response.status_code
 
     return response
+
+
+class UnstractFSException(UnstractBaseException):
+    """Handles all error from fs connector class and propagates the error
+    message to UI.
+
+    Args:
+        UnstractBaseException: Inherits class UnstractBaseException
+    """
+
+    default_detail = "Error testing connection. "
+    default_status_code = 500

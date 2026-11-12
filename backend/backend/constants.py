@@ -20,6 +20,16 @@ class FieldLengthConstants:
     ADAPTER_ID_LENGTH = 128
 
 
+class RequestMethod:
+    """HTTP request method constants."""
+
+    DELETE = "DELETE"
+    GET = "GET"
+    HEAD = "HEAD"
+    OPTIONS = "OPTIONS"
+    SAFE_METHODS = frozenset({GET, HEAD, OPTIONS})
+
+
 class RequestHeader:
     """Request header constants."""
 
@@ -28,3 +38,9 @@ class RequestHeader:
 
 class UrlPathConstants:
     PROMPT_STUDIO = "prompt-studio/"
+
+
+class FeatureFlag:
+    """Temporary feature flags."""
+
+    APP_DEPLOYMENT = "app_deployment"

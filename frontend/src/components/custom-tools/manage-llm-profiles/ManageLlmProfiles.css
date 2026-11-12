@@ -1,5 +1,33 @@
 /* Styles for ManageLlmProfiles */
 
-.manage-llm-pro-icon {
-    font-size: 10px;
+.action-buttons-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-id-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.profile-id-text {
+  font-size: 12px;
+}
+
+.profile-copy-button {
+  padding: 0;
+  min-width: auto;
+  height: auto;
+}
+
+.profile-copy-icon {
+  font-size: 12px;
+  /* width/height, not font-size alone: antd shipped an icon FONT (sized by
+   * font-size); lucide ships SVGs, which ignore it and fall back to their
+   * own 24px default. font-size is kept for any text in the same element. */
+  width: 12px;
+  height: 12px;
 }

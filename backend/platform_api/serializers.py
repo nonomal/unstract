@@ -1,0 +1,105 @@
+from api_key_usage.expiry import expires_at_field
+from api_key_usage.serializers import USAGE_FIELDS, KeyUsageFieldsMixin
+from platform_audit.actions import TargetType
+from rest_framework import serializers
+from utils.input_sanitizer import validate_safe_text
+from utils.user_context import UserContext
+
+from backend.serializers import AuditSerializer
+from platform_api.models import PlatformApiKey
+
+
+class PlatformApiKeyListSerializer(KeyUsageFieldsMixin, serializers.ModelSerializer):
+    usage_key_type = TargetType.PLATFORM_API_KEY
+    key = serializers.SerializerMethodField()
+    created_by_email = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PlatformApiKey
+        fields = [
+            "id",
+            "name",
+            "description",
+            "key",
+            "is_active",
+            "expires_at",
+            "previous_key_expires_at",
+            *USAGE_FIELDS,
+            "created_at",
+            "modified_at",
+            "permission",
+            "created_by_email",
+        ]
+
+    def get_key(self, obj):
+        key_str = str(obj.key)
+        return f"****-{key_str[-4:]}"
+
+    def get_created_by_email(self, obj):
+        return obj.created_by.email if obj.created_by else "Deleted user"
+
+
+class PlatformApiKeyCreateSerializer(AuditSerializer):
+    description = serializers.CharField(required=True, max_length=512)
+    expires_at = expires_at_field()
+
+    class Meta:
+        model = PlatformApiKey
+        fields = ["name", "description", "permission", "expires_at"]
+
+    def validate_name(self, value):
+        value = validate_safe_text(value)
+        organization = UserContext.get_organization()
+        if PlatformApiKey.objects.filter(name=value, organization=organization).exists():
+            raise serializers.ValidationError(
+                "A key with this name already exists in your organization."
+            )
+        return value
+
+    def validate_description(self, value):
+        return validate_safe_text(value)
+
+
+class PlatformApiKeyUpdateSerializer(AuditSerializer):
+    expires_at = expires_at_field()
+
+    class Meta:
+        model = PlatformApiKey
+        fields = ["description", "is_active", "permission", "expires_at"]
+        extra_kwargs = {
+            "description": {"required": False},
+            "is_active": {"required": False},
+            "permission": {"required": False},
+        }
+
+    def validate_description(self, value):
+        return validate_safe_text(value)
+
+    def update(self, instance, validated_data):
+        request = self.context.get("request")
+        if request:
+            validated_data["modified_by"] = request.user
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        # Only the fields this edit sets: a whole-row save would write back an
+        # expiry, or a key rotated, while the edit was in flight.
+        instance.save(update_fields=list(validated_data))
+        return instance
+
+
+class PlatformApiKeyDetailSerializer(KeyUsageFieldsMixin, serializers.ModelSerializer):
+    """Used for create/rotate responses where the full key is shown once."""
+
+    usage_key_type = TargetType.PLATFORM_API_KEY
+
+    class Meta:
+        model = PlatformApiKey
+        fields = [
+            "id",
+            "name",
+            "key",
+            "is_active",
+            "expires_at",
+            "previous_key_expires_at",
+            *USAGE_FIELDS,
+        ]

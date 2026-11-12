@@ -1,7 +1,7 @@
 import json
 import logging
 import traceback
-from typing import Any, Optional
+from typing import Any
 
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse
@@ -9,11 +9,13 @@ from drf_standardized_errors.handler import exception_handler
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from unstract.sdk1.exceptions import SdkError
+
 logger = logging.getLogger(__name__)
 
 
 # Set via settings.REST_FRAMEWORK.EXCEPTION_HANDLER.
-def drf_logging_exc_handler(exc: Exception, context: Any) -> Optional[Response]:
+def drf_logging_exc_handler(exc: Exception, context: Any) -> Response | None:
     """Custom exception handler for DRF.
 
     DRF's exception handler takes care of Http404, PermissionDenied and
@@ -31,11 +33,49 @@ def drf_logging_exc_handler(exc: Exception, context: Any) -> Optional[Response]:
             handled by another method in the middleware
     """
     request = context.get("request")
-    response: Optional[Response] = exception_handler(exc=exc, context=context)
+
+    # Handle SdkError exceptions and preserve their status codes
+    if isinstance(exc, SdkError):
+        status_code = exc.status_code or 500
+        response = Response(
+            {"error": str(exc), "type": "sdk_error"},
+            status=status_code,
+        )
+        ExceptionLoggingMiddleware.format_exc_and_log(
+            request=request, response=response, exception=exc
+        )
+        return response
+
+    response: Response | None = exception_handler(exc=exc, context=context)
+    _enrich_not_found_detail(response=response, context=context)
     ExceptionLoggingMiddleware.format_exc_and_log(
         request=request, response=response, exception=exc
     )
     return response
+
+
+def _enrich_not_found_detail(response: Response | None, context: Any) -> None:
+    """Replace DRF's generic "Not found." with the resource's name.
+
+    Derives a human label from the view's `queryset` model so every 404
+    reads "<Resource> not found." app-wide, no per-view work. Uses the
+    static `queryset` attr (not `get_queryset()`) to avoid running view
+    logic during error handling; views without it keep the generic message.
+    Override `Meta.verbose_name` to tune a model's label.
+    """
+    if response is None or getattr(response, "status_code", None) != 404:
+        return
+    data = getattr(response, "data", None)
+    if not isinstance(data, dict):
+        return
+    model = getattr(getattr(context.get("view"), "queryset", None), "model", None)
+    if model is None:
+        return
+    label = str(model._meta.verbose_name).capitalize()
+    for err in data.get("errors", []):
+        # Guard: a raise here would mask the original error with a 500.
+        if isinstance(err, dict) and err.get("code") == "not_found":
+            err["detail"] = f"{label} not found."
 
 
 class ExceptionLoggingMiddleware:
@@ -54,7 +94,7 @@ class ExceptionLoggingMiddleware:
 
     def process_exception(
         self, request: HttpRequest, exception: Exception
-    ) -> Optional[HttpResponse]:
+    ) -> HttpResponse | None:
         """Django hook to handle exceptions by a middleware.
 
         Args:
@@ -68,13 +108,17 @@ class ExceptionLoggingMiddleware:
         # Handle only when running in production, for debug mode
         # Django takes care of displaying a detailed HTML page.
         if not settings.DEBUG and exception:
+            logger.error(f"Unhandled exception by DRF for {request}, logging error...")
+            ExceptionLoggingMiddleware.format_exc_and_log(
+                request=request, exception=exception
+            )
             detail = {"detail": "Error processing the request."}
             return HttpResponse(json.dumps(detail), status=500)
         return None
 
     @staticmethod
     def format_exc_and_log(
-        request: Request, response: Optional[Response], exception: Exception
+        request: Request, exception: Exception, response: Response | None = None
     ) -> None:
         """Format the exception to be logged and logs it.
 
@@ -86,18 +130,7 @@ class ExceptionLoggingMiddleware:
         if response:
             status_code = response.status_code
         if status_code >= 500:
-            message = "{method} {url} {status}\n\n{error}\n\n````{tb}````".format(
-                method=request.method,
-                url=request.build_absolute_uri(),
-                status=status_code,
-                error=repr(exception),
-                tb=traceback.format_exc(),
-            )
+            message = f"{request.method} {request.build_absolute_uri()} {status_code}\n\n{repr(exception)}\n\n````{traceback.format_exc()}````"
         else:
-            message = "{method} {url} {status} {error}".format(
-                method=request.method,
-                url=request.build_absolute_uri(),
-                status=status_code,
-                error=repr(exception),
-            )
+            message = f"{request.method} {request.build_absolute_uri()} {status_code} {repr(exception)}"
         logger.error(message)

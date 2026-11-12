@@ -1,4 +1,5 @@
 **/__pycache__
+**/.mypy_cache
 **/.pytest_cache
 **/.python-version
 **/.pyc
@@ -42,9 +43,6 @@
 *.idea
 *.vscode
 *.git
-**/.pdm.toml
-**/.pdm-build
-**/.pdm-python
 !LICENSE
 *.md
 !README.md
@@ -52,13 +50,16 @@
 .pre-commit-config.yaml
 **/tests
 test*.py
+**/*.egg-info
 
 backend
-document-service
 frontend
 !platform-service
 prompt-service
 tools
-!unstract
-worker
+unstract
+!unstract/core
+!unstract/flags
+!unstract/sdk1
+runner
 x2text-service

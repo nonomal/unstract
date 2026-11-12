@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 
 import { useExceptionHandler } from "../hooks/useExceptionHandler.jsx";
 import { useAlertStore } from "../store/alert-store";
+
 const useUserSession = () => {
   const navigate = useNavigate();
   const handleException = useExceptionHandler();
@@ -11,9 +12,10 @@ const useUserSession = () => {
 
   return async () => {
     try {
+      const timestamp = new Date().getTime();
       const requestOptions = {
         method: "GET",
-        url: "/api/v1/session",
+        url: `/api/v1/session?q=${timestamp}`,
       };
       const res = await axios(requestOptions);
       return res.data;
@@ -23,7 +25,7 @@ const useUserSession = () => {
       }
 
       if (error?.response?.data?.type === "subscription_error") {
-        navigate("/trial-expired");
+        navigate("/subscription-expired");
         return;
       }
 
@@ -31,4 +33,5 @@ const useUserSession = () => {
     }
   };
 };
+
 export { useUserSession };

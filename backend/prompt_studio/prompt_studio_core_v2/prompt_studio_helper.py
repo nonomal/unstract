@@ -1,0 +1,3641 @@
+import json
+import logging
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from account_v2.constants import Common
+from account_v2.models import User
+from adapter_processor_v2.deprecated_adapters import is_adapter_selectable
+from adapter_processor_v2.image_output_gating import LLMWHISPERER_ADAPTER_PREFIX
+from adapter_processor_v2.models import AdapterInstance, UserDefaultAdapter
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+from permissions.permission import (
+    _is_resource_owner,
+    _is_resource_viewer,
+    has_group_access,
+)
+from plugins import get_plugin
+from rest_framework.exceptions import APIException
+from rest_framework.request import Request
+from tenant_account_v2.organization_member_service import OrganizationMemberService
+from utils.file_storage.constants import FileStorageKeys
+from utils.file_storage.helpers.prompt_studio_file_helper import PromptStudioFileHelper
+from utils.local_context import StateStore
+
+from prompt_studio import vlm_utils
+from prompt_studio.lookup_utils import (
+    get_lookup_config,
+    get_lookup_configs_for_tool,
+)
+from prompt_studio.prompt_profile_manager_v2.models import ProfileManager
+from prompt_studio.prompt_profile_manager_v2.profile_manager_helper import (
+    ProfileManagerHelper,
+)
+from prompt_studio.prompt_studio_core_v2.constants import (
+    DefaultValues,
+    ExecutionSource,
+    IndexingStatus,
+    LogLevels,
+    ToolStudioKeys,
+    ToolStudioPromptKeys,
+)
+from prompt_studio.prompt_studio_core_v2.constants import IndexingConstants as IKeys
+from prompt_studio.prompt_studio_core_v2.constants import (
+    ToolStudioPromptKeys as TSPKeys,
+)
+from prompt_studio.prompt_studio_core_v2.document_indexing_service import (
+    DocumentIndexingService,
+)
+from prompt_studio.prompt_studio_core_v2.exceptions import (
+    AnswerFetchError,
+    DefaultProfileError,
+    EmptyPromptError,
+    ExtractionAPIError,
+    ImageModePageLimitExceeded,
+    IndexingAPIError,
+    NoPromptsFound,
+    OperationNotSupported,
+    PermissionError,
+)
+from prompt_studio.prompt_studio_core_v2.migration_utils import (
+    SummarizeMigrationUtils,
+)
+from prompt_studio.prompt_studio_core_v2.models import CustomTool
+from prompt_studio.prompt_studio_core_v2.prompt_ide_base_tool import PromptIdeBaseTool
+from prompt_studio.prompt_studio_core_v2.prompt_variable_service import (
+    PromptStudioVariableService,
+)
+from prompt_studio.prompt_studio_document_manager_v2.models import DocumentManager
+from prompt_studio.prompt_studio_index_manager_v2.prompt_studio_index_helper import (  # noqa: E501
+    ExtractionStatusResult,
+    PromptStudioIndexHelper,
+)
+from prompt_studio.prompt_studio_output_manager_v2.output_manager_helper import (
+    OutputManagerHelper,
+)
+from prompt_studio.prompt_studio_v2.models import ToolStudioPrompt
+from prompt_studio.vlm_utils import invalidate_vlm_answers_on_reextraction
+from unstract.core.pubsub_helper import LogPublisher
+from unstract.sdk1.adapters.x2text.constants import ImageOutputConstants
+from unstract.sdk1.adapters.x2text.llm_whisperer_v2.src.helper import (
+    LLMWhispererHelper,
+)
+from unstract.sdk1.adapters.x2text.llm_whisperer_v2.src.page_range import (
+    PageRangeError,
+)
+from unstract.sdk1.adapters.x2text.page_image_loader import get_fixed_page_cap
+from unstract.sdk1.constants import LogLevel
+from unstract.sdk1.exceptions import IndexingError, SdkError
+from unstract.sdk1.execution.context import ExecutionContext
+from unstract.sdk1.file_storage.constants import StorageType
+from unstract.sdk1.file_storage.env_helper import EnvHelper
+from unstract.sdk1.llm import LLM
+from unstract.sdk1.utils.image_limits import (
+    codes as image_limit_codes,
+)
+from unstract.sdk1.utils.image_limits import (
+    compute_page_budget,
+    extraction_bound_kwargs,
+    fixed_cap_message,
+    model_aware_limits_enabled,
+    page_cap_message,
+)
+from unstract.sdk1.utils.indexing import IndexingUtils
+from unstract.sdk1.utils.tool import ToolUtils
+
+logger = logging.getLogger(__name__)
+
+CHOICES_JSON = "/static/select_choices.json"
+
+logger = logging.getLogger(__name__)
+
+
+def _adapter_accessible_by(adapter: AdapterInstance, user: User) -> bool:
+    """Whether ``user`` may use ``adapter`` (owner, direct viewer, org, or group).
+
+    ``created_by`` is audit-only since UN-2202 — access is owner/viewer role
+    based via the membership bridges.
+    """
+    return (
+        adapter.shared_to_org
+        or _is_resource_owner(user, adapter)
+        or _is_resource_viewer(user, adapter)
+        or has_group_access(user, adapter)
+    )
+
+
+class PromptStudioHelper:
+    """Helper class for Custom tool operations."""
+
+    @staticmethod
+    def create_default_profile_manager(user: User, tool_id: uuid) -> None:
+        """Create a default profile manager for a given user and tool.
+
+        Builds the profile from the creator's default-set adapters
+        (UserDefaultAdapter). In cloud these are the frictionless adapters
+        seeded at onboarding; in OSS/on-prem they are auto-set as the user
+        adds the first adapter of each type. Skips silently when a usable
+        default is missing for any of the four types, so a project can still
+        be created before adapters are configured.
+
+        Returns:
+            None
+        """
+        organization_member = OrganizationMemberService.get_user_by_id(id=user.id)
+        if not organization_member:
+            logger.info(
+                "Skipping default profile creation: user has no organization membership"
+            )
+            return
+
+        default_adapter = UserDefaultAdapter.objects.filter(
+            organization_member=organization_member
+        ).first()
+        if not default_adapter:
+            logger.info("Skipping default profile creation: no default adapters set")
+            return
+
+        adapters = {
+            "llm": default_adapter.default_llm_adapter,
+            "embedding_model": default_adapter.default_embedding_adapter,
+            "vector_store": default_adapter.default_vector_db_adapter,
+            "x2text": default_adapter.default_x2text_adapter,
+        }
+        # A valid profile needs a selectable default for every adapter type
+        if not all(is_adapter_selectable(adapter) for adapter in adapters.values()):
+            logger.info(
+                "Skipping default profile creation: "
+                "incomplete or unusable default adapters"
+            )
+            return
+
+        # Best-effort: a profile creation hiccup must never break project creation.
+        # The savepoint keeps a DB error from poisoning the request's outer
+        # transaction when ATOMIC_REQUESTS is enabled.
+        try:
+            with transaction.atomic():
+                ProfileManager.objects.create(
+                    prompt_studio_tool=CustomTool.objects.get(pk=tool_id),
+                    is_default=True,
+                    created_by=user,
+                    modified_by=user,
+                    profile_name=DefaultValues.DEFAULT_PROFILE_NAME,
+                    chunk_size=0,
+                    chunk_overlap=0,
+                    section="Default",
+                    retrieval_strategy="simple",
+                    similarity_top_k=3,
+                    **adapters,
+                )
+        except Exception:
+            logger.warning(
+                "Skipping default profile creation: failed to create profile",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def validate_adapter_status(
+        profile_manager: ProfileManager,
+    ) -> None:
+        """Helper method to validate the status of adapters in profile manager.
+
+        Args:
+            profile_manager (ProfileManager): The profile manager instance to
+              validate.
+
+        Raises:
+            PermissionError: If the owner does not have permission to perform
+              the action.
+        """
+        error_msg = "Permission Error: Free usage for the configured trial adapter exhausted.Please connect your own service accounts to continue.Please see our documentation for more details:https://docs.unstract.com/unstract_platform/setup_accounts/whats_needed"  # noqa: E501
+        adapters = [
+            profile_manager.llm,
+            profile_manager.vector_store,
+            profile_manager.embedding_model,
+            profile_manager.x2text,
+        ]
+
+        for adapter in adapters:
+            if not adapter.is_usable:
+                raise PermissionError(error_msg)
+
+    @staticmethod
+    def validate_profile_manager_owner_access(
+        profile_manager: ProfileManager,
+        request_user: User | None = None,
+    ) -> None:
+        """Validate adapter access for a profile before using its adapters.
+
+        This is a revocation guard on the profile *creator*, not a
+        requester ACL: users with project access deliberately piggyback on
+        the creator's adapter access. Bypasses (UN-3739): an org-admin
+        requester (implicit access to all adapters); a None creator —
+        profiles whose creating user was deleted, which includes
+        platform-API users removed on key deletion since ``created_by``
+        is SET_NULL; a service-account creator (platform-API profiles
+        hold no adapter shares by design); and an org-admin creator.
+
+        Args:
+            profile_manager: The profile whose adapters will be used.
+            request_user: The user triggering the action. Defaults to None
+              only for the legacy, currently-uncalled ``index_document`` /
+              ``prompt_responder`` chain (UN-3756); all live callers pass
+              a requester.
+
+        Raises:
+            PermissionError: If the profile creator no longer has access to
+              one or more adapters and no bypass applies.
+        """
+        if OrganizationMemberService.is_user_organization_admin(request_user):
+            return
+
+        owner = profile_manager.created_by
+        if owner is None:
+            return
+
+        if getattr(owner, "is_service_account", False):
+            return
+
+        if OrganizationMemberService.is_user_organization_admin(owner):
+            return
+
+        adapters = [
+            profile_manager.llm,
+            profile_manager.vector_store,
+            profile_manager.embedding_model,
+            profile_manager.x2text,
+        ]
+        # Access = org share, owner/viewer role, or group (UN-2202);
+        # see _adapter_accessible_by.
+        denied = [
+            adapter for adapter in adapters if not _adapter_accessible_by(adapter, owner)
+        ]
+        if not denied:
+            return
+
+        logger.error(
+            "Adapter access denied for profile '%s': creator %s lacks access"
+            " to adapters %s, requester %s",
+            profile_manager.profile_name,
+            owner.user_id,
+            [str(adapter.id) for adapter in denied],
+            getattr(request_user, "user_id", None),
+        )
+
+        # Third-party identity stays in server logs only — user-facing text
+        # carries no PII.
+        denied_names = ", ".join(
+            dict.fromkeys(adapter.adapter_name for adapter in denied)
+        )
+        if request_user is not None and owner.pk == request_user.pk:
+            # The requester IS the creator — "created by another user"
+            # would be false, and they can be addressed directly.
+            adapter_ref = (
+                f"the adapter '{denied_names}', which you no longer have" f" access to"
+                if len(denied) == 1
+                else f"adapters you no longer have access to: {denied_names}"
+            )
+            error_msg = (
+                f"Permission Error: This project's LLM profile"
+                f" '{profile_manager.profile_name}' uses {adapter_ref}."
+                f" Ask an org admin to re-share access with you or share with"
+                f" everyone, or recreate the profile with adapters you can"
+                f" access."
+            )
+            raise PermissionError(error_msg)
+
+        profile_ref = (
+            f"This project's LLM profile '{profile_manager.profile_name}' was"
+            f" created by another user"
+        )
+        if not OrganizationMemberService.get_user_by_id(owner.id):
+            error_msg = (
+                f"Permission Error: {profile_ref} who is no longer a member of"
+                f" this organization. Ask an org admin to recreate the default"
+                f" profile, or to share these adapters with everyone:"
+                f" {denied_names}."
+            )
+        elif len(denied) > 1:
+            error_msg = (
+                f"Permission Error: {profile_ref} who no longer has access to"
+                f" these adapters: {denied_names}. Ask an org admin to re-share"
+                f" them with the profile's creator, share them with everyone,"
+                f" or recreate the profile."
+            )
+        else:
+            error_msg = (
+                f"Permission Error: {profile_ref} who no longer has access to"
+                f" the adapter '{denied_names}'. Ask an org admin to re-share"
+                f" it with the profile's creator, share it with everyone, or"
+                f" recreate the profile."
+            )
+
+        raise PermissionError(error_msg)
+
+    @staticmethod
+    def _publish_log(
+        component: dict[str, str], level: str, state: str, message: str
+    ) -> None:
+        LogPublisher.publish(
+            channel_id=StateStore.get(Common.LOG_EVENTS_ID),
+            payload=LogPublisher.log_progress(component, level, state, message),
+        )
+
+    @staticmethod
+    def _get_dispatcher():
+        """Executor dispatcher for the executor worker.
+
+        Always the PG request-reply dispatcher since UN-4046. This used to be
+        gate-routed per dispatch on ``pg_queue_enabled``, falling back to the
+        Celery ``ExecutionDispatcher``; with the flag gone the factory returns
+        the PG dispatcher directly. It is kept as a factory call rather than a
+        direct construction on purpose — UN-3779 was a hardcoded
+        ``ExecutionDispatcher`` here that published to RabbitMQ and hung for its
+        full 1200s timeout with no consumer.
+        """
+        from pg_queue.executor_rpc import get_executor_dispatcher
+
+        return get_executor_dispatcher()
+
+    @staticmethod
+    def _get_platform_api_key(org_id: str) -> str:
+        """Get the platform API key for the given organization."""
+        # Lazy import: avoids Django app registry init order
+        from platform_settings_v2.platform_auth_service import (
+            PlatformAuthenticationService,
+        )
+
+        platform_key = PlatformAuthenticationService.get_active_platform_key(org_id)
+        if not platform_key:
+            raise ValueError(
+                f"No active platform API key found for organization {org_id}. "
+                "Cannot dispatch executor task."
+            )
+        return str(platform_key.key)
+
+    @staticmethod
+    def _build_summarize_params(
+        tool: "CustomTool",
+        default_profile: "ProfileManager",
+        directory: str,
+        stem: str,
+        extract_file_path: str,
+        platform_api_key: str,
+        *,
+        request_user: User | None,
+    ) -> tuple[dict[str, Any] | None, str, "ProfileManager"]:
+        """Build summarize_params dict if summarization is enabled.
+
+        Returns:
+            (summarize_params or None, summarize_file_path, summary_profile).
+        """
+        if not tool.summarize_context:
+            return None, "", default_profile
+
+        SummarizeMigrationUtils.migrate_tool_to_adapter_based(tool)
+        summary_profile = default_profile
+        if not tool.summarize_llm_adapter:
+            try:
+                sp = ProfileManager.objects.get(
+                    prompt_studio_tool=tool, is_summarize_llm=True
+                )
+                sp.chunk_size = 0
+                summary_profile = sp
+            except ProfileManager.DoesNotExist:
+                pass
+
+        if summary_profile != default_profile:
+            PromptStudioHelper.validate_adapter_status(summary_profile)
+            PromptStudioHelper.validate_profile_manager_owner_access(
+                summary_profile, request_user=request_user
+            )
+
+        llm_adapter_id = (
+            str(tool.summarize_llm_adapter.id)
+            if tool.summarize_llm_adapter
+            else str(summary_profile.llm.id)
+        )
+
+        prompts = PromptStudioHelper.fetch_prompt_from_tool(tool.tool_id)
+        prompt_keys = [p.prompt_key for p in prompts]
+
+        summarize_file_path = os.path.join(directory, "summarize", stem + ".txt")
+
+        summarize_params = {
+            "llm_adapter_instance_id": llm_adapter_id,
+            "summarize_prompt": tool.summarize_prompt or "",
+            "extract_file_path": extract_file_path,
+            "summarize_file_path": summarize_file_path,
+            "platform_api_key": platform_api_key,
+            "prompt_keys": prompt_keys,
+        }
+        return summarize_params, summarize_file_path, summary_profile
+
+    @staticmethod
+    def _build_prompt_output(
+        prompt: "ToolStudioPrompt",
+        profile_manager: "ProfileManager",
+        vector_db: str,
+        embedding_model: str,
+        llm: str,
+        x2text: str,
+        monitor_llm: str,
+        tool: "CustomTool",
+        doc_name: str,
+        org_id: str,
+        user_id: str,
+        tool_id: str,
+        document_id: str,
+    ) -> dict[str, Any]:
+        """Build the output dict for a single prompt in bulk fetch."""
+        output: dict[str, Any] = {}
+        output[TSPKeys.PROMPT] = prompt.prompt
+        output[TSPKeys.ACTIVE] = prompt.active
+        output[TSPKeys.REQUIRED] = prompt.required
+        output[TSPKeys.CHUNK_SIZE] = profile_manager.chunk_size
+        output[TSPKeys.VECTOR_DB] = vector_db
+        output[TSPKeys.EMBEDDING] = embedding_model
+        output[TSPKeys.CHUNK_OVERLAP] = profile_manager.chunk_overlap
+        output[TSPKeys.LLM] = llm
+        output[TSPKeys.TYPE] = prompt.enforce_type
+        output[TSPKeys.NAME] = prompt.prompt_key
+        output[TSPKeys.RETRIEVAL_STRATEGY] = profile_manager.retrieval_strategy
+        output[TSPKeys.SIMILARITY_TOP_K] = profile_manager.similarity_top_k
+        output[TSPKeys.SECTION] = profile_manager.section
+        output[TSPKeys.X2TEXT_ADAPTER] = x2text
+        PromptStudioHelper._stamp_x2text_output_mode(output, profile_manager)
+
+        webhook_enabled = bool(prompt.enable_postprocessing_webhook)
+        webhook_url = (prompt.postprocessing_webhook_url or "").strip()
+        if webhook_enabled and not webhook_url:
+            webhook_enabled = False
+        output[TSPKeys.ENABLE_POSTPROCESSING_WEBHOOK] = webhook_enabled
+        if webhook_enabled:
+            output[TSPKeys.POSTPROCESSING_WEBHOOK_URL] = webhook_url
+
+        if lookup_config := get_lookup_config(prompt):
+            output["lookup_config"] = lookup_config
+
+        output[TSPKeys.EVAL_SETTINGS] = {}
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_EVALUATE] = prompt.evaluate
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_MONITOR_LLM] = [monitor_llm]
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_EXCLUDE_FAILED] = (
+            tool.exclude_failed
+        )
+        for attr in dir(prompt):
+            if attr.startswith(TSPKeys.EVAL_METRIC_PREFIX):
+                output[TSPKeys.EVAL_SETTINGS][attr] = getattr(prompt, attr)
+
+        output = PromptStudioHelper.fetch_table_settings_if_enabled(
+            doc_name, prompt, org_id, user_id, tool_id, output
+        )
+        variable_map = PromptStudioVariableService.frame_variable_replacement_map(
+            doc_id=document_id, prompt_object=prompt
+        )
+        if variable_map:
+            output[TSPKeys.VARIABLE_MAP] = variable_map
+        return output
+
+    @staticmethod
+    def _wait_for_indexing(
+        org_id: str, user_id: str, doc_id_key: str
+    ) -> dict[str, str] | None:
+        """Poll until an in-progress indexing completes or times out.
+
+        Returns:
+            Completed/pending result dict, or ``None`` if indexing failed
+            and the caller should re-index.
+        """
+        if not DocumentIndexingService.is_document_indexing(
+            org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+        ):
+            return None
+
+        logger.info(
+            "Document %s is already being indexed; "
+            "waiting for completion before proceeding.",
+            doc_id_key,
+        )
+        poll_interval = 2  # seconds
+        max_wait = 300  # 5 minutes
+        elapsed = 0
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            indexed_doc_id = DocumentIndexingService.get_indexed_document_id(
+                org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+            )
+            if indexed_doc_id:
+                return {
+                    "status": IndexingStatus.COMPLETED_STATUS.value,
+                    "output": indexed_doc_id,
+                }
+            if not DocumentIndexingService.is_document_indexing(
+                org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+            ):
+                return None
+        # Timed out — return PENDING as safety net
+        return {
+            "status": IndexingStatus.PENDING_STATUS.value,
+            "output": IndexingStatus.DOCUMENT_BEING_INDEXED.value,
+        }
+
+    # ------------------------------------------------------------------
+    # Phase 5B — Payload builders for fire-and-forget dispatch
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_index_payload(
+        tool_id: str,
+        file_name: str,
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        run_id: str,
+        *,
+        request_user: User | None,
+    ) -> tuple[ExecutionContext, dict[str, Any]]:
+        """Build ide_index ExecutionContext for fire-and-forget dispatch.
+
+        Does ORM validation synchronously, then returns the execution
+        context so the caller can dispatch with callbacks.  Summarization
+        is deferred to the executor worker via ``summarize_params``.
+        """
+        tool: CustomTool = CustomTool.objects.get(pk=tool_id)
+        file_path = PromptStudioFileHelper.get_or_create_prompt_studio_subdirectory(
+            org_id,
+            is_create=False,
+            user_id=user_id,
+            tool_id=tool_id,
+        )
+        file_path = str(Path(file_path) / file_name)
+
+        default_profile = ProfileManager.get_default_llm_profile(tool)
+        if not default_profile:
+            raise DefaultProfileError()
+
+        PromptStudioHelper.validate_adapter_status(default_profile)
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            default_profile, request_user=request_user
+        )
+
+        # Common path decomposition used by extract, summarize, and index
+        directory, filename = os.path.split(file_path)
+        stem = os.path.splitext(filename)[0]
+        extract_file_path = os.path.join(directory, "extract", stem + ".txt")
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+
+        # Build summarize_params for executor (summarization runs in worker)
+        summarize_params, summarize_file_path, summary_profile = (
+            PromptStudioHelper._build_summarize_params(
+                tool,
+                default_profile,
+                directory,
+                stem,
+                extract_file_path,
+                platform_api_key,
+                request_user=request_user,
+            )
+        )
+
+        # Generate doc_id for indexing tracking
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+
+        # Compute x2text_config_hash early so the marker check below (and the
+        # post-success callback) can both consume the same value.
+        x2text_metadata = default_profile.x2text.metadata or {}
+        x2text_config_hash = ToolUtils.hash_str(
+            json.dumps(x2text_metadata, sort_keys=True)
+        )
+
+        # Manage Documents → Index: mirror the pre-async dynamic_extractor
+        # behaviour.  If the extraction marker says this x2text_config_hash +
+        # enable_highlight combination is already extracted, read the existing
+        # extract file from disk and reuse it so the executor can skip the
+        # extract step.  Any failure here falls back to full extraction.
+        reused_extracted_text: str | None = None
+        try:
+            already_extracted = PromptStudioIndexHelper.check_extraction_status(
+                document_id=document_id,
+                profile_manager=default_profile,
+                x2text_config_hash=x2text_config_hash,
+                enable_highlight=tool.enable_highlight,
+            )
+            if already_extracted:
+                try:
+                    reused_extracted_text = fs_instance.read(
+                        path=extract_file_path, mode="r"
+                    )
+                    logger.info(
+                        "Manage Documents index: marker valid, reusing existing "
+                        "extract file for document=%s",
+                        document_id,
+                    )
+                except FileNotFoundError:
+                    logger.warning(
+                        "Marker says extracted but extract file missing: %s. "
+                        "Will re-extract.",
+                        extract_file_path,
+                    )
+        except Exception:
+            logger.warning(
+                "check_extraction_status raised; falling back to full extraction",
+                exc_info=True,
+            )
+        if reused_extracted_text:
+            # The cache key ignores the LLM, so a cached image-mode extraction
+            # made for another LLM must still fit this profile's (outside the
+            # fallback above: a rejection must reach the user).
+            PromptStudioHelper._check_cached_image_extraction(
+                default_profile, reused_extracted_text, filename
+            )
+
+        util = PromptIdeBaseTool(log_level=LogLevel.INFO, org_id=org_id)
+        doc_id_key = IndexingUtils.generate_index_key(
+            vector_db=str(default_profile.vector_store.id),
+            embedding=str(default_profile.embedding_model.id),
+            x2text=str(default_profile.x2text.id),
+            chunk_size=str(default_profile.chunk_size),
+            chunk_overlap=str(default_profile.chunk_overlap),
+            file_path=file_path,
+            file_hash=None,
+            fs=fs_instance,
+            tool=util,
+        )
+
+        usage_kwargs = {"run_id": run_id, "file_name": filename}
+
+        extract_params = {
+            IKeys.X2TEXT_INSTANCE_ID: str(default_profile.x2text.id),
+            IKeys.LLM_INSTANCE_IDS: PromptStudioHelper._image_limit_llm_ids(
+                default_profile
+            ),
+            IKeys.FILE_PATH: file_path,
+            IKeys.ENABLE_HIGHLIGHT: tool.enable_highlight,
+            IKeys.OUTPUT_FILE_PATH: extract_file_path,
+            "platform_api_key": platform_api_key,
+            IKeys.USAGE_KWARGS: usage_kwargs,
+        }
+
+        index_params = {
+            IKeys.TOOL_ID: tool_id,
+            IKeys.EMBEDDING_INSTANCE_ID: str(default_profile.embedding_model.id),
+            IKeys.VECTOR_DB_INSTANCE_ID: str(default_profile.vector_store.id),
+            IKeys.X2TEXT_INSTANCE_ID: str(default_profile.x2text.id),
+            IKeys.FILE_PATH: extract_file_path,
+            IKeys.FILE_HASH: None,
+            IKeys.CHUNK_OVERLAP: default_profile.chunk_overlap,
+            IKeys.CHUNK_SIZE: default_profile.chunk_size,
+            IKeys.REINDEX: True,
+            IKeys.ENABLE_HIGHLIGHT: tool.enable_highlight,
+            IKeys.USAGE_KWARGS: usage_kwargs,
+            IKeys.RUN_ID: run_id,
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            "platform_api_key": platform_api_key,
+        }
+
+        # On marker-hit, pre-populate the extracted text so the executor's
+        # _handle_ide_index skips the extract step entirely.
+        if reused_extracted_text:
+            index_params[IKeys.EXTRACTED_TEXT] = reused_extracted_text
+
+        log_events_id = StateStore.get(Common.LOG_EVENTS_ID) or ""
+        request_id = StateStore.get(Common.REQUEST_ID) or ""
+
+        context = ExecutionContext(
+            executor_name="legacy",
+            operation="ide_index",
+            run_id=run_id or str(uuid.uuid4()),
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params={
+                "extract_params": extract_params,
+                "index_params": index_params,
+                "summarize_params": summarize_params,
+            },
+            request_id=request_id,
+            log_events_id=log_events_id,
+        )
+
+        # x2text_config_hash (computed above) is forwarded to the callback so
+        # ide_index_complete can refresh the extraction marker via
+        # mark_extraction_status.
+        cb_kwargs = {
+            "log_events_id": log_events_id,
+            "request_id": request_id,
+            "org_id": org_id,
+            "user_id": user_id,
+            "document_id": document_id,
+            "doc_id_key": doc_id_key,
+            "profile_manager_id": str(default_profile.profile_id),
+            "tool_id": tool_id,
+            "run_id": run_id,
+            "file_name": file_name,
+            "x2text_config_hash": x2text_config_hash,
+            "enable_highlight": tool.enable_highlight,
+            "summary_profile_id": (
+                str(summary_profile.profile_id) if tool.summarize_context else ""
+            ),
+            "summarize_file_path": summarize_file_path,
+        }
+
+        return context, cb_kwargs
+
+    @staticmethod
+    def _resolve_profile_manager(
+        tool: Any, prompt: Any = None, profile_manager_id: str | None = None
+    ) -> Any:
+        """Resolve the profile a run executes under.
+
+        The ladder, in order: an explicitly passed ``profile_manager_id``, then
+        the prompt's own FK, then the project default. A prompt need not carry
+        its own FK - falling back to the project default matches what
+        index_document and single-pass extraction already do.
+
+        ``get_default_llm_profile`` raises ``DefaultProfileError`` when no
+        project default exists, so this never returns a falsy value.
+
+        Args:
+            tool (CustomTool): Prompt Studio project the prompt belongs to
+            prompt (ToolStudioPrompt | None): Prompt whose FK to consult, if any
+            profile_manager_id (str | None): Explicitly requested profile
+
+        Returns:
+            ProfileManager: The resolved profile
+        """
+        if profile_manager_id:
+            return ProfileManagerHelper.get_profile_manager(
+                profile_manager_id=profile_manager_id
+            )
+        if prompt is not None and prompt.profile_manager:
+            return prompt.profile_manager
+        return ProfileManager.get_default_llm_profile(tool)
+
+    @staticmethod
+    def _resolve_llm_ids(tool: Any) -> tuple[str, str]:
+        """Resolve monitor_llm and challenge_llm IDs for the tool."""
+        monitor_llm_instance = tool.monitor_llm
+        challenge_llm_instance = tool.challenge_llm
+        if monitor_llm_instance:
+            monitor_llm = str(monitor_llm_instance.id)
+        else:
+            dp = ProfileManager.get_default_llm_profile(tool)
+            if not dp:
+                raise DefaultProfileError()
+            monitor_llm = str(dp.llm.id)
+        if challenge_llm_instance:
+            challenge_llm = str(challenge_llm_instance.id)
+        else:
+            dp = ProfileManager.get_default_llm_profile(tool)
+            if not dp:
+                raise DefaultProfileError()
+            challenge_llm = str(dp.llm.id)
+        return monitor_llm, challenge_llm
+
+    @staticmethod
+    def _build_grammar_list(prompt_grammer: Any) -> list[dict[str, Any]]:
+        """Build the grammar synonym list from the tool's prompt_grammer dict."""
+        if not prompt_grammer:
+            return []
+        return [
+            {TSPKeys.WORD: word, TSPKeys.SYNONYMS: synonyms}
+            for word, synonyms in prompt_grammer.items()
+        ]
+
+    @staticmethod
+    def build_fetch_response_payload(
+        tool: CustomTool,
+        doc_path: str,
+        doc_name: str,
+        prompt: ToolStudioPrompt,
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        run_id: str,
+        profile_manager_id: str | None = None,
+        *,
+        request_user: User | None,
+    ) -> tuple[ExecutionContext | None, dict[str, Any]]:
+        """Build answer_prompt ExecutionContext for fire-and-forget dispatch.
+
+        Does ORM work, extraction, and indexing synchronously.  Only the
+        LLM answer_prompt call is dispatched asynchronously.
+
+        Returns:
+            (context, cb_kwargs) or (None, pending_response_dict)
+        """
+        profile_manager = PromptStudioHelper._resolve_profile_manager(
+            tool=tool, prompt=prompt, profile_manager_id=profile_manager_id
+        )
+
+        monitor_llm, challenge_llm = PromptStudioHelper._resolve_llm_ids(tool)
+
+        PromptStudioHelper.validate_adapter_status(profile_manager)
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            profile_manager, request_user=request_user
+        )
+
+        vector_db = str(profile_manager.vector_store.id)
+        embedding_model = str(profile_manager.embedding_model.id)
+        llm = str(profile_manager.llm.id)
+        x2text = str(profile_manager.x2text.id)
+
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        util = PromptIdeBaseTool(log_level=LogLevel.INFO, org_id=org_id)
+        file_path = doc_path
+        directory, filename = os.path.split(doc_path)
+        extract_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+
+        doc_id = IndexingUtils.generate_index_key(
+            vector_db=vector_db,
+            embedding=embedding_model,
+            x2text=x2text,
+            chunk_size=str(profile_manager.chunk_size),
+            chunk_overlap=str(profile_manager.chunk_overlap),
+            file_path=file_path,
+            file_hash=None,
+            fs=fs_instance,
+            tool=util,
+        )
+
+        # Extract (blocking, usually cached)
+        extracted_text = PromptStudioHelper.dynamic_extractor(
+            profile_manager=profile_manager,
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            enable_highlight=tool.enable_highlight,
+        )
+
+        # Captured before the summarize override: the page-image reader must
+        # key on the extract path even when answers run over the summary.
+        image_extract_path = extract_path
+        is_summary = tool.summarize_as_source
+        if is_summary:
+            profile_manager.chunk_size = 0
+            p = Path(extract_path)
+            extract_path = str(p.parent.parent / "summarize" / (p.stem + ".txt"))
+
+        # Index (blocking, usually cached)
+        index_result = PromptStudioHelper.dynamic_indexer(
+            profile_manager=profile_manager,
+            tool_id=str(tool.tool_id),
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            user_id=user_id,
+            enable_highlight=tool.enable_highlight,
+            extracted_text=extracted_text,
+            doc_id_key=doc_id,
+        )
+
+        if index_result.get("status") == IndexingStatus.PENDING_STATUS.value:
+            return None, {
+                "status": IndexingStatus.PENDING_STATUS.value,
+                "message": IndexingStatus.DOCUMENT_BEING_INDEXED.value,
+            }
+
+        # Build outputs
+        tool_id = str(tool.tool_id)
+        output: dict[str, Any] = {}
+        outputs: list[dict[str, Any]] = []
+        grammar_list = PromptStudioHelper._build_grammar_list(tool.prompt_grammer)
+
+        output[TSPKeys.PROMPT] = prompt.prompt
+        output[TSPKeys.ACTIVE] = prompt.active
+        output[TSPKeys.REQUIRED] = prompt.required
+        output[TSPKeys.CHUNK_SIZE] = profile_manager.chunk_size
+        output[TSPKeys.VECTOR_DB] = vector_db
+        output[TSPKeys.EMBEDDING] = embedding_model
+        output[TSPKeys.CHUNK_OVERLAP] = profile_manager.chunk_overlap
+        output[TSPKeys.LLM] = llm
+        output[TSPKeys.TYPE] = prompt.enforce_type
+        output[TSPKeys.NAME] = prompt.prompt_key
+        output[TSPKeys.RETRIEVAL_STRATEGY] = profile_manager.retrieval_strategy
+        output[TSPKeys.SIMILARITY_TOP_K] = profile_manager.similarity_top_k
+        output[TSPKeys.SECTION] = profile_manager.section
+        output[TSPKeys.X2TEXT_ADAPTER] = x2text
+        PromptStudioHelper._stamp_x2text_output_mode(output, profile_manager)
+
+        webhook_enabled = bool(prompt.enable_postprocessing_webhook)
+        webhook_url = (prompt.postprocessing_webhook_url or "").strip()
+        if webhook_enabled and not webhook_url:
+            webhook_enabled = False
+        output[TSPKeys.ENABLE_POSTPROCESSING_WEBHOOK] = webhook_enabled
+        if webhook_enabled:
+            output[TSPKeys.POSTPROCESSING_WEBHOOK_URL] = webhook_url
+
+        if lookup_config := get_lookup_config(prompt):
+            output["lookup_config"] = lookup_config
+
+        output[TSPKeys.EVAL_SETTINGS] = {}
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_EVALUATE] = prompt.evaluate
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_MONITOR_LLM] = [monitor_llm]
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_EXCLUDE_FAILED] = (
+            tool.exclude_failed
+        )
+        for attr in dir(prompt):
+            if attr.startswith(TSPKeys.EVAL_METRIC_PREFIX):
+                output[TSPKeys.EVAL_SETTINGS][attr] = getattr(prompt, attr)
+
+        output = PromptStudioHelper.fetch_table_settings_if_enabled(
+            doc_name, prompt, org_id, user_id, tool_id, output
+        )
+        variable_map = PromptStudioVariableService.frame_variable_replacement_map(
+            doc_id=document_id, prompt_object=prompt
+        )
+        if variable_map:
+            output[TSPKeys.VARIABLE_MAP] = variable_map
+        outputs.append(output)
+
+        tool_settings: dict[str, Any] = {}
+        tool_settings[TSPKeys.ENABLE_CHALLENGE] = tool.enable_challenge
+        tool_settings[TSPKeys.CHALLENGE_LLM] = challenge_llm
+        tool_settings[TSPKeys.SINGLE_PASS_EXTRACTION_MODE] = (
+            tool.single_pass_extraction_mode
+        )
+        tool_settings[TSPKeys.SUMMARIZE_AS_SOURCE] = tool.summarize_as_source
+        tool_settings[TSPKeys.PREAMBLE] = tool.preamble
+        tool_settings[TSPKeys.POSTAMBLE] = tool.postamble
+        tool_settings[TSPKeys.GRAMMAR] = grammar_list
+        tool_settings[TSPKeys.ENABLE_HIGHLIGHT] = tool.enable_highlight
+        tool_settings[TSPKeys.ENABLE_WORD_CONFIDENCE] = tool.enable_word_confidence
+        tool_settings[TSPKeys.PLATFORM_POSTAMBLE] = getattr(
+            settings, TSPKeys.PLATFORM_POSTAMBLE.upper(), ""
+        )
+        tool_settings[TSPKeys.WORD_CONFIDENCE_POSTAMBLE] = getattr(
+            settings, TSPKeys.WORD_CONFIDENCE_POSTAMBLE.upper(), ""
+        )
+
+        file_hash = fs_instance.get_hash_from_file(path=extract_path)
+
+        payload: dict[str, Any] = {
+            TSPKeys.TOOL_SETTINGS: tool_settings,
+            TSPKeys.OUTPUTS: outputs,
+            TSPKeys.TOOL_ID: tool_id,
+            TSPKeys.RUN_ID: run_id,
+            TSPKeys.FILE_NAME: doc_name,
+            TSPKeys.FILE_HASH: file_hash,
+            TSPKeys.FILE_PATH: extract_path,
+            TSPKeys.EXTRACT_FILE_PATH: image_extract_path,
+            Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            TSPKeys.CUSTOM_DATA: tool.custom_data,
+        }
+
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+        payload[ToolStudioKeys.PLATFORM_SERVICE_API_KEY] = platform_api_key
+        payload[TSPKeys.INCLUDE_METADATA] = True
+
+        log_events_id = StateStore.get(Common.LOG_EVENTS_ID) or ""
+        request_id = StateStore.get(Common.REQUEST_ID) or ""
+
+        context = ExecutionContext(
+            executor_name="legacy",
+            operation="answer_prompt",
+            run_id=run_id,
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params=payload,
+            request_id=request_id,
+            log_events_id=log_events_id,
+        )
+
+        cb_kwargs = {
+            "log_events_id": log_events_id,
+            "request_id": request_id,
+            "org_id": org_id,
+            "user_id": user_id,
+            "operation": "fetch_response",
+            "run_id": run_id,
+            "document_id": document_id,
+            "tool_id": tool_id,
+            "prompt_ids": [str(prompt.prompt_id)],
+            # Record the profile actually used, not the (possibly None) argument.
+            # The callback otherwise re-resolves the project default, so a
+            # default change mid-run would book output against a different
+            # profile than the one that produced it.
+            "profile_manager_id": str(profile_manager.profile_id),
+            "is_single_pass": False,
+        }
+
+        return context, cb_kwargs
+
+    @staticmethod
+    def build_bulk_fetch_response_payload(
+        tool: CustomTool,
+        doc_path: str,
+        doc_name: str,
+        prompts: list[ToolStudioPrompt],
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        run_id: str,
+        profile_manager_id: str | None = None,
+        *,
+        request_user: User | None,
+    ) -> tuple[ExecutionContext | None, dict[str, Any]]:
+        """Build answer_prompt payload for multiple prompts in one task.
+
+        Does ORM work, extraction, and indexing synchronously once for
+        all prompts.  Only the LLM answer_prompt call is dispatched
+        asynchronously with all prompts in the outputs list.
+
+        Returns:
+            (context, cb_kwargs) or (None, pending_response_dict)
+        """
+        # No single prompt to consult here, so the FK rung is skipped.
+        profile_manager = PromptStudioHelper._resolve_profile_manager(
+            tool=tool, profile_manager_id=profile_manager_id
+        )
+
+        PromptStudioHelper.validate_adapter_status(profile_manager)
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            profile_manager, request_user=request_user
+        )
+
+        monitor_llm, challenge_llm = PromptStudioHelper._resolve_llm_ids(tool)
+
+        vector_db = str(profile_manager.vector_store.id)
+        embedding_model = str(profile_manager.embedding_model.id)
+        llm = str(profile_manager.llm.id)
+        x2text = str(profile_manager.x2text.id)
+
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        util = PromptIdeBaseTool(log_level=LogLevel.INFO, org_id=org_id)
+        file_path = doc_path
+        directory, filename = os.path.split(doc_path)
+        extract_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+
+        doc_id = IndexingUtils.generate_index_key(
+            vector_db=vector_db,
+            embedding=embedding_model,
+            x2text=x2text,
+            chunk_size=str(profile_manager.chunk_size),
+            chunk_overlap=str(profile_manager.chunk_overlap),
+            file_path=file_path,
+            file_hash=None,
+            fs=fs_instance,
+            tool=util,
+        )
+
+        # Extract ONCE (blocking, usually cached)
+        extracted_text = PromptStudioHelper.dynamic_extractor(
+            profile_manager=profile_manager,
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            enable_highlight=tool.enable_highlight,
+        )
+
+        # Captured before the summarize override: the page-image reader must
+        # key on the extract path even when answers run over the summary.
+        image_extract_path = extract_path
+        is_summary = tool.summarize_as_source
+        if is_summary:
+            profile_manager.chunk_size = 0
+            p = Path(extract_path)
+            extract_path = str(p.parent.parent / "summarize" / (p.stem + ".txt"))
+
+        # Index ONCE (blocking, usually cached)
+        index_result = PromptStudioHelper.dynamic_indexer(
+            profile_manager=profile_manager,
+            tool_id=str(tool.tool_id),
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            user_id=user_id,
+            enable_highlight=tool.enable_highlight,
+            extracted_text=extracted_text,
+            doc_id_key=doc_id,
+        )
+
+        if index_result.get("status") == IndexingStatus.PENDING_STATUS.value:
+            return None, {
+                "status": IndexingStatus.PENDING_STATUS.value,
+                "message": IndexingStatus.DOCUMENT_BEING_INDEXED.value,
+            }
+
+        # Per-prompt output building
+        tool_id = str(tool.tool_id)
+        grammar_list = PromptStudioHelper._build_grammar_list(tool.prompt_grammer)
+        outputs: list[dict[str, Any]] = [
+            PromptStudioHelper._build_prompt_output(
+                prompt=prompt,
+                profile_manager=profile_manager,
+                vector_db=vector_db,
+                embedding_model=embedding_model,
+                llm=llm,
+                x2text=x2text,
+                monitor_llm=monitor_llm,
+                tool=tool,
+                doc_name=doc_name,
+                org_id=org_id,
+                user_id=user_id,
+                tool_id=tool_id,
+                document_id=document_id,
+            )
+            for prompt in prompts
+        ]
+
+        tool_settings: dict[str, Any] = {}
+        tool_settings[TSPKeys.ENABLE_CHALLENGE] = tool.enable_challenge
+        tool_settings[TSPKeys.CHALLENGE_LLM] = challenge_llm
+        tool_settings[TSPKeys.SINGLE_PASS_EXTRACTION_MODE] = (
+            tool.single_pass_extraction_mode
+        )
+        tool_settings[TSPKeys.SUMMARIZE_AS_SOURCE] = tool.summarize_as_source
+        tool_settings[TSPKeys.PREAMBLE] = tool.preamble
+        tool_settings[TSPKeys.POSTAMBLE] = tool.postamble
+        tool_settings[TSPKeys.GRAMMAR] = grammar_list
+        tool_settings[TSPKeys.ENABLE_HIGHLIGHT] = tool.enable_highlight
+        tool_settings[TSPKeys.ENABLE_WORD_CONFIDENCE] = tool.enable_word_confidence
+        tool_settings[TSPKeys.PLATFORM_POSTAMBLE] = getattr(
+            settings, TSPKeys.PLATFORM_POSTAMBLE.upper(), ""
+        )
+        tool_settings[TSPKeys.WORD_CONFIDENCE_POSTAMBLE] = getattr(
+            settings, TSPKeys.WORD_CONFIDENCE_POSTAMBLE.upper(), ""
+        )
+
+        file_hash = fs_instance.get_hash_from_file(path=extract_path)
+
+        payload: dict[str, Any] = {
+            TSPKeys.TOOL_SETTINGS: tool_settings,
+            TSPKeys.OUTPUTS: outputs,
+            TSPKeys.TOOL_ID: tool_id,
+            TSPKeys.RUN_ID: run_id,
+            TSPKeys.FILE_NAME: doc_name,
+            TSPKeys.FILE_HASH: file_hash,
+            TSPKeys.FILE_PATH: extract_path,
+            TSPKeys.EXTRACT_FILE_PATH: image_extract_path,
+            Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            TSPKeys.CUSTOM_DATA: tool.custom_data,
+        }
+
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+        payload[ToolStudioKeys.PLATFORM_SERVICE_API_KEY] = platform_api_key
+        payload[TSPKeys.INCLUDE_METADATA] = True
+
+        log_events_id = StateStore.get(Common.LOG_EVENTS_ID) or ""
+        request_id = StateStore.get(Common.REQUEST_ID) or ""
+
+        context = ExecutionContext(
+            executor_name="legacy",
+            operation="answer_prompt",
+            run_id=run_id,
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params=payload,
+            request_id=request_id,
+            log_events_id=log_events_id,
+        )
+
+        cb_kwargs = {
+            "log_events_id": log_events_id,
+            "request_id": request_id,
+            "org_id": org_id,
+            "user_id": user_id,
+            "operation": "fetch_response",
+            "run_id": run_id,
+            "document_id": document_id,
+            "tool_id": tool_id,
+            "prompt_ids": [str(p.prompt_id) for p in prompts],
+            # Record the profile actually used, not the (possibly None)
+            # argument - same reason as build_fetch_response_payload above.
+            "profile_manager_id": str(profile_manager.profile_id),
+            "is_single_pass": False,
+        }
+
+        return context, cb_kwargs
+
+    @staticmethod
+    def build_single_pass_payload(
+        tool: CustomTool,
+        doc_path: str,
+        doc_name: str,
+        prompts: list[ToolStudioPrompt],
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        run_id: str,
+        *,
+        request_user: User | None,
+    ) -> tuple[ExecutionContext, dict[str, Any]]:
+        """Build single_pass_extraction ExecutionContext.
+
+        Does ORM work and extraction synchronously.  Only the LLM
+        single-pass call is dispatched asynchronously.
+        """
+        tool_id = str(tool.tool_id)
+        outputs: list[dict[str, Any]] = []
+        grammar: list[dict[str, Any]] = []
+        prompt_grammar = tool.prompt_grammer
+        default_profile = ProfileManager.get_default_llm_profile(tool)
+
+        if not default_profile:
+            raise DefaultProfileError()
+
+        challenge_llm_instance: AdapterInstance | None = tool.challenge_llm
+        challenge_llm: str | None = None
+        if challenge_llm_instance:
+            challenge_llm = str(challenge_llm_instance.id)
+        else:
+            challenge_llm = str(default_profile.llm.id)
+
+        PromptStudioHelper.validate_adapter_status(default_profile)
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            default_profile, request_user=request_user
+        )
+        default_profile.chunk_size = 0
+
+        if prompt_grammar:
+            for word, synonyms in prompt_grammar.items():
+                grammar.append({TSPKeys.WORD: word, TSPKeys.SYNONYMS: synonyms})
+
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        directory, filename = os.path.split(doc_path)
+        file_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+
+        # Extract (blocking, usually cached)
+        PromptStudioHelper.dynamic_extractor(
+            profile_manager=default_profile,
+            file_path=doc_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            enable_highlight=tool.enable_highlight,
+        )
+
+        vector_db = str(default_profile.vector_store.id)
+        embedding_model = str(default_profile.embedding_model.id)
+        llm = str(default_profile.llm.id)
+        x2text = str(default_profile.x2text.id)
+
+        tool_settings: dict[str, Any] = {
+            TSPKeys.PREAMBLE: tool.preamble,
+            TSPKeys.POSTAMBLE: tool.postamble,
+            TSPKeys.GRAMMAR: grammar,
+            TSPKeys.LLM: llm,
+            TSPKeys.X2TEXT_ADAPTER: x2text,
+            TSPKeys.VECTOR_DB: vector_db,
+            TSPKeys.EMBEDDING: embedding_model,
+            TSPKeys.CHUNK_SIZE: default_profile.chunk_size,
+            TSPKeys.CHUNK_OVERLAP: default_profile.chunk_overlap,
+            TSPKeys.ENABLE_CHALLENGE: tool.enable_challenge,
+            TSPKeys.ENABLE_HIGHLIGHT: tool.enable_highlight,
+            TSPKeys.ENABLE_WORD_CONFIDENCE: tool.enable_word_confidence,
+            TSPKeys.CHALLENGE_LLM: challenge_llm,
+            TSPKeys.PLATFORM_POSTAMBLE: getattr(
+                settings, TSPKeys.PLATFORM_POSTAMBLE.upper(), ""
+            ),
+            TSPKeys.WORD_CONFIDENCE_POSTAMBLE: getattr(
+                settings, TSPKeys.WORD_CONFIDENCE_POSTAMBLE.upper(), ""
+            ),
+            TSPKeys.SUMMARIZE_AS_SOURCE: tool.summarize_as_source,
+            TSPKeys.RETRIEVAL_STRATEGY: default_profile.retrieval_strategy
+            or TSPKeys.SIMPLE,
+            TSPKeys.SIMILARITY_TOP_K: default_profile.similarity_top_k,
+        }
+        # Stamp the x2text output mode like every other payload builder — the
+        # executor's single-pass guard trusts the stamp, and an unstamped IDE
+        # payload is treated as pre-upgrade text mode (guard never fires).
+        PromptStudioHelper._stamp_x2text_output_mode(tool_settings, default_profile)
+
+        lookup_configs = get_lookup_configs_for_tool(tool, prompts=prompts)
+        if lookup_configs:
+            tool_settings["lookup_configs"] = lookup_configs
+
+        for p in prompts:
+            if not p.prompt:
+                raise EmptyPromptError()
+            outputs.append(
+                {
+                    TSPKeys.PROMPT: p.prompt,
+                    TSPKeys.ACTIVE: p.active,
+                    TSPKeys.TYPE: p.enforce_type,
+                    TSPKeys.NAME: p.prompt_key,
+                }
+            )
+
+        if tool.summarize_as_source:
+            path_obj = Path(file_path)
+            file_path = str(
+                path_obj.parent.parent / TSPKeys.SUMMARIZE / (path_obj.stem + ".txt")
+            )
+
+        file_hash = fs_instance.get_hash_from_file(path=file_path)
+
+        payload: dict[str, Any] = {
+            TSPKeys.TOOL_SETTINGS: tool_settings,
+            TSPKeys.OUTPUTS: outputs,
+            TSPKeys.TOOL_ID: tool_id,
+            TSPKeys.RUN_ID: run_id,
+            TSPKeys.FILE_HASH: file_hash,
+            TSPKeys.FILE_NAME: doc_name,
+            TSPKeys.FILE_PATH: file_path,
+            Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            TSPKeys.CUSTOM_DATA: tool.custom_data,
+        }
+
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+        payload[ToolStudioKeys.PLATFORM_SERVICE_API_KEY] = platform_api_key
+        payload[TSPKeys.INCLUDE_METADATA] = True
+
+        log_events_id = StateStore.get(Common.LOG_EVENTS_ID) or ""
+        request_id = StateStore.get(Common.REQUEST_ID) or ""
+
+        context = ExecutionContext(
+            executor_name="legacy",
+            operation="single_pass_extraction",
+            run_id=run_id or str(uuid.uuid4()),
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params=payload,
+            request_id=request_id,
+            log_events_id=log_events_id,
+        )
+
+        cb_kwargs = {
+            "log_events_id": log_events_id,
+            "request_id": request_id,
+            "org_id": org_id,
+            "user_id": user_id,
+            "operation": "single_pass_extraction",
+            "run_id": run_id,
+            "document_id": document_id,
+            "tool_id": tool_id,
+            "prompt_ids": [str(p.prompt_id) for p in prompts],
+            "profile_manager_id": str(default_profile.profile_id),
+            "is_single_pass": True,
+        }
+
+        return context, cb_kwargs
+
+    @staticmethod
+    def get_select_fields() -> dict[str, Any]:
+        """Method to fetch dropdown field values for frontend.
+
+        Returns:
+            dict[str, Any]: Dict for dropdown data
+        """
+        with open(f"{os.path.dirname(__file__)}{CHOICES_JSON}") as f:
+            choices = f.read()
+        response: dict[str, Any] = json.loads(choices)
+        # Update select choices with payload modifier plugin if available
+        payload_modifier_plugin = get_plugin("payload_modifier")
+        if payload_modifier_plugin:
+            modifier_service = payload_modifier_plugin["service_class"]()
+            response = modifier_service.update_select_choices(default_choices=response)
+        return response
+
+    @staticmethod
+    def _fetch_prompt_from_id(id: str) -> ToolStudioPrompt:
+        """Internal function used to fetch prompt from ID.
+
+        Args:
+            id (_type_): UUID of the prompt
+
+        Returns:
+            ToolStudioPrompt: Instance of the model
+        """
+        prompt_instance: ToolStudioPrompt = ToolStudioPrompt.objects.get(pk=id)
+        return prompt_instance
+
+    @staticmethod
+    def fetch_prompt_from_tool(tool_id: str) -> list[ToolStudioPrompt]:
+        """Internal function used to fetch mapped prompts from ToolID.
+
+        Args:
+            tool_id (_type_): UUID of the tool
+
+        Returns:
+            List[ToolStudioPrompt]: List of instance of the model
+        """
+        prompt_instances: list[ToolStudioPrompt] = ToolStudioPrompt.objects.filter(
+            tool_id=tool_id
+        ).order_by(TSPKeys.SEQUENCE_NUMBER)
+        return prompt_instances
+
+    @staticmethod
+    def _stamp_x2text_output_mode(output: dict, profile_manager) -> None:
+        """Stamp the x2text output mode onto a per-prompt payload.
+
+        Lets the executor detect image mode from the payload instead of a
+        platform-service call. LLMWhisperer-only (the sole adapter with an
+        image output mode); best-effort — a metadata read failure leaves
+        the stamp absent and the executor falls back to live resolution.
+        """
+        x2text = getattr(profile_manager, "x2text", None)
+        if x2text is None:
+            return
+        try:
+            adapter_id = str(getattr(x2text, "adapter_id", "") or "")
+            if not adapter_id.startswith(LLMWHISPERER_ADAPTER_PREFIX):
+                return
+            metadata = x2text.metadata or {}
+            output[TSPKeys.X2TEXT_OUTPUT_MODE] = metadata.get(
+                ImageOutputConstants.OUTPUT_MODE
+            )
+        except Exception:
+            logger.exception("Could not stamp x2text output mode; will resolve live")
+
+    @staticmethod
+    def _is_image_output_mode(profile_manager: ProfileManager | None) -> bool:
+        """True when the profile's x2text adapter is LLMWhisperer in image mode.
+
+        Gated on BOTH the LLMWhisperer adapter id and ``output_mode == image``:
+        ``output_mode`` is user-editable adapter metadata, so keying on it alone
+        would make any future x2text adapter that adopts the same key inherit
+        image-mode rules it never asked for.
+        """
+        x2text = getattr(profile_manager, "x2text", None)
+        if x2text is None:
+            return False
+        adapter_id = str(getattr(x2text, "adapter_id", "") or "")
+        if not adapter_id.startswith(LLMWHISPERER_ADAPTER_PREFIX):
+            return False
+        return (x2text.metadata or {}).get(
+            ImageOutputConstants.OUTPUT_MODE
+        ) == ImageOutputConstants.IMAGE_MODE
+
+    @staticmethod
+    def uploads_use_image_output_mode(profile_manager: ProfileManager | None) -> bool:
+        """Whether uploads to a project are checked against image-mode limits.
+
+        True when the project's default profile is LLMWhisperer in image mode:
+        an upload isn't tied to an output mode, and the same document is fine
+        in a text mode. Fails open — an unreadable adapter config (e.g. metadata
+        encrypted with an old key) must not block uploads; extraction still
+        enforces the limits.
+        """
+        try:
+            return PromptStudioHelper._is_image_output_mode(profile_manager)
+        except Exception:
+            logger.exception("Could not read the default profile's output mode")
+            return False
+
+    @staticmethod
+    def _image_limit_llm_ids(profile_manager: ProfileManager | None) -> list[str]:
+        """The LLM ids whose image limits apply to this profile's extraction."""
+        llm = getattr(profile_manager, "llm", None)
+        llm_id = getattr(llm, "id", None)
+        return [str(llm_id)] if llm_id else []
+
+    @staticmethod
+    def _upload_page_budget(profile_manager: ProfileManager | None) -> Any:
+        """The profile LLM's page budget, or None to use the fixed cap.
+
+        Resolution is local (the adapter's own validation) and never waits on
+        the network: the limits table is served from memory, and a due
+        refresh runs in the background. Any failure, or
+        ``VLM_IMAGE_LIMITS_ENFORCE=false``, falls back to the fixed cap rather
+        than blocking the upload: extraction re-checks against the LLM before
+        anything is converted.
+        """
+        llm = getattr(profile_manager, "llm", None)
+        if llm is None or not model_aware_limits_enabled():
+            return None
+        try:
+            limits, tokens = LLM.image_input_limits_for(
+                str(llm.adapter_id), llm.metadata or {}
+            )
+        except SdkError as e:
+            # The error type only, no traceback: adapter error text stays out of
+            # the log.
+            logger.warning(
+                "Could not resolve image limits for the default profile's LLM "
+                "(%s); using the fixed page cap for the upload check",
+                type(e).__name__,
+            )
+            return None
+        except Exception:
+            # Not the adapter's fault: a defect while resolving the limits.
+            # The upload still falls back to the fixed cap; extraction
+            # re-resolves and fails with a clear reason if this persists.
+            logger.exception(
+                "Internal error resolving image limits for the default "
+                "profile's LLM; using the fixed page cap for the upload check"
+            )
+            return None
+        bounds = extraction_bound_kwargs()
+        return compute_page_budget(
+            limits,
+            context_tokens=tokens,
+            page_ceiling=bounds["page_ceiling"],
+            legacy_cap=bounds["legacy_cap"],
+        )
+
+    @staticmethod
+    def _check_cached_image_extraction(
+        profile_manager: ProfileManager, extracted_text: str, filename: str
+    ) -> None:
+        """Re-check a cached image-mode extraction against the profile's LLM.
+
+        The extraction cache is keyed on the document, profile and x2text
+        config, not the LLM. After a profile switches LLM (e.g. Gemini to
+        Bedrock Claude, 20 images) a cache hit would skip the page-budget
+        check and the prompt would fail at the provider. Uses the page count
+        recorded in the image-mode summary; no-op outside image mode or when
+        the count is unknown (answer time re-checks). Without a resolvable
+        LLM, or with ``VLM_IMAGE_LIMITS_ENFORCE=false``, the fixed page cap
+        applies, as at upload.
+        """
+        if not PromptStudioHelper.uploads_use_image_output_mode(profile_manager):
+            return
+        page_count = LLMWhispererHelper.page_count_from_image_output_summary(
+            extracted_text
+        )
+        if page_count is None:
+            return
+        budget = PromptStudioHelper._upload_page_budget(profile_manager)
+        if budget is None:
+            page_cap = get_fixed_page_cap()
+            if page_count <= page_cap:
+                return
+            raise ExtractionAPIError(
+                f"Failed to extract '{filename}'. "
+                f"{image_limit_codes.IMAGE_PAGE_CAP_EXCEEDED}: "
+                + fixed_cap_message(
+                    page_count,
+                    page_cap,
+                    switch_to="switch this profile to a text output mode",
+                )
+            )
+        if page_count <= budget.max_pages:
+            return
+        raise ExtractionAPIError(
+            f"Failed to extract '{filename}'. "
+            f"{image_limit_codes.IMAGE_PAGE_CAP_EXCEEDED}: "
+            + page_cap_message(page_count, budget, charged=None)
+            + " The document was extracted earlier for a different LLM; "
+            "switch this profile back, or use one whose LLM accepts more pages."
+        )
+
+    @staticmethod
+    def validate_upload_page_count_for_image_mode(
+        file_data: Any, file_type: str, profile_manager: ProfileManager | None = None
+    ) -> None:
+        """Reject, at upload, a PDF with more pages than image mode can answer.
+
+        Call only when ``uploads_use_image_output_mode`` is True. Image mode
+        sends every page to the LLM in one request, so a document over the
+        LLM's page budget can never be answered — and converting it would be
+        billed. Catching it at upload means the user never builds prompts
+        around a document that will fail at indexing.
+
+        ``profile_manager`` is the project's default profile: its LLM's
+        image-request limits set the budget (the same computation the
+        extraction-time pre-check runs). Without a resolvable LLM the fixed
+        cap applies. The file is read in place, not copied into memory. A
+        PDF whose page count can't be read is let through; extraction
+        re-checks it.
+        """
+        if file_type != "application/pdf":
+            return
+        total_page_count = LLMWhispererHelper.pdf_page_count(file_data)
+        file_data.seek(0)
+        if total_page_count is None:
+            return
+        page_count, selection_valid = PromptStudioHelper._selected_page_count(
+            profile_manager, total_page_count
+        )
+        # Named in the message only when the selection narrowed the count,
+        # as the SDK's pre-submit check does.
+        selected_from = total_page_count if page_count != total_page_count else None
+        budget = PromptStudioHelper._upload_page_budget(profile_manager)
+        if budget is not None:
+            if page_count <= budget.max_pages:
+                return
+            profile_name = getattr(profile_manager, "profile_name", "") or "default"
+            raise ImageModePageLimitExceeded(
+                detail=(
+                    page_cap_message(
+                        page_count,
+                        budget,
+                        charged=None,
+                        selected_from=selected_from,
+                        invalid_selection=not selection_valid,
+                    )
+                    + " This check uses the project's default profile "
+                    f"('{profile_name}'); other profiles may allow a different "
+                    "number of pages."
+                )
+            )
+        page_cap = get_fixed_page_cap()
+        if page_count <= page_cap:
+            return
+        raise ImageModePageLimitExceeded(
+            detail=fixed_cap_message(
+                page_count,
+                page_cap,
+                switch_to="switch the project's default profile to a text output mode",
+                selected_from=selected_from,
+                invalid_selection=not selection_valid,
+            )
+        )
+
+    @staticmethod
+    def _selected_page_count(
+        profile_manager: ProfileManager | None, total_page_count: int
+    ) -> tuple[int, bool]:
+        """``(pages the profile's 'Pages to extract' selects, setting valid)``.
+
+        Image mode converts and sends only the selected pages, so the upload
+        check counts those, with the SDK's own counting. Fails open to the
+        whole document when the setting is invalid (``False``: the message
+        must not suggest a smaller range) or unreadable; extraction reports
+        an invalid setting before anything is converted. Failures are logged
+        with their type only: the setting's value is user input, and reading
+        the adapter metadata decrypts it, so an error there can quote
+        credentials (hence no traceback either).
+        """
+        try:
+            x2text = getattr(profile_manager, "x2text", None)
+            metadata = (getattr(x2text, "metadata", None) or {}) if x2text else {}
+            return (
+                LLMWhispererHelper.selected_page_count(metadata, total_page_count),
+                True,
+            )
+        except PageRangeError as e:
+            logger.warning(
+                "The default profile's 'Pages to extract' setting is invalid "
+                "(%s); the upload page check counts all %d pages",
+                type(e).__name__,
+                total_page_count,
+            )
+            return total_page_count, False
+        except Exception as e:
+            logger.error(
+                "Could not apply the default profile's 'Pages to extract' setting "
+                "to the upload page check (%s); counting all %d pages",
+                type(e).__name__,
+                total_page_count,
+            )
+            return total_page_count, True
+
+    @staticmethod
+    def _validate_image_output_pdf_only(
+        profile_manager: ProfileManager, file_name: str
+    ) -> None:
+        """Reject non-PDF inputs when the x2text adapter is in image mode.
+
+        Image output mode (LLMWhisperer V2) supports PDF input only. The SDK
+        adapter enforces this at extraction time; this mirror-check runs just
+        before extraction is dispatched (from ``dynamic_extractor``, the single
+        choke point for every extract path) so the user gets the identical
+        PDF-only message early. The message + PDF test come from the shared
+        ``ImageOutputConstants`` so the two layers cannot drift.
+
+        Gated by ``_is_image_output_mode`` (adapter id AND output mode).
+
+        Also rejects image-mode extraction outright when the cloud plugin
+        package is present but its backend hooks are broken
+        (``vlm_utils.VLM_HOOKS_BROKEN``) — see the inline comment below.
+        """
+        if not PromptStudioHelper._is_image_output_mode(profile_manager):
+            return
+        # Fail-closed on a half-broken cloud install: with the plugin package
+        # present but its backend hooks unimportable, a re-extraction would
+        # rewrite the page images while the answers stored against the old
+        # pages are never invalidated. Blocking image-mode extraction here
+        # (same choke point) is the only safe behavior.
+        if vlm_utils.VLM_HOOKS_BROKEN:
+            raise IndexingAPIError(
+                detail=(
+                    "Image output mode is unavailable: the VLM consumer "
+                    "plugin is installed but failed to load. Contact your "
+                    "administrator, or switch the profile's text extractor "
+                    "to a text output mode."
+                ),
+                status_code=500,
+            )
+        if not ImageOutputConstants.is_pdf(file_name):
+            raise IndexingAPIError(
+                detail=ImageOutputConstants.PDF_ONLY_ERROR,
+                status_code=400,
+            )
+
+    @staticmethod
+    def index_document(
+        tool_id: str,
+        file_name: str,
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        run_id: str = None,
+        request_user: User | None = None,
+    ) -> Any:
+        """Method to index a document.
+
+        Args:
+            tool_id (str): Id of the tool
+            file_name (str): File to parse
+            org_id (str): The ID of the organization to which the user belongs.
+            user_id (str): The ID of the user who uploaded the document.
+
+        Raises:
+            ToolNotValid
+            IndexingError
+        """
+        tool: CustomTool = CustomTool.objects.get(pk=tool_id)
+        file_path = PromptStudioFileHelper.get_or_create_prompt_studio_subdirectory(
+            org_id,
+            is_create=False,
+            user_id=user_id,
+            tool_id=tool_id,
+        )
+        file_path = str(Path(file_path) / file_name)
+
+        # Always get the default profile first
+        default_profile = ProfileManager.get_default_llm_profile(tool)
+        summary_profile = (
+            default_profile  # Constructed profile for summarization, not stored in DB
+        )
+
+        # Check if summarization is enabled and handle accordingly
+        if tool.summarize_context:
+            # Trigger migration if needed
+            SummarizeMigrationUtils.migrate_tool_to_adapter_based(tool)
+
+            if tool.summarize_llm_adapter:
+                # For summarization with adapter-based approach, we'll use the default profile
+                # but override the LLM when needed in the summarization process
+                summary_profile = default_profile
+            else:
+                # Fallback to old profile-based approach
+                try:
+                    profile_manager: ProfileManager = ProfileManager.objects.get(
+                        prompt_studio_tool=tool, is_summarize_llm=True
+                    )
+                    profile_manager.chunk_size = 0
+                    summary_profile = profile_manager
+                except ProfileManager.DoesNotExist:
+                    # If no summarize profile exists, continue with default profile
+                    logger.warning(
+                        f"No summarize profile found for tool {tool_id}, using default profile"
+                    )
+                    summary_profile = default_profile
+
+        # Validate the status of adapter in profile manager
+        PromptStudioHelper.validate_adapter_status(default_profile)
+        # Need to check the user who created profile manager
+        # has access to adapters configured in profile manager
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            default_profile, request_user=request_user
+        )
+
+        # Also validate summary profile if it's different from default
+        if tool.summarize_context and summary_profile != default_profile:
+            PromptStudioHelper.validate_adapter_status(summary_profile)
+            PromptStudioHelper.validate_profile_manager_owner_access(
+                summary_profile, request_user=request_user
+            )
+
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        util = PromptIdeBaseTool(log_level=LogLevel.INFO, org_id=org_id)
+        doc_id = IndexingUtils.generate_index_key(
+            vector_db=str(default_profile.vector_store.id),
+            embedding=str(default_profile.embedding_model.id),
+            x2text=str(default_profile.x2text.id),
+            chunk_size=str(default_profile.chunk_size),
+            chunk_overlap=str(default_profile.chunk_overlap),
+            file_path=file_path,
+            file_hash=None,
+            fs=fs_instance,
+            tool=util,
+        )
+
+        extracted_text = PromptStudioHelper.dynamic_extractor(
+            profile_manager=default_profile,
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            enable_highlight=tool.enable_highlight,
+        )
+        if tool.summarize_context:
+            summarize_file_path = PromptStudioHelper.summarize(
+                file_name, org_id, run_id, tool
+            )
+            summarize_doc_id = IndexingUtils.generate_index_key(
+                vector_db=str(summary_profile.vector_store.id),
+                embedding=str(summary_profile.embedding_model.id),
+                x2text=str(summary_profile.x2text.id),
+                chunk_size="0",  # Summarization always uses chunk_size=0
+                chunk_overlap=str(summary_profile.chunk_overlap),
+                file_path=summarize_file_path,
+                fs=fs_instance,
+                tool=util,
+            )
+            PromptStudioIndexHelper.handle_index_manager(
+                document_id=document_id,
+                is_summary=True,
+                profile_manager=summary_profile,
+                doc_id=summarize_doc_id,
+            )
+        start_time = time.time()
+        logger.info(f"[{tool_id}] Indexing started for doc: {file_name}")
+        PromptStudioHelper._publish_log(
+            {"tool_id": tool_id, "run_id": run_id, "doc_name": file_name},
+            LogLevels.INFO,
+            LogLevels.RUN,
+            "Indexing started",
+        )
+        PromptStudioHelper.dynamic_indexer(
+            profile_manager=default_profile,
+            tool_id=tool_id,
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            reindex=True,
+            run_id=run_id,
+            user_id=user_id,
+            enable_highlight=tool.enable_highlight,
+            extracted_text=extracted_text,
+            doc_id_key=doc_id,
+        )
+
+        elapsed_time = time.time() - start_time
+        logger.info(
+            f"[{tool_id}] Indexing successful for doc: {file_name},"
+            f" took {elapsed_time:.3f}s"
+        )
+        logger.info(f"[{tool_id}] Indexing successful for doc: {file_name}")
+        PromptStudioHelper._publish_log(
+            {"tool_id": tool_id, "run_id": run_id, "doc_name": file_name},
+            LogLevels.INFO,
+            LogLevels.RUN,
+            f"Indexing successful, took {elapsed_time:.3f}s",
+        )
+        logger.info(f"Indexing successful : {doc_id}")
+        return doc_id
+
+    @staticmethod
+    def summarize(file_name, org_id, run_id, tool) -> str:
+        summarizer_plugin = get_plugin("summarizer")
+        usage_kwargs: dict[Any, Any] = dict()
+        usage_kwargs[ToolStudioPromptKeys.RUN_ID] = run_id
+        prompts: list[ToolStudioPrompt] = PromptStudioHelper.fetch_prompt_from_tool(
+            tool.tool_id
+        )
+        if summarizer_plugin:
+            summarizer_service = summarizer_plugin["service_class"]()
+            summarize_file_path = summarizer_service.process(
+                tool_id=str(tool.tool_id),
+                file_name=file_name,
+                org_id=org_id,
+                user_id=tool.created_by.user_id,
+                usage_kwargs=usage_kwargs.copy(),
+                prompts=prompts,
+            )
+            # Trigger migration if needed
+            SummarizeMigrationUtils.migrate_tool_to_adapter_based(tool)
+
+            # Validate that summarization is properly configured
+            if not tool.summarize_llm_adapter:
+                # Fallback to old approach if no adapter - just validate it exists
+                try:
+                    ProfileManager.objects.get(
+                        prompt_studio_tool=tool, is_summarize_llm=True
+                    )
+                except ProfileManager.DoesNotExist:
+                    logger.warning(
+                        f"No summarize profile found for tool {tool.tool_id}, using default profile"
+                    )
+
+            return summarize_file_path
+
+    @staticmethod
+    def prompt_responder(
+        tool_id: str,
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        id: str | None = None,
+        run_id: str = None,
+        profile_manager_id: str | None = None,
+        request_user: User | None = None,
+    ) -> Any:
+        """Execute chain/single run of the prompts. Makes a call to prompt
+        service and returns the dict of response.
+
+        Args:
+            tool_id (str): ID of tool created in prompt studio
+            org_id (str): Organization ID
+            user_id (str): User's ID
+            document_id (str): UUID of the document uploaded
+            id (Optional[str]): ID of the prompt
+            profile_manager_id (Optional[str]): UUID of the profile manager
+
+        Raises:
+            AnswerFetchError: Error from prompt-service
+
+        Returns:
+            Any: Dictionary containing the response from prompt-service
+        """
+        document: DocumentManager = DocumentManager.objects.get(pk=document_id)
+        doc_name: str = document.document_name
+        doc_path = PromptStudioHelper._get_document_path(
+            org_id, user_id, tool_id, doc_name
+        )
+
+        if id:
+            return PromptStudioHelper._execute_single_prompt(
+                id=id,
+                doc_path=doc_path,
+                doc_name=doc_name,
+                tool_id=tool_id,
+                org_id=org_id,
+                user_id=user_id,
+                document_id=document_id,
+                run_id=run_id,
+                profile_manager_id=profile_manager_id,
+                request_user=request_user,
+            )
+        else:
+            return PromptStudioHelper._execute_prompts_in_single_pass(
+                doc_path=doc_path,
+                doc_name=doc_name,
+                tool_id=tool_id,
+                org_id=org_id,
+                document_id=document_id,
+                run_id=run_id,
+                request_user=request_user,
+            )
+
+    @staticmethod
+    def _execute_single_prompt(
+        id,
+        doc_path,
+        doc_name,
+        tool_id,
+        org_id,
+        user_id,
+        document_id,
+        run_id,
+        profile_manager_id,
+        request_user: User | None = None,
+    ):
+        prompt_instance = PromptStudioHelper._fetch_prompt_from_id(id)
+
+        # Check if payload modifier plugin is available for table/record operations
+        payload_modifier_plugin = get_plugin("payload_modifier")
+        if (
+            prompt_instance.enforce_type == TSPKeys.TABLE
+            or prompt_instance.enforce_type == TSPKeys.RECORD
+            or prompt_instance.enforce_type == TSPKeys.AGENTIC_TABLE
+        ) and not payload_modifier_plugin:
+            raise OperationNotSupported()
+
+        prompt_name = prompt_instance.prompt_key
+        PromptStudioHelper._publish_log(
+            {
+                "tool_id": tool_id,
+                "run_id": run_id,
+                "prompt_key": prompt_name,
+                "doc_name": doc_name,
+            },
+            LogLevels.INFO,
+            LogLevels.RUN,
+            "Executing single prompt",
+        )
+        prompts = [prompt_instance]
+        tool = prompt_instance.tool_id
+
+        PromptStudioHelper._publish_log(
+            {
+                "tool_id": tool_id,
+                "run_id": run_id,
+                "prompt_key": prompt_name,
+                "doc_name": doc_name,
+            },
+            LogLevels.DEBUG,
+            LogLevels.RUN,
+            "Invoking prompt service",
+        )
+        try:
+            if (
+                prompt_instance.enforce_type == TSPKeys.AGENTIC_TABLE
+                and payload_modifier_plugin
+            ):
+                modifier_service = payload_modifier_plugin["service_class"]()
+                response = modifier_service.execute_agentic_table(
+                    tool_id=tool_id,
+                    prompt_id=str(prompt_instance.prompt_id),
+                    prompt_key=prompt_name,
+                    prompt=prompt_instance.prompt,
+                    doc_path=doc_path,
+                    doc_name=doc_name,
+                    org_id=org_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                )
+            else:
+                response = PromptStudioHelper._fetch_response(
+                    doc_path=doc_path,
+                    doc_name=doc_name,
+                    tool=tool,
+                    prompt=prompt_instance,
+                    org_id=org_id,
+                    document_id=document_id,
+                    run_id=run_id,
+                    profile_manager_id=profile_manager_id,
+                    user_id=user_id,
+                    request_user=request_user,
+                )
+            # Book the output against the profile the run actually used, the
+            # same ladder _fetch_response applies. Forwarding the raw (possibly
+            # None) argument makes _handle_response re-resolve the project
+            # default, so a prompt carrying its own FK would run under that FK
+            # but have its output stored under the project default.
+            resolved_profile_id = str(
+                PromptStudioHelper._resolve_profile_manager(
+                    tool=tool,
+                    prompt=prompt_instance,
+                    profile_manager_id=profile_manager_id,
+                ).profile_id
+            )
+
+            return PromptStudioHelper._handle_response(
+                response=response,
+                run_id=run_id,
+                prompts=prompts,
+                document_id=document_id,
+                is_single_pass=False,
+                profile_manager_id=resolved_profile_id,
+            )
+        except APIException:
+            # Validation responses are user-facing; DRF renders them as-is.
+            raise
+        except Exception as e:
+            logger.error(
+                f"[{tool.tool_id}] Error while fetching response for "
+                f"prompt {id} and doc {document_id}: {e}"
+            )
+            msg = str(e)
+            PromptStudioHelper._publish_log(
+                {
+                    "tool_id": tool_id,
+                    "run_id": run_id,
+                    "prompt_key": prompt_name,
+                    "doc_name": doc_name,
+                },
+                LogLevels.ERROR,
+                LogLevels.RUN,
+                msg,
+            )
+            raise e
+
+    @staticmethod
+    def _execute_prompts_in_single_pass(
+        doc_path,
+        doc_name,
+        tool_id,
+        org_id,
+        document_id,
+        run_id,
+        request_user: User | None = None,
+    ):
+        prompts = PromptStudioHelper.fetch_prompt_from_tool(tool_id)
+        prompts = [
+            prompt
+            for prompt in prompts
+            if prompt.prompt_type != TSPKeys.NOTES
+            and prompt.active
+            and prompt.enforce_type != TSPKeys.TABLE
+            and prompt.enforce_type != TSPKeys.RECORD
+        ]
+        if not prompts:
+            logger.error(f"[{tool_id or 'NA'}] No prompts found for id: {id}")
+            raise NoPromptsFound()
+
+        PromptStudioHelper._publish_log(
+            {"tool_id": tool_id, "run_id": run_id, "prompt_id": str(id)},
+            LogLevels.INFO,
+            LogLevels.RUN,
+            "Executing prompts in single pass",
+        )
+        try:
+            tool = prompts[0].tool_id
+            response = PromptStudioHelper._fetch_single_pass_response(
+                input_file_path=doc_path,
+                doc_name=doc_name,
+                tool=tool,
+                prompts=prompts,
+                org_id=org_id,
+                document_id=document_id,
+                run_id=run_id,
+                request_user=request_user,
+            )
+            return PromptStudioHelper._handle_response(
+                response=response,
+                run_id=run_id,
+                prompts=prompts,
+                document_id=document_id,
+                is_single_pass=True,
+            )
+        except APIException:
+            # Validation responses are user-facing; DRF renders them as-is.
+            raise
+        except Exception as e:
+            logger.error(
+                f"[{tool.tool_id}] Error while fetching single pass response: {e}"
+            )
+            PromptStudioHelper._publish_log(
+                {
+                    "tool_id": tool_id,
+                    "run_id": run_id,
+                    "prompt_id": str(id),
+                },
+                LogLevels.ERROR,
+                LogLevels.RUN,
+                f"Failed to fetch single pass response. {e}",
+            )
+            raise e
+
+    @staticmethod
+    def _get_document_path(org_id, user_id, tool_id, doc_name):
+        doc_path = PromptStudioFileHelper.get_or_create_prompt_studio_subdirectory(
+            org_id=org_id,
+            user_id=user_id,
+            tool_id=tool_id,
+            is_create=False,
+        )
+        return str(Path(doc_path) / doc_name)
+
+    @staticmethod
+    def _get_extract_or_summary_document_path(
+        org_id, user_id, tool_id, doc_name, doc_type
+    ) -> str:
+        doc_path = PromptStudioFileHelper.get_or_create_prompt_studio_subdirectory(
+            org_id=org_id,
+            user_id=user_id,
+            tool_id=tool_id,
+            is_create=False,
+        )
+        extracted_doc_name = Path(doc_name).stem + TSPKeys.TXT_EXTENTION
+        return str(Path(doc_path) / doc_type / extracted_doc_name)
+
+    @staticmethod
+    def _handle_response(
+        response,
+        run_id,
+        prompts,
+        document_id,
+        is_single_pass,
+        profile_manager_id=None,
+    ):
+        if response.get("status") == IndexingStatus.PENDING_STATUS.value:
+            return {
+                "status": IndexingStatus.PENDING_STATUS.value,
+                "message": IndexingStatus.DOCUMENT_BEING_INDEXED.value,
+            }
+
+        outputs = response["output"]
+        metadata = response["metadata"]
+        # Same guard as the internal API (UN-4017). This is the in-backend
+        # execution path — it dispatches the identical single_pass_extraction
+        # executor, so it can receive the identical bad shape. Without this,
+        # handle_prompt_output_update does outputs.get(prompt.prompt_key) on a
+        # list and raises AttributeError, which surfaces as a bare 500.
+        # `metadata` is indexed five times at the top of
+        # handle_prompt_output_update, unconditionally and before its
+        # `if not prompts` early exit, so it has the same exposure as `outputs`
+        # and had been left unchecked here.
+        for field_name, value in (("outputs", outputs), ("metadata", metadata)):
+            if isinstance(value, dict):
+                continue
+            # Name the type rather than asserting a shape: this fires for
+            # NoneType, int and bool too, and "LLM returned a JSON array
+            # (got NoneType)" contradicts itself.
+            detail = (
+                f"LLM response could not be used as the {field_name} map — a "
+                "single JSON object keyed by field name is expected (got "
+                f"{type(value).__name__})."
+            )
+            # Only for `outputs`. `metadata` is assembled by the executor, not
+            # returned by the LLM, so telling the user to rephrase a prompt
+            # would be a dead end for a defect that is ours — the same
+            # misdirection the shape claim above was rewritten to avoid.
+            if is_single_pass and field_name == "outputs":
+                detail += (
+                    " In single-pass extraction all prompts share one response,"
+                    " so a prompt that asks for a list or for separate JSON"
+                    " entries can change the shape of the entire result."
+                    " Rephrase that prompt to describe the value of its own"
+                    " field, or run these prompts with single-pass extraction"
+                    " turned off."
+                )
+            logger.error("%s run_id=%s document_id=%s", detail, run_id, document_id)
+            raise AnswerFetchError(detail, status_code=422)
+
+        return OutputManagerHelper.handle_prompt_output_update(
+            run_id=run_id,
+            prompts=prompts,
+            outputs=outputs,
+            document_id=document_id,
+            is_single_pass_extract=is_single_pass,
+            profile_manager_id=profile_manager_id,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _fetch_response(
+        tool: CustomTool,
+        doc_path: str,
+        doc_name: str,
+        prompt: ToolStudioPrompt,
+        org_id: str,
+        document_id: str,
+        run_id: str,
+        user_id: str,
+        profile_manager_id: str | None = None,
+        request_user: User | None = None,
+    ) -> Any:
+        """Utility function to invoke prompt service. Used internally.
+
+        Args:
+            tool (CustomTool): CustomTool instance (prompt studio project)
+            doc_path (str): Path to the document
+            doc_name (str): Name of the document
+            prompt (ToolStudioPrompt): ToolStudioPrompt instance to fetch response
+            org_id (str): UUID of the organization
+            document_id (str): UUID of the document
+            profile_manager_id (Optional[str]): UUID of the profile manager
+            user_id (str): The ID of the user who uploaded the document
+
+
+        Raises:
+            DefaultProfileError: If no default profile is selected
+            AnswerFetchError: Due to failures in prompt service
+
+        Returns:
+            Any: Output from LLM
+        """
+        # Fetch the ProfileManager instance using the profile_manager_id if provided
+        profile_manager = PromptStudioHelper._resolve_profile_manager(
+            tool=tool, prompt=prompt, profile_manager_id=profile_manager_id
+        )
+
+        monitor_llm_instance: AdapterInstance | None = tool.monitor_llm
+        monitor_llm: str | None = None
+        challenge_llm_instance: AdapterInstance | None = tool.challenge_llm
+        challenge_llm: str | None = None
+        if monitor_llm_instance:
+            monitor_llm = str(monitor_llm_instance.id)
+        else:
+            # Using default profile manager llm if monitor_llm is None
+            default_profile = ProfileManager.get_default_llm_profile(tool)
+            monitor_llm = str(default_profile.llm.id)
+
+        # Using default profile manager llm if challenge_llm is None
+        if challenge_llm_instance:
+            challenge_llm = str(challenge_llm_instance.id)
+        else:
+            default_profile = ProfileManager.get_default_llm_profile(tool)
+            challenge_llm = str(default_profile.llm.id)
+
+        # Need to check the user who created profile manager
+        PromptStudioHelper.validate_adapter_status(profile_manager)
+        # Need to check the user who created profile manager
+        # has access to adapters
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            profile_manager, request_user=request_user
+        )
+        # Not checking reindex here as there might be
+        # change in Profile Manager
+        vector_db = str(profile_manager.vector_store.id)
+        embedding_model = str(profile_manager.embedding_model.id)
+        llm = str(profile_manager.llm.id)
+        x2text = str(profile_manager.x2text.id)
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        util = PromptIdeBaseTool(log_level=LogLevel.INFO, org_id=org_id)
+        file_path = doc_path
+        directory, filename = os.path.split(doc_path)
+        doc_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+        is_summary = tool.summarize_as_source
+        logger.info(f"Summary status : {is_summary}")
+        logger.info(
+            f"Passing file_path for fetching answer "
+            f"{file_path} : extraction path {doc_path}"
+        )
+        doc_id = IndexingUtils.generate_index_key(
+            vector_db=str(profile_manager.vector_store.id),
+            embedding=str(profile_manager.embedding_model.id),
+            x2text=str(profile_manager.x2text.id),
+            chunk_size=str(profile_manager.chunk_size),
+            chunk_overlap=str(profile_manager.chunk_overlap),
+            file_path=file_path,
+            file_hash=None,
+            fs=fs_instance,
+            tool=util,
+        )
+        logger.info(f"Extracting text from {file_path} for {doc_id}")
+        extracted_text = PromptStudioHelper.dynamic_extractor(
+            profile_manager=profile_manager,
+            file_path=file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            enable_highlight=tool.enable_highlight,
+        )
+        logger.info(f"Extracted text from {file_path} for {doc_id}")
+        if is_summary:
+            profile_manager.chunk_size = 0
+            doc_path = Path(doc_path)  # Convert string to Path object
+            doc_path = str(
+                doc_path.parent.parent / "summarize" / (doc_path.stem + ".txt")
+            )
+            logger.info("Summary enabled, set chunk to zero..")
+        logger.info(f"Indexing document {doc_path} for {doc_id}")
+        index_result = PromptStudioHelper.dynamic_indexer(
+            profile_manager=profile_manager,
+            file_path=file_path,
+            tool_id=str(tool.tool_id),
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            user_id=user_id,
+            enable_highlight=tool.enable_highlight,
+            extracted_text=extracted_text,
+            doc_id_key=doc_id,
+        )
+        if index_result.get("status") == IndexingStatus.PENDING_STATUS.value:
+            return {
+                "status": IndexingStatus.PENDING_STATUS.value,
+                "message": IndexingStatus.DOCUMENT_BEING_INDEXED.value,
+            }
+        tool_id = str(tool.tool_id)
+        output: dict[str, Any] = {}
+        outputs: list[dict[str, Any]] = []
+        grammer_dict = {}
+        grammar_list = []
+        # Adding validations
+        prompt_grammer = tool.prompt_grammer
+        if prompt_grammer:
+            for word, synonyms in prompt_grammer.items():
+                synonyms = prompt_grammer[word]
+                grammer_dict[TSPKeys.WORD] = word
+                grammer_dict[TSPKeys.SYNONYMS] = synonyms
+                grammar_list.append(grammer_dict)
+                grammer_dict = {}
+
+        output[TSPKeys.PROMPT] = prompt.prompt
+        output[TSPKeys.ACTIVE] = prompt.active
+        output[TSPKeys.REQUIRED] = prompt.required
+        logger.info(f"Chunk size set to {profile_manager.chunk_size} ")
+        output[TSPKeys.CHUNK_SIZE] = profile_manager.chunk_size
+        output[TSPKeys.VECTOR_DB] = vector_db
+        output[TSPKeys.EMBEDDING] = embedding_model
+        output[TSPKeys.CHUNK_OVERLAP] = profile_manager.chunk_overlap
+        output[TSPKeys.LLM] = llm
+        output[TSPKeys.TYPE] = prompt.enforce_type
+        output[TSPKeys.NAME] = prompt.prompt_key
+        output[TSPKeys.RETRIEVAL_STRATEGY] = profile_manager.retrieval_strategy
+        output[TSPKeys.SIMILARITY_TOP_K] = profile_manager.similarity_top_k
+        output[TSPKeys.SECTION] = profile_manager.section
+        output[TSPKeys.X2TEXT_ADAPTER] = x2text
+        PromptStudioHelper._stamp_x2text_output_mode(output, profile_manager)
+        # Webhook postprocessing settings
+        webhook_enabled = bool(prompt.enable_postprocessing_webhook)
+        webhook_url = (prompt.postprocessing_webhook_url or "").strip()
+        if webhook_enabled and not webhook_url:
+            logger.warning(
+                "Postprocessing webhook enabled but URL missing for prompt %s; disabling.",
+                prompt.prompt_key,
+            )
+            webhook_enabled = False
+        output[TSPKeys.ENABLE_POSTPROCESSING_WEBHOOK] = webhook_enabled
+        if webhook_enabled:
+            output[TSPKeys.POSTPROCESSING_WEBHOOK_URL] = webhook_url
+        if lookup_config := get_lookup_config(prompt):
+            output["lookup_config"] = lookup_config
+        # Eval settings for the prompt
+        output[TSPKeys.EVAL_SETTINGS] = {}
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_EVALUATE] = prompt.evaluate
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_MONITOR_LLM] = [monitor_llm]
+        output[TSPKeys.EVAL_SETTINGS][TSPKeys.EVAL_SETTINGS_EXCLUDE_FAILED] = (
+            tool.exclude_failed
+        )
+        for attr in dir(prompt):
+            if attr.startswith(TSPKeys.EVAL_METRIC_PREFIX):
+                attr_val = getattr(prompt, attr)
+                output[TSPKeys.EVAL_SETTINGS][attr] = attr_val
+
+        output = PromptStudioHelper.fetch_table_settings_if_enabled(
+            doc_name, prompt, org_id, user_id, tool_id, output
+        )
+        variable_map = PromptStudioVariableService.frame_variable_replacement_map(
+            doc_id=document_id, prompt_object=prompt
+        )
+        if variable_map:
+            output[TSPKeys.VARIABLE_MAP] = variable_map
+        outputs.append(output)
+
+        tool_settings = {}
+        tool_settings[TSPKeys.ENABLE_CHALLENGE] = tool.enable_challenge
+        tool_settings[TSPKeys.CHALLENGE_LLM] = challenge_llm
+        tool_settings[TSPKeys.SINGLE_PASS_EXTRACTION_MODE] = (
+            tool.single_pass_extraction_mode
+        )
+        tool_settings[TSPKeys.SUMMARIZE_AS_SOURCE] = tool.summarize_as_source
+        tool_settings[TSPKeys.PREAMBLE] = tool.preamble
+        tool_settings[TSPKeys.POSTAMBLE] = tool.postamble
+        tool_settings[TSPKeys.GRAMMAR] = grammar_list
+        tool_settings[TSPKeys.ENABLE_HIGHLIGHT] = tool.enable_highlight
+        tool_settings[TSPKeys.ENABLE_WORD_CONFIDENCE] = tool.enable_word_confidence
+        tool_settings[TSPKeys.PLATFORM_POSTAMBLE] = getattr(
+            settings, TSPKeys.PLATFORM_POSTAMBLE.upper(), ""
+        )
+        tool_settings[TSPKeys.WORD_CONFIDENCE_POSTAMBLE] = getattr(
+            settings, TSPKeys.WORD_CONFIDENCE_POSTAMBLE.upper(), ""
+        )
+        file_hash = fs_instance.get_hash_from_file(path=doc_path)
+
+        payload = {
+            TSPKeys.TOOL_SETTINGS: tool_settings,
+            TSPKeys.OUTPUTS: outputs,
+            TSPKeys.TOOL_ID: tool_id,
+            TSPKeys.RUN_ID: run_id,
+            TSPKeys.FILE_NAME: doc_name,
+            TSPKeys.FILE_HASH: file_hash,
+            TSPKeys.FILE_PATH: doc_path,
+            Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            TSPKeys.CUSTOM_DATA: tool.custom_data,
+        }
+
+        # Add platform API key and metadata flag for executor
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+        payload[ToolStudioKeys.PLATFORM_SERVICE_API_KEY] = platform_api_key
+        payload[TSPKeys.INCLUDE_METADATA] = True
+
+        dispatcher = PromptStudioHelper._get_dispatcher()
+        context = ExecutionContext(
+            executor_name="legacy",
+            operation="answer_prompt",
+            run_id=run_id,
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params=payload,
+            request_id=StateStore.get(Common.REQUEST_ID),
+            log_events_id=StateStore.get(Common.LOG_EVENTS_ID),
+        )
+        result = dispatcher.dispatch(context)
+        if not result.success:
+            raise AnswerFetchError(
+                "Error while fetching response for "
+                f"'{prompt.prompt_key}' with '{doc_name}'. {result.error}",
+            )
+        return result.data
+
+    @staticmethod
+    def fetch_table_settings_if_enabled(
+        doc_name: str,
+        prompt: ToolStudioPrompt,
+        org_id: str,
+        user_id: str,
+        tool_id: str,
+        output: dict[str, Any],
+    ) -> dict[str, Any]:
+        if prompt.enforce_type == TSPKeys.TABLE or prompt.enforce_type == TSPKeys.RECORD:
+            extract_doc_path: str = (
+                PromptStudioHelper._get_extract_or_summary_document_path(
+                    org_id, user_id, tool_id, doc_name, TSPKeys.EXTRACT
+                )
+            )
+            # Update output with payload modifier plugin if available
+            payload_modifier_plugin = get_plugin("payload_modifier")
+            if payload_modifier_plugin:
+                modifier_service = payload_modifier_plugin["service_class"]()
+                output = modifier_service.update(
+                    output=output,
+                    tool_id=tool_id,
+                    prompt_id=str(prompt.prompt_id),
+                    prompt=prompt.prompt,
+                    input_file=extract_doc_path,
+                    clean_pages=True,
+                )
+
+        return output
+
+    @staticmethod
+    def dynamic_indexer(
+        profile_manager: ProfileManager,
+        tool_id: str,
+        file_path: str,
+        org_id: str,
+        document_id: str,
+        user_id: str,
+        extracted_text: str,
+        reindex: bool = False,
+        run_id: str = None,
+        enable_highlight: bool = False,
+        doc_id_key: str | None = None,
+    ) -> Any:
+        """Used to index a file based on the passed arguments.
+
+        This is useful when a file needs to be indexed dynamically as the
+        parameters meant for indexing changes. The file
+
+        Args:
+            profile_manager (ProfileManager): Profile manager instance that hold
+                values such as chunk size, chunk overlap and adapter IDs
+            tool_id (str): UUID of the prompt studio tool
+            file_path (str): Path to the file that needs to be indexed
+            org_id (str): ID of the organization
+            is_summary (bool, optional): Flag to ensure if extracted contents
+                need to be persisted.  Defaults to False.
+            user_id (str): The ID of the user who uploaded the document
+
+        Returns:
+            str: Index key for the combination of arguments
+        """
+        if profile_manager.chunk_size == 0:
+            PromptStudioIndexHelper.handle_index_manager(
+                document_id=document_id,
+                profile_manager=profile_manager,
+                doc_id=doc_id_key,
+            )
+            logger.info("Skipping addition of nodes to VectoDB since chunk size is 0")
+            return {
+                "status": IndexingStatus.COMPLETED_STATUS.value,
+                "output": doc_id_key,
+            }
+
+        embedding_model = str(profile_manager.embedding_model.id)
+        vector_db = str(profile_manager.vector_store.id)
+        x2text_adapter = str(profile_manager.x2text.id)
+        directory, filename = os.path.split(file_path)
+        file_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+        try:
+            usage_kwargs = {"run_id": run_id}
+            # Orginal file name with which file got uploaded in prompt studio
+            usage_kwargs["file_name"] = filename
+
+            if not reindex:
+                indexed_doc_id = DocumentIndexingService.get_indexed_document_id(
+                    org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+                )
+                if indexed_doc_id:
+                    return {
+                        "status": IndexingStatus.COMPLETED_STATUS.value,
+                        "output": indexed_doc_id,
+                    }
+                # Wait for in-progress indexing instead of returning PENDING
+                wait_result = PromptStudioHelper._wait_for_indexing(
+                    org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+                )
+                if wait_result is not None:
+                    return wait_result
+                # wait_result is None → indexing failed; fall through to
+                # re-index below
+
+            # Set the document as being indexed
+            DocumentIndexingService.set_document_indexing(
+                org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+            )
+            logger.info(f"Invoking prompt service for indexing : {doc_id_key}")
+            payload = {
+                IKeys.TOOL_ID: tool_id,
+                IKeys.EMBEDDING_INSTANCE_ID: embedding_model,
+                IKeys.VECTOR_DB_INSTANCE_ID: vector_db,
+                IKeys.X2TEXT_INSTANCE_ID: x2text_adapter,
+                IKeys.FILE_PATH: file_path,
+                IKeys.FILE_HASH: None,
+                IKeys.CHUNK_OVERLAP: profile_manager.chunk_overlap,
+                IKeys.CHUNK_SIZE: profile_manager.chunk_size,
+                IKeys.REINDEX: reindex,
+                IKeys.ENABLE_HIGHLIGHT: enable_highlight,
+                IKeys.USAGE_KWARGS: usage_kwargs.copy(),
+                IKeys.EXTRACTED_TEXT: extracted_text,
+                IKeys.RUN_ID: run_id,
+                Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+                TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            }
+
+            # Add platform API key for executor
+            platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+            payload["platform_api_key"] = platform_api_key
+
+            dispatcher = PromptStudioHelper._get_dispatcher()
+            index_context = ExecutionContext(
+                executor_name="legacy",
+                operation="index",
+                run_id=run_id or str(uuid.uuid4()),
+                execution_source="ide",
+                organization_id=org_id,
+                executor_params=payload,
+                request_id=StateStore.get(Common.REQUEST_ID),
+                log_events_id=StateStore.get(Common.LOG_EVENTS_ID),
+            )
+            result = dispatcher.dispatch(index_context)
+            if not result.success:
+                raise IndexingAPIError(
+                    f"Failed to index '{filename}'. {result.error}",
+                )
+            doc_id = result.data.get("doc_id")
+
+            PromptStudioIndexHelper.handle_index_manager(
+                document_id=document_id,
+                profile_manager=profile_manager,
+                doc_id=doc_id,
+            )
+            DocumentIndexingService.mark_document_indexed(
+                org_id=org_id, user_id=user_id, doc_id_key=doc_id_key, doc_id=doc_id
+            )
+            return {"status": IndexingStatus.COMPLETED_STATUS.value, "output": doc_id}
+        except (IndexingError, IndexingAPIError, SdkError) as e:
+            # Clear the indexing flag so subsequent requests are not blocked
+            try:
+                DocumentIndexingService.remove_document_indexing(
+                    org_id=org_id, user_id=user_id, doc_id_key=doc_id_key
+                )
+            except Exception:
+                logger.exception("Failed to clear indexing flag for %s", doc_id_key)
+            msg = str(e)
+            if isinstance(e, SdkError) and hasattr(e.actual_err, "response"):
+                msg = e.actual_err.response.json().get("error", str(e))
+
+            msg = f"Error while indexing '{filename}'. {msg}"
+            logger.error(msg, stack_info=True, exc_info=True)
+            PromptStudioHelper._publish_log(
+                {"tool_id": tool_id, "run_id": run_id, "doc_name": filename},
+                LogLevels.ERROR,
+                LogLevels.RUN,
+                msg,
+            )
+            raise IndexingAPIError(msg) from e
+
+    @staticmethod
+    def _fetch_single_pass_response(
+        tool: CustomTool,
+        input_file_path: str,
+        doc_name: str,
+        prompts: list[ToolStudioPrompt],
+        org_id: str,
+        document_id: str,
+        run_id: str = None,
+        request_user: User | None = None,
+    ) -> Any:
+        tool_id: str = str(tool.tool_id)
+        outputs: list[dict[str, Any]] = []
+        grammar: list[dict[str, Any]] = []
+        prompt_grammar = tool.prompt_grammer
+        default_profile = ProfileManager.get_default_llm_profile(tool)
+        if not default_profile:
+            raise DefaultProfileError()
+
+        challenge_llm_instance: AdapterInstance | None = tool.challenge_llm
+        challenge_llm: str | None = None
+        # Using default profile manager llm if challenge_llm is None
+        if challenge_llm_instance:
+            challenge_llm = str(challenge_llm_instance.id)
+        else:
+            challenge_llm = str(default_profile.llm.id)
+        # Need to check the user who created profile manager
+        PromptStudioHelper.validate_adapter_status(default_profile)
+        # has access to adapters configured in profile manager
+        PromptStudioHelper.validate_profile_manager_owner_access(
+            default_profile, request_user=request_user
+        )
+        default_profile.chunk_size = 0  # To retrive full context
+        if prompt_grammar:
+            for word, synonyms in prompt_grammar.items():
+                grammar.append({TSPKeys.WORD: word, TSPKeys.SYNONYMS: synonyms})
+
+        fs_instance = EnvHelper.get_storage(
+            storage_type=StorageType.PERMANENT,
+            env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+        )
+        directory, filename = os.path.split(input_file_path)
+        file_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+        PromptStudioHelper.dynamic_extractor(
+            profile_manager=default_profile,
+            file_path=input_file_path,
+            org_id=org_id,
+            document_id=document_id,
+            run_id=run_id,
+            enable_highlight=tool.enable_highlight,
+        )
+        # Indexing is not needed as Single pass is always non chunked.
+        vector_db = str(default_profile.vector_store.id)
+        embedding_model = str(default_profile.embedding_model.id)
+        llm = str(default_profile.llm.id)
+        x2text = str(default_profile.x2text.id)
+        tool_settings = {}
+        tool_settings[TSPKeys.PREAMBLE] = tool.preamble
+        tool_settings[TSPKeys.POSTAMBLE] = tool.postamble
+        tool_settings[TSPKeys.GRAMMAR] = grammar
+        tool_settings[TSPKeys.LLM] = llm
+        tool_settings[TSPKeys.X2TEXT_ADAPTER] = x2text
+        tool_settings[TSPKeys.VECTOR_DB] = vector_db
+        tool_settings[TSPKeys.EMBEDDING] = embedding_model
+        tool_settings[TSPKeys.CHUNK_SIZE] = default_profile.chunk_size
+        tool_settings[TSPKeys.CHUNK_OVERLAP] = default_profile.chunk_overlap
+        tool_settings[TSPKeys.ENABLE_CHALLENGE] = tool.enable_challenge
+        tool_settings[TSPKeys.ENABLE_HIGHLIGHT] = tool.enable_highlight
+        tool_settings[TSPKeys.ENABLE_WORD_CONFIDENCE] = tool.enable_word_confidence
+        tool_settings[TSPKeys.CHALLENGE_LLM] = challenge_llm
+        tool_settings[TSPKeys.PLATFORM_POSTAMBLE] = getattr(
+            settings, TSPKeys.PLATFORM_POSTAMBLE.upper(), ""
+        )
+        tool_settings[TSPKeys.WORD_CONFIDENCE_POSTAMBLE] = getattr(
+            settings, TSPKeys.WORD_CONFIDENCE_POSTAMBLE.upper(), ""
+        )
+        tool_settings[TSPKeys.SUMMARIZE_AS_SOURCE] = tool.summarize_as_source
+        tool_settings[TSPKeys.RETRIEVAL_STRATEGY] = (
+            default_profile.retrieval_strategy or TSPKeys.SIMPLE
+        )
+        tool_settings[TSPKeys.SIMILARITY_TOP_K] = default_profile.similarity_top_k
+        for prompt in prompts:
+            if not prompt.prompt:
+                raise EmptyPromptError()
+            output: dict[str, Any] = {}
+            output[TSPKeys.PROMPT] = prompt.prompt
+            output[TSPKeys.ACTIVE] = prompt.active
+            output[TSPKeys.TYPE] = prompt.enforce_type
+            output[TSPKeys.NAME] = prompt.prompt_key
+            outputs.append(output)
+
+        if tool.summarize_as_source:
+            path = Path(file_path)
+            file_path = str(path.parent.parent / TSPKeys.SUMMARIZE / (path.stem + ".txt"))
+        file_hash = fs_instance.get_hash_from_file(path=file_path)
+        logger.info("payload constructued, calling prompt service..")
+        payload = {
+            TSPKeys.TOOL_SETTINGS: tool_settings,
+            TSPKeys.OUTPUTS: outputs,
+            TSPKeys.TOOL_ID: tool_id,
+            TSPKeys.RUN_ID: run_id,
+            TSPKeys.FILE_HASH: file_hash,
+            TSPKeys.FILE_NAME: doc_name,
+            TSPKeys.FILE_PATH: file_path,
+            Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            TSPKeys.CUSTOM_DATA: tool.custom_data,
+        }
+
+        # Add platform API key and metadata flag for executor
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+        payload[ToolStudioKeys.PLATFORM_SERVICE_API_KEY] = platform_api_key
+        payload[TSPKeys.INCLUDE_METADATA] = True
+
+        dispatcher = PromptStudioHelper._get_dispatcher()
+        context = ExecutionContext(
+            executor_name="legacy",
+            operation="single_pass_extraction",
+            run_id=run_id or str(uuid.uuid4()),
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params=payload,
+            request_id=StateStore.get(Common.REQUEST_ID),
+            log_events_id=StateStore.get(Common.LOG_EVENTS_ID),
+        )
+        result = dispatcher.dispatch(context)
+        if not result.success:
+            raise AnswerFetchError(
+                f"Error fetching single pass response. {result.error}",
+            )
+        return result.data
+
+    @staticmethod
+    def get_tool_from_tool_id(tool_id: str) -> CustomTool | None:
+        try:
+            tool: CustomTool = CustomTool.objects.get(tool_id=tool_id)
+            return tool
+        except CustomTool.DoesNotExist:
+            return None
+
+    @staticmethod
+    def dynamic_extractor(
+        file_path: str,
+        enable_highlight: bool,
+        run_id: str,
+        org_id: str,
+        profile_manager: ProfileManager,
+        document_id: str,
+    ) -> str:
+        # Reject a non-PDF input paired with an image-output adapter before any
+        # extraction work. This is the single choke point every extract path
+        # funnels through, and it runs under this profile_manager (not the
+        # default profile), so every entry point and prompt-level profile
+        # override is covered (UNS-757/758).
+        PromptStudioHelper._validate_image_output_pdf_only(
+            profile_manager, os.path.basename(file_path)
+        )
+        # Guard against None metadata (when adapter_metadata_b is None)
+        metadata = profile_manager.x2text.metadata or {}
+        x2text_config_hash = ToolUtils.hash_str(json.dumps(metadata, sort_keys=True))
+
+        x2text = str(profile_manager.x2text.id)
+        is_extracted: bool = False
+        extract_file_path: str | None = None
+        extracted_text = ""
+        directory, filename = os.path.split(file_path)
+        extract_file_path = os.path.join(
+            directory, "extract", os.path.splitext(filename)[0] + ".txt"
+        )
+        usage_kwargs = {"run_id": run_id}
+        # Orginal file name with which file got uploaded in prompt studio
+        usage_kwargs["file_name"] = filename
+        is_extracted = PromptStudioIndexHelper.check_extraction_status(
+            document_id=document_id,
+            profile_manager=profile_manager,
+            x2text_config_hash=x2text_config_hash,
+            enable_highlight=enable_highlight,
+        )
+        if is_extracted:
+            fs_instance = EnvHelper.get_storage(
+                storage_type=StorageType.PERMANENT,
+                env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+            )
+            try:
+                extracted_text = fs_instance.read(path=extract_file_path, mode="r")
+                logger.info("Extracted text found. Reading from file..")
+                # The cache key ignores the LLM, so a cached image-mode
+                # extraction made for another LLM must still fit this one.
+                PromptStudioHelper._check_cached_image_extraction(
+                    profile_manager, extracted_text, filename
+                )
+                return extracted_text
+            except FileNotFoundError as e:
+                logger.warning(
+                    f"File not found for extraction. {extract_file_path}. {e}"
+                    "Continuing extraction.."
+                )
+                extracted_text = None
+        payload = {
+            IKeys.X2TEXT_INSTANCE_ID: x2text,
+            IKeys.LLM_INSTANCE_IDS: PromptStudioHelper._image_limit_llm_ids(
+                profile_manager
+            ),
+            IKeys.FILE_PATH: file_path,
+            IKeys.ENABLE_HIGHLIGHT: enable_highlight,
+            IKeys.USAGE_KWARGS: usage_kwargs.copy(),
+            IKeys.RUN_ID: run_id,
+            Common.LOG_EVENTS_ID: StateStore.get(Common.LOG_EVENTS_ID),
+            TSPKeys.EXECUTION_SOURCE: ExecutionSource.IDE.value,
+            IKeys.OUTPUT_FILE_PATH: extract_file_path,
+        }
+
+        # Add platform API key for executor
+        platform_api_key = PromptStudioHelper._get_platform_api_key(org_id)
+        payload["platform_api_key"] = platform_api_key
+
+        dispatcher = PromptStudioHelper._get_dispatcher()
+        extract_context = ExecutionContext(
+            executor_name="legacy",
+            operation="extract",
+            run_id=run_id or str(uuid.uuid4()),
+            execution_source="ide",
+            organization_id=org_id,
+            executor_params=payload,
+            request_id=StateStore.get(Common.REQUEST_ID),
+            log_events_id=StateStore.get(Common.LOG_EVENTS_ID),
+        )
+        result = dispatcher.dispatch(extract_context)
+        if not result.success:
+            msg = result.error or "Unknown extraction error"
+            status_result = PromptStudioIndexHelper.mark_extraction_status(
+                document_id=document_id,
+                profile_manager=profile_manager,
+                x2text_config_hash=x2text_config_hash,
+                enable_highlight=enable_highlight,
+                extracted=False,
+                error_message=msg,
+            )
+            if status_result is not ExtractionStatusResult.OK:
+                logger.warning(
+                    f"Failed to mark extraction failure for document {document_id}. "
+                    f"Extraction failed but status not saved."
+                )
+            raise ExtractionAPIError(
+                f"Failed to extract '{filename}'. {msg}",
+            )
+
+        extracted_text = result.data.get("extracted_text", "")
+
+        # A fresh (non-cache-hit) extraction rewrote any persisted page
+        # images — notify the VLM answer-invalidation hook (no-op in OSS)
+        # BEFORE committing the extraction-success marker. A success marker
+        # for this hash can already exist (the cache-hit path falls through
+        # here when the extracted text file was missing), so on a hook
+        # failure it is explicitly marked failed: a retry then re-runs
+        # extraction and invalidation instead of cache-hitting past a
+        # stale-answer state.
+        try:
+            invalidate_vlm_answers_on_reextraction(
+                document_id=str(document_id),
+                profile_manager=profile_manager,
+                extract_file_path=extract_file_path,
+            )
+        except Exception as e:
+            status_result = PromptStudioIndexHelper.mark_extraction_status(
+                document_id=document_id,
+                profile_manager=profile_manager,
+                x2text_config_hash=x2text_config_hash,
+                enable_highlight=enable_highlight,
+                extracted=False,
+                error_message=f"VLM answer invalidation failed: {e}",
+            )
+            if status_result is not ExtractionStatusResult.OK:
+                # The stale success marker survived. Remove the freshly
+                # written text so a cache hit on that marker falls through
+                # the file-missing path and re-extracts anyway.
+                logger.warning(
+                    f"Failed to mark extraction failure for document {document_id} "
+                    f"after VLM answer invalidation failed; removing extracted text."
+                )
+                try:
+                    EnvHelper.get_storage(
+                        storage_type=StorageType.PERMANENT,
+                        env_name=FileStorageKeys.PERMANENT_REMOTE_STORAGE,
+                    ).rm_exact(extract_file_path)
+                except Exception:
+                    logger.exception(
+                        f"Failed to remove {extract_file_path}; a retry may "
+                        f"cache-hit past VLM answer invalidation."
+                    )
+            raise
+
+        # Distinct name: ``result`` is the dispatcher's ExecutionResult and is
+        # still read above. Rebinding it to an ExtractionStatusResult made
+        # ``result.data`` correct only by branch ordering.
+        status_result = PromptStudioIndexHelper.mark_extraction_status(
+            document_id=document_id,
+            profile_manager=profile_manager,
+            x2text_config_hash=x2text_config_hash,
+            enable_highlight=enable_highlight,
+        )
+        if status_result is not ExtractionStatusResult.OK:
+            logger.warning(
+                f"Failed to mark extraction success for document {document_id}. "
+                f"Extraction completed but status not saved."
+            )
+
+        return extracted_text
+
+    @staticmethod
+    def export_project_settings(tool: CustomTool) -> dict:
+        """Export project settings as a comprehensive JSON structure.
+
+        Args:
+            tool (CustomTool): The CustomTool instance to export
+
+        Returns:
+            dict: Complete project configuration including tool settings and prompts
+        """
+        return {
+            "tool_metadata": PromptStudioHelper._export_tool_metadata(tool),
+            "tool_settings": PromptStudioHelper._export_tool_settings(tool),
+            "default_profile_settings": PromptStudioHelper._export_default_profile_settings(
+                tool
+            ),
+            "prompts": PromptStudioHelper._export_prompts(tool),
+            "export_metadata": PromptStudioHelper._export_metadata(tool),
+        }
+
+    @staticmethod
+    def _export_tool_metadata(tool: CustomTool) -> dict:
+        """Export tool metadata information.
+
+        Args:
+            tool (CustomTool): The CustomTool instance
+
+        Returns:
+            dict: Tool metadata configuration
+        """
+        return {
+            "tool_name": tool.tool_name,
+            "description": tool.description,
+            "author": tool.author,
+            "icon": tool.icon,
+        }
+
+    @staticmethod
+    def _export_tool_settings(tool: CustomTool) -> dict:
+        """Export tool settings configuration.
+
+        Args:
+            tool (CustomTool): The CustomTool instance
+
+        Returns:
+            dict: Tool settings configuration
+        """
+        return {
+            "preamble": tool.preamble,
+            "postamble": tool.postamble,
+            "summarize_prompt": tool.summarize_prompt,
+            "summarize_context": tool.summarize_context,
+            "summarize_as_source": tool.summarize_as_source,
+            "enable_challenge": tool.enable_challenge,
+            "enable_highlight": tool.enable_highlight,
+            "exclude_failed": tool.exclude_failed,
+            "single_pass_extraction_mode": tool.single_pass_extraction_mode,
+            "prompt_grammer": tool.prompt_grammer,
+        }
+
+    @staticmethod
+    def _export_default_profile_settings(tool: CustomTool) -> dict:
+        """Export default profile settings with safe fallbacks.
+
+        Args:
+            tool (CustomTool): The CustomTool instance
+
+        Returns:
+            dict: Default profile configuration
+        """
+        default_profile = PromptStudioHelper._get_default_profile(tool)
+
+        return {
+            "chunk_size": default_profile.chunk_size
+            if default_profile
+            else DefaultValues.DEFAULT_CHUNK_SIZE,
+            "chunk_overlap": default_profile.chunk_overlap
+            if default_profile
+            else DefaultValues.DEFAULT_CHUNK_OVERLAP,
+            "retrieval_strategy": (
+                default_profile.retrieval_strategy
+                if default_profile
+                else DefaultValues.DEFAULT_RETRIEVAL_STRATEGY
+            ),
+            "similarity_top_k": (
+                default_profile.similarity_top_k
+                if default_profile
+                else DefaultValues.DEFAULT_SIMILARITY_TOP_K
+            ),
+            "section": default_profile.section
+            if default_profile
+            else DefaultValues.DEFAULT_SECTION,
+            "profile_name": (
+                default_profile.profile_name
+                if default_profile
+                else DefaultValues.DEFAULT_PROFILE_NAME
+            ),
+        }
+
+    @staticmethod
+    def _get_default_profile(tool: CustomTool) -> ProfileManager | None:
+        """Safely retrieve the default profile for a tool.
+
+        Args:
+            tool (CustomTool): The CustomTool instance
+
+        Returns:
+            ProfileManager | None: Default profile or None if not found
+        """
+        try:
+            return ProfileManager.objects.filter(
+                prompt_studio_tool=tool, is_default=True
+            ).first()
+        except Exception as e:
+            logger.warning(
+                f"Failed to retrieve default profile for tool {tool.tool_id}: {e}"
+            )
+            return None
+
+    @staticmethod
+    def _export_prompts(tool: CustomTool) -> list[dict]:
+        """Export all prompts for the tool.
+
+        Args:
+            tool (CustomTool): The CustomTool instance
+
+        Returns:
+            list[dict]: List of prompt configurations
+        """
+        prompts = PromptStudioHelper.fetch_prompt_from_tool(str(tool.tool_id))
+        # Resolve the plugin once for the whole export, not per prompt.
+        payload_modifier_plugin = get_plugin("payload_modifier")
+        return [
+            PromptStudioHelper._export_single_prompt(prompt, payload_modifier_plugin)
+            for prompt in prompts
+        ]
+
+    @staticmethod
+    def _export_single_prompt(
+        prompt: ToolStudioPrompt, payload_modifier_plugin: dict | None = None
+    ) -> dict:
+        """Export a single prompt configuration.
+
+        Args:
+            prompt (ToolStudioPrompt): The prompt instance to export
+
+        Returns:
+            dict: Prompt configuration
+        """
+        d = {
+            "prompt_key": prompt.prompt_key,
+            "prompt": prompt.prompt,
+            "active": prompt.active,
+            "required": prompt.required,
+            "enforce_type": prompt.enforce_type,
+            "sequence_number": prompt.sequence_number,
+            "prompt_type": prompt.prompt_type,
+            "assert_prompt": prompt.assert_prompt,
+            "assertion_failure_prompt": prompt.assertion_failure_prompt,
+            "is_assert": prompt.is_assert,
+            "evaluate": prompt.evaluate,
+            "eval_quality_faithfulness": prompt.eval_quality_faithfulness,
+            "eval_quality_correctness": prompt.eval_quality_correctness,
+            "eval_quality_relevance": prompt.eval_quality_relevance,
+            "eval_security_pii": prompt.eval_security_pii,
+            "eval_guidance_toxicity": prompt.eval_guidance_toxicity,
+            "eval_guidance_completeness": prompt.eval_guidance_completeness,
+            "enable_postprocessing_webhook": prompt.enable_postprocessing_webhook,
+            "postprocessing_webhook_url": prompt.postprocessing_webhook_url,
+        }
+
+        # Enrich with cloud-only per-prompt settings (table / agentic-table)
+        # via the payload_modifier plugin. Pure-OSS (no plugin) is a no-op.
+        try:
+            if payload_modifier_plugin:
+                settings = payload_modifier_plugin[
+                    "service_class"
+                ]().export_prompt_settings(prompt)
+                if settings:
+                    d["settings"] = settings
+        except Exception as e:
+            logger.warning(
+                f"Failed to export settings for prompt {prompt.prompt_id}: {e}"
+            )
+
+        return d
+
+    @staticmethod
+    def _export_metadata(tool: CustomTool) -> dict:
+        """Export metadata about the export itself.
+
+        Args:
+            tool (CustomTool): The CustomTool instance
+
+        Returns:
+            dict: Export metadata
+        """
+        return {
+            "exported_at": tool.modified_at.isoformat() if tool.modified_at else None,
+            "tool_id": str(tool.tool_id),
+        }
+
+    @staticmethod
+    def validate_import_file(request: Request) -> tuple[dict, dict]:
+        """Validate uploaded file and extract import data.
+
+        Returns:
+            tuple: (import_data, selected_adapters)
+        """
+        if "file" not in request.FILES:
+            raise ValueError("No file provided")
+
+        file = request.FILES["file"]
+
+        if not file.name.endswith(".json"):
+            raise ValueError("Only JSON files are supported")
+
+        try:
+            import_data = json.loads(file.read().decode("utf-8"))
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON file")
+
+        required_keys = ["tool_metadata", "tool_settings", "prompts"]
+        if not all(key in import_data for key in required_keys):
+            raise ValueError("Invalid project file structure")
+
+        selected_adapters = {
+            "llm_adapter_id": request.data.get("llm_adapter_id"),
+            "vector_db_adapter_id": request.data.get("vector_db_adapter_id"),
+            "embedding_adapter_id": request.data.get("embedding_adapter_id"),
+            "x2text_adapter_id": request.data.get("x2text_adapter_id"),
+        }
+
+        return import_data, selected_adapters
+
+    @staticmethod
+    def generate_unique_tool_name(base_name: str, organization) -> str:
+        """Generate a unique tool name for import.
+
+        Args:
+            base_name: Original tool name from import data
+            organization: Organization instance
+
+        Returns:
+            str: Unique tool name
+        """
+        tool_name = base_name
+        counter = 1
+
+        while CustomTool.objects.filter(
+            tool_name=tool_name,
+            organization=organization,
+        ).exists():
+            tool_name = f"{base_name} (imported {counter})"
+            counter += 1
+
+        return tool_name
+
+    @staticmethod
+    def create_tool_from_import_data(
+        import_data: dict, tool_name: str, organization, user
+    ) -> CustomTool:
+        """Create a new CustomTool from import data.
+
+        Args:
+            import_data: Parsed JSON data from import file
+            tool_name: Unique tool name
+            organization: Organization instance
+            user: User creating the tool
+
+        Returns:
+            CustomTool: Created tool instance
+        """
+        tool_metadata = import_data["tool_metadata"]
+        tool_settings = import_data["tool_settings"]
+
+        tool = CustomTool.objects.create(
+            tool_name=tool_name,
+            description=tool_metadata["description"],
+            author=tool_metadata["author"],
+            icon=tool_metadata.get("icon", DefaultValues.DEFAULT_ICON),
+            preamble=tool_settings.get("preamble", DefaultValues.DEFAULT_PREAMBLE),
+            postamble=tool_settings.get("postamble", DefaultValues.DEFAULT_POSTAMBLE),
+            summarize_prompt=tool_settings.get(
+                "summarize_prompt", DefaultValues.DEFAULT_SUMMARIZE_PROMPT
+            ),
+            summarize_context=tool_settings.get(
+                "summarize_context", DefaultValues.DEFAULT_SUMMARIZE_CONTEXT
+            ),
+            summarize_as_source=tool_settings.get(
+                "summarize_as_source", DefaultValues.DEFAULT_SUMMARIZE_AS_SOURCE
+            ),
+            enable_challenge=tool_settings.get(
+                "enable_challenge", DefaultValues.DEFAULT_ENABLE_CHALLENGE
+            ),
+            enable_highlight=tool_settings.get(
+                "enable_highlight", DefaultValues.DEFAULT_ENABLE_HIGHLIGHT
+            ),
+            exclude_failed=tool_settings.get(
+                "exclude_failed", DefaultValues.DEFAULT_EXCLUDE_FAILED
+            ),
+            single_pass_extraction_mode=tool_settings.get(
+                "single_pass_extraction_mode",
+                DefaultValues.DEFAULT_SINGLE_PASS_EXTRACTION_MODE,
+            ),
+            prompt_grammer=tool_settings.get("prompt_grammer"),
+            created_by=user,
+            modified_by=user,
+            organization=organization,
+        )
+
+        # created_by is audit-only; grant the creator an OWNER membership row so
+        # access/ownership flows through it (UN-2202), as the viewset create does.
+        tool.grant_owner(user)
+
+        return tool
+
+    @staticmethod
+    def create_profile_manager(
+        import_data: dict, selected_adapters: dict, new_tool: CustomTool, user
+    ) -> None:
+        """Create profile manager with imported settings and selected adapters.
+
+        Args:
+            import_data: Parsed JSON data from import file
+            selected_adapters: Dictionary of selected adapter IDs
+            new_tool: Created tool instance
+            user: User creating the profile
+        """
+        profile_settings = import_data.get("default_profile_settings", {})
+
+        if all(selected_adapters.values()):
+            PromptStudioHelper._create_profile_with_selected_adapters(
+                profile_settings, selected_adapters, new_tool, user
+            )
+        else:
+            PromptStudioHelper._create_default_profile_with_settings(
+                profile_settings, new_tool, user
+            )
+
+    @staticmethod
+    def _create_profile_with_selected_adapters(
+        profile_settings: dict, selected_adapters: dict, new_tool: CustomTool, user
+    ) -> None:
+        """Create profile manager with user-selected adapters."""
+        try:
+            llm_adapter = AdapterInstance.objects.get(
+                id=selected_adapters["llm_adapter_id"]
+            )
+            vector_db_adapter = AdapterInstance.objects.get(
+                id=selected_adapters["vector_db_adapter_id"]
+            )
+            embedding_adapter = AdapterInstance.objects.get(
+                id=selected_adapters["embedding_adapter_id"]
+            )
+            x2text_adapter = AdapterInstance.objects.get(
+                id=selected_adapters["x2text_adapter_id"]
+            )
+
+            ProfileManager.objects.create(
+                profile_name=profile_settings.get(
+                    "profile_name", DefaultValues.DEFAULT_PROFILE_NAME
+                ),
+                vector_store=vector_db_adapter,
+                embedding_model=embedding_adapter,
+                llm=llm_adapter,
+                x2text=x2text_adapter,
+                chunk_size=profile_settings.get(
+                    "chunk_size", DefaultValues.DEFAULT_CHUNK_SIZE
+                ),
+                chunk_overlap=profile_settings.get(
+                    "chunk_overlap", DefaultValues.DEFAULT_CHUNK_OVERLAP
+                ),
+                retrieval_strategy=profile_settings.get(
+                    "retrieval_strategy", DefaultValues.DEFAULT_RETRIEVAL_STRATEGY
+                ),
+                similarity_top_k=profile_settings.get(
+                    "similarity_top_k", DefaultValues.DEFAULT_SIMILARITY_TOP_K
+                ),
+                section=profile_settings.get("section", DefaultValues.DEFAULT_SECTION),
+                prompt_studio_tool=new_tool,
+                is_default=True,
+                created_by=user,
+                modified_by=user,
+            )
+        except AdapterInstance.DoesNotExist as e:
+            raise ValueError(f"One or more selected adapters not found: {e}")
+
+    @staticmethod
+    def _create_default_profile_with_settings(
+        profile_settings: dict, new_tool: CustomTool, user
+    ) -> None:
+        """Create default profile and update with imported settings."""
+        PromptStudioHelper.create_default_profile_manager(
+            user=user, tool_id=new_tool.tool_id
+        )
+
+        if profile_settings:
+            try:
+                default_profile = ProfileManager.objects.filter(
+                    prompt_studio_tool=new_tool, is_default=True
+                ).first()
+
+                if default_profile:
+                    default_profile.chunk_size = profile_settings.get(
+                        "chunk_size", DefaultValues.DEFAULT_CHUNK_SIZE
+                    )
+                    default_profile.chunk_overlap = profile_settings.get(
+                        "chunk_overlap", DefaultValues.DEFAULT_CHUNK_OVERLAP
+                    )
+                    default_profile.retrieval_strategy = profile_settings.get(
+                        "retrieval_strategy", DefaultValues.DEFAULT_RETRIEVAL_STRATEGY
+                    )
+                    default_profile.similarity_top_k = profile_settings.get(
+                        "similarity_top_k", DefaultValues.DEFAULT_SIMILARITY_TOP_K
+                    )
+                    default_profile.section = profile_settings.get(
+                        "section", DefaultValues.DEFAULT_SECTION
+                    )
+                    default_profile.profile_name = profile_settings.get(
+                        "profile_name", DefaultValues.DEFAULT_PROFILE_NAME
+                    )
+                    default_profile.save()
+            except Exception as e:
+                logger.warning(f"Could not update profile settings: {e}")
+
+    @staticmethod
+    def import_prompts(prompts_data: list, new_tool: CustomTool, user) -> None:
+        """Import prompts from import data.
+
+        Args:
+            prompts_data: List of prompt data from import file
+            new_tool: Created tool instance
+            user: User creating the prompts
+        """
+        default_profile = ProfileManager.objects.filter(
+            prompt_studio_tool=new_tool, is_default=True
+        ).first()
+
+        payload_modifier_plugin = get_plugin("payload_modifier")
+
+        for prompt_data in prompts_data:
+            created = ToolStudioPrompt.objects.create(
+                prompt_key=prompt_data["prompt_key"],
+                prompt=prompt_data["prompt"],
+                active=prompt_data.get("active", DefaultValues.DEFAULT_ACTIVE),
+                required=prompt_data.get("required", DefaultValues.DEFAULT_REQUIRED),
+                enforce_type=prompt_data.get(
+                    "enforce_type", DefaultValues.DEFAULT_ENFORCE_TYPE
+                ),
+                sequence_number=prompt_data.get("sequence_number"),
+                prompt_type=prompt_data.get("prompt_type"),
+                assert_prompt=prompt_data.get("assert_prompt"),
+                assertion_failure_prompt=prompt_data.get("assertion_failure_prompt"),
+                is_assert=prompt_data.get("is_assert", DefaultValues.DEFAULT_IS_ASSERT),
+                evaluate=prompt_data.get("evaluate", DefaultValues.DEFAULT_EVALUATE),
+                eval_quality_faithfulness=prompt_data.get(
+                    "eval_quality_faithfulness",
+                    DefaultValues.DEFAULT_EVAL_QUALITY_FAITHFULNESS,
+                ),
+                eval_quality_correctness=prompt_data.get(
+                    "eval_quality_correctness",
+                    DefaultValues.DEFAULT_EVAL_QUALITY_CORRECTNESS,
+                ),
+                eval_quality_relevance=prompt_data.get(
+                    "eval_quality_relevance", DefaultValues.DEFAULT_EVAL_QUALITY_RELEVANCE
+                ),
+                eval_security_pii=prompt_data.get(
+                    "eval_security_pii", DefaultValues.DEFAULT_EVAL_SECURITY_PII
+                ),
+                eval_guidance_toxicity=prompt_data.get(
+                    "eval_guidance_toxicity", DefaultValues.DEFAULT_EVAL_GUIDANCE_TOXICITY
+                ),
+                eval_guidance_completeness=prompt_data.get(
+                    "eval_guidance_completeness",
+                    DefaultValues.DEFAULT_EVAL_GUIDANCE_COMPLETENESS,
+                ),
+                enable_postprocessing_webhook=prompt_data.get(
+                    "enable_postprocessing_webhook", False
+                ),
+                postprocessing_webhook_url=prompt_data.get("postprocessing_webhook_url"),
+                tool_id=new_tool,
+                profile_manager=default_profile,
+                created_by=user,
+                modified_by=user,
+            )
+
+            # Restore cloud-only per-prompt settings carried in the blob via
+            # the payload_modifier plugin. Backward-compatible: blobs without
+            # a "settings" key (old exports / pure-OSS) are a no-op.
+            settings = prompt_data.get("settings")
+            if settings and payload_modifier_plugin:
+                try:
+                    payload_modifier_plugin["service_class"]().import_prompt_settings(
+                        created, settings
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to import settings for prompt "
+                        f"{created.prompt_id}: {e}"
+                    )
+
+    @staticmethod
+    def validate_adapter_configuration(
+        selected_adapters: dict, new_tool: CustomTool
+    ) -> tuple[bool, str]:
+        """Validate adapter configuration and determine if config is needed.
+
+        Args:
+            selected_adapters: Dictionary of selected adapter IDs
+            new_tool: Created tool instance
+
+        Returns:
+            tuple: (needs_adapter_config, warning_message)
+        """
+        if all(selected_adapters.values()):
+            return False, ""
+
+        try:
+            default_profile = ProfileManager.objects.filter(
+                prompt_studio_tool=new_tool, is_default=True
+            ).first()
+
+            if default_profile:
+                adapters_to_check = [
+                    default_profile.llm,
+                    default_profile.vector_store,
+                    default_profile.embedding_model,
+                    default_profile.x2text,
+                ]
+
+                for adapter in adapters_to_check:
+                    if not is_adapter_selectable(adapter):
+                        warning_message = (
+                            "Some adapters may need to be configured before you can use "
+                            "this project. Please check the profile settings."
+                        )
+                        return True, warning_message
+        except Exception:
+            warning_message = (
+                "Some adapters may need to be configured before you can use "
+                "this project. Please check the profile settings."
+            )
+            return True, warning_message
+
+        return False, ""
+
+    @staticmethod
+    def sync_prompts(tool: CustomTool, import_data: dict, user) -> dict:
+        """Sync prompts from export JSON into an existing project.
+
+        Replaces all existing prompts with prompts from the export data.
+        Tool settings (preamble, postamble, etc.) are also updated.
+        Profiles and adapters are left untouched.
+
+        Args:
+            tool: Target CustomTool instance
+            import_data: Parsed export JSON
+            user: User performing the sync
+
+        Returns:
+            dict: Summary of the sync operation
+        """
+        prompts_data = import_data.get("prompts", [])
+        tool_settings = import_data.get("tool_settings", {})
+
+        # Get the target tool's default profile
+        default_profile = ProfileManager.objects.filter(
+            prompt_studio_tool=tool, is_default=True
+        ).first()
+        if not default_profile:
+            raise ValueError(
+                "Target project must have a default profile configured "
+                "before syncing prompts."
+            )
+
+        with transaction.atomic():
+            # Delete all existing prompts. QuerySet.delete() returns the
+            # cascade total (outputs ride along via CASCADE) — report only
+            # the prompt rows to the API client
+            _, per_model = ToolStudioPrompt.objects.filter(tool_id=tool).delete()
+            deleted_count = per_model.get(ToolStudioPrompt._meta.label, 0)
+            if deleted_count:
+                # QuerySet.delete() bypasses ToolStudioPrompt.delete(), so
+                # bump the parent explicitly — clearing prompts is still a
+                # modification (_base_manager: see ToolStudioPrompt._touch_tool)
+                CustomTool._base_manager.filter(pk=tool.tool_id).update(
+                    modified_at=timezone.now()
+                )
+
+            # Create new prompts from export data
+            PromptStudioHelper.import_prompts(prompts_data, tool, user)
+
+            # Update tool settings
+            tool_settings_fields = [
+                "preamble",
+                "postamble",
+                "summarize_prompt",
+                "summarize_context",
+                "summarize_as_source",
+                "enable_challenge",
+                "enable_highlight",
+                "exclude_failed",
+                "single_pass_extraction_mode",
+                "prompt_grammer",
+            ]
+            update_fields = []
+            for field in tool_settings_fields:
+                if field in tool_settings:
+                    setattr(tool, field, tool_settings[field])
+                    update_fields.append(field)
+
+            if update_fields:
+                tool.modified_by = user
+                update_fields.append("modified_by")
+                tool.save(update_fields=update_fields)
+
+        return {
+            "prompts_deleted": deleted_count,
+            "prompts_created": len(prompts_data),
+            "tool_settings_updated": bool(update_fields),
+        }

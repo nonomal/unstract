@@ -20,6 +20,7 @@ The following filesystems are supported
 - Unstract Cloud Storage
 - Box
 - Dropbox (issues exist around file discovery/listing)
+- SharePoint / OneDrive
 - HTTP(S)
 
 ## Databases
@@ -36,7 +37,7 @@ The following databases are supported
 
 ### Local Development
 
-To get started with local development, 
+To get started with local development,
 - Create and source a virtual environment if you haven't already following [these steps](/README.md#create-your-virtual-env).
 - If you're using Mac, install the below library needed for PyMSSQL
 ```
@@ -44,7 +45,7 @@ brew install pkg-config freetds
 ```
 - Install the required dependencies with
 ```shell
-pdm install
+uv sync
 ```
 
 ### Environment variables
@@ -54,4 +55,25 @@ If the [GCSHelper](/src/unstract/connectors/gcs_helper.py) is used, the followin
 
 ### Running tests
 
-TODO: Use a test framework and document way to run tests
+#### Connector-Specific Testing
+For detailed setup and integration testing:
+1. Copy `sample.env` to `.env` in the connectors directory
+2. Configure connector credentials in `.env`
+
+#### Running Unit Tests
+
+```bash
+cd unstract/connectors
+
+# Install test dependencies
+uv sync --group test
+
+# Run all tests for a connector
+uv run pytest tests/filesystems/test_sharepoint_fs.py -v
+
+# Run unit tests only
+uv run pytest tests/filesystems/test_sharepoint_fs.py::TestSharePointFSUnit -v
+
+# Run integration tests (requires .env credentials)
+uv run pytest tests/filesystems/test_sharepoint_fs.py::TestSharePointFSIntegration -v -s
+```

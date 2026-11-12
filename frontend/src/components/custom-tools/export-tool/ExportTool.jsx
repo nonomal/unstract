@@ -1,19 +1,12 @@
-import {
-  DeleteOutlined,
-  QuestionCircleOutlined,
-  UserOutlined,
-} from "@ant-design/icons";
-import {
-  Avatar,
-  List,
-  Modal,
-  Popconfirm,
-  Radio,
-  Select,
-  Typography,
-} from "antd";
+import { CircleHelp, Trash2, User } from "lucide-react";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Radio, Select } from "@/components/ui/shims/antd-inputs";
+import { Avatar } from "@/components/ui/shims/antd-leaves";
+import { Modal, Popconfirm } from "@/components/ui/shims/antd-overlays";
+import { List } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 import "./ExportTool.css";
 
 import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
@@ -45,7 +38,7 @@ function ExportTool({
     }
 
     const promptStudioUsers = toolDetails?.prompt_studio_users?.map((user) =>
-      user?.id?.toString()
+      user?.id?.toString(),
     );
 
     const filteredUsers = allUsers.filter((user) => {
@@ -66,7 +59,7 @@ function ExportTool({
     }
     const createdByUserId = toolDetails?.created_by?.toString();
     const promptStudioUsers = toolDetails?.prompt_studio_users?.map((user) =>
-      user?.id?.toString()
+      user?.id?.toString(),
     );
     setSelectedUsers(
       toolDetails.shared_users
@@ -76,13 +69,13 @@ function ExportTool({
             !promptStudioUsers.includes(userId) && createdByUserId !== userId
           );
         })
-        .map((user) => user?.id?.toString())
+        .map((user) => user?.id?.toString()),
     );
   }, [toolDetails]);
 
   const handleDeleteUser = (userId) => {
     setSelectedUsers((prevSelectedUsers) =>
-      prevSelectedUsers.filter((user) => user !== userId)
+      prevSelectedUsers.filter((user) => user !== userId),
     );
   };
   const filterOption = (input, option) =>
@@ -94,14 +87,16 @@ function ExportTool({
 
   const shareWithUsers = () => {
     if (sharingOption === SHARE_ALL) {
-      return <Typography.Text>Shared with everyone</Typography.Text>;
+      return (
+        <Typography.Text>Shared with everyone in current org</Typography.Text>
+      );
     }
     return (
       <>
         <List
           dataSource={selectedUsers.map((userId) => {
             const user = allUsers.find(
-              (u) => u?.id.toString() === userId.toString()
+              (u) => u?.id.toString() === userId.toString(),
             );
             return {
               id: user?.id,
@@ -118,12 +113,21 @@ function ExportTool({
                     description={`Are you sure to remove ${item?.email}?`}
                     okText="Yes"
                     cancelText="No"
-                    icon={<QuestionCircleOutlined />}
+                    icon={<CircleHelp />}
                     onConfirm={(event) => handleDeleteUser(item?.id)}
                   >
-                    <Typography.Text>
-                      <DeleteOutlined className="action-icon-buttons" />
-                    </Typography.Text>
+                    {/*
+                     * A real button with a name: the icon on its own put
+                     * nothing in the accessibility tree, so the only way to
+                     * un-share was unreachable by keyboard and unnameable by
+                     * a screen reader. Matches CoOwnerManagement.
+                     */}
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<Trash2 className="action-icon-buttons" />}
+                      aria-label={`Remove ${item?.email}`}
+                    />
                   </Popconfirm>
                 </div>
               }
@@ -131,10 +135,7 @@ function ExportTool({
               <List.Item.Meta
                 title={
                   <>
-                    <Avatar
-                      className="shared-user-avatar"
-                      icon={<UserOutlined />}
-                    />
+                    <Avatar className="shared-user-avatar" icon={<User />} />
                     <Typography.Text className="export-username">
                       {item?.email}
                     </Typography.Text>
@@ -177,7 +178,9 @@ function ExportTool({
                 value={sharingOption}
                 className="export-per-radio"
               >
-                <Radio value={SHARE_ALL}>Share with everyone</Radio>
+                <Radio value={SHARE_ALL}>
+                  Share with everyone in current org
+                </Radio>
                 <Radio value={SHARE_CUSTOM}>Custom share</Radio>
               </Radio.Group>
             )}

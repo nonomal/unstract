@@ -1,0 +1,324 @@
+"""Shared share-management surface for resource ViewSets.
+
+The write side accepts exactly the three axes named in
+``_SUPPORTED_SHARE_AXES``; the read side (``_read_axis``) only knows the two
+per-recipient ones by name. ``shared_users`` is the direct-viewer axis, backed
+by VIEWER membership rows, while ``shared_groups`` is stored polymorphically in
+``ResourceGroupShare`` (not an M2M) and routed through the sharing helpers.
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, ClassVar
+
+from django.db.models import Model
+from plugins import get_plugin
+from rest_framework import status
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+logger = logging.getLogger(__name__)
+
+notification_plugin = get_plugin("notification")
+
+_SUPPORTED_SHARE_AXES = ("shared_users", "shared_groups", "shared_to_org")
+
+
+def _extract_desired_share_state(payload: Any) -> dict[str, Any]:
+    """Normalize a POST /share/ body into the dispatcher's keyword shape.
+
+    Accepts only the three known axes; unknown keys are rejected so client
+    bugs surface loudly. Empty payload is allowed (no-op) for symmetry with
+    "clear my share state" requests.
+    """
+    if not isinstance(payload, dict):
+        raise ValidationError({"detail": "Request body must be a JSON object."})
+    unknown = set(payload) - set(_SUPPORTED_SHARE_AXES)
+    if unknown:
+        raise ValidationError({"detail": f"Unsupported share axes: {sorted(unknown)}."})
+    desired: dict[str, Any] = {}
+    for axis in ("shared_users", "shared_groups"):
+        if axis in payload:
+            desired[axis] = _coerce_id_list(axis, payload[axis])
+    if "shared_to_org" in payload:
+        desired["shared_to_org"] = bool(payload["shared_to_org"])
+    return desired
+
+
+def _coerce_id_list(axis: str, value: Any) -> list[int]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValidationError({axis: "Must be a list of integer IDs."})
+    coerced: list[int] = []
+    for raw in value:
+        try:
+            coerced.append(int(raw))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({axis: f"Invalid ID: {raw!r}"}) from exc
+    return coerced
+
+
+def _users_left_without_access(instance: Model, users: set[Any]) -> list[Any]:
+    """Narrow ``users`` to those with no remaining access to ``instance``.
+
+    Someone dropped from ``shared_users`` may still reach the resource via a
+    group or an org-wide share; telling them their access was removed would be
+    wrong.
+    """
+    if not users:
+        return []
+    from tenant_account_v2.sharing_helpers import retained_user_ids
+
+    retained = retained_user_ids(instance)
+    if retained is None:
+        # Org-wide or frictionless: access never depended on the share, so
+        # nobody lost anything.
+        return []
+    return [user for user in users if user.pk not in retained]
+
+
+def _send_share_notification(
+    instance: Model, context: tuple[str, str], users: set[Any], actor: Any
+) -> None:
+    """Email users newly granted direct access. Best-effort.
+
+    Sent inline, matching every other direct-share call site in the codebase
+    (pipelines, API deployments, connectors, ...). Group shares, by contrast,
+    dispatch through PGQueue (see ``share_notifications.notify_resource_group_share_changed``)
+    because a group's member count -- and so its send time -- is unbounded in
+    a way a handful of direct users is not.
+    """
+    resource_type, resource_name = context
+    try:
+        notification_plugin["service_class"]().send_sharing_notification(
+            resource_type=resource_type,
+            resource_name=resource_name,
+            resource_id=str(instance.pk),
+            shared_by=actor,
+            shared_to=list(users),
+            resource_instance=instance,
+        )
+    except Exception:
+        logger.exception("Failed to send sharing notification for %s", instance.pk)
+
+
+def _send_revoke_notification(
+    instance: Model, context: tuple[str, str], users: list[Any], actor: Any
+) -> None:
+    """Email users whose direct access was revoked. Best-effort."""
+    resource_type, resource_name = context
+    try:
+        notification_plugin["service_class"]().send_access_removed_notification(
+            resource_type=resource_type,
+            resource_name=resource_name,
+            resource_id=str(instance.pk),
+            removed_from=users,
+            removed_by=actor,
+            resource_instance=instance,
+        )
+    except Exception:
+        logger.exception("Failed to send access-removed notification for %s", instance.pk)
+
+
+@dataclass
+class AxisDiff:
+    """DEPRECATED shim -- see ``ResourceShareManagementMixin.share_axes`` below."""
+
+    before: set[Any] = field(default_factory=set)
+    after: set[Any] = field(default_factory=set)
+
+    @property
+    def added(self) -> set[Any]:
+        return self.after - self.before
+
+    @property
+    def removed(self) -> set[Any]:
+        return self.before - self.after
+
+
+class ResourceShareManagementMixin:
+    """Adds the shared share-management surface to a resource ViewSet."""
+
+    # DEPRECATED, temporary: ``share_axes``, ``snapshot_share_axes`` and
+    # ``diff_share_axes`` (with ``AxisDiff`` above) were removed on this branch
+    # -- the PATCH-based sharing path they backed is dead, its diff is always
+    # empty (see 999e443b4). Restored here only because cloud's
+    # ``AgenticProjectViewSet.partial_update`` on ``origin/main`` still calls
+    # them, and OSS merges before cloud (Zipstack/unstract-cloud#1698 carries
+    # the real removal). Delete this whole block, and this comment, once #1698
+    # merges -- at that point nothing on cloud main calls it anymore.
+    share_axes: ClassVar[tuple[str, ...]] = ("shared_users", "shared_groups")
+
+    def snapshot_share_axes(self, instance: Model) -> dict[str, set[Any]]:
+        """DEPRECATED shim. See the block comment above ``share_axes``."""
+        return {axis: self._read_axis(instance, axis) for axis in self.share_axes}
+
+    def diff_share_axes(
+        self,
+        instance: Model,
+        before: dict[str, set[Any]],
+        request_data: dict[str, Any],
+    ) -> dict[str, AxisDiff]:
+        """DEPRECATED shim. See the block comment above ``share_axes``."""
+        instance.refresh_from_db()
+        return {
+            axis: AxisDiff(before=before[axis], after=self._read_axis(instance, axis))
+            for axis in self.share_axes
+            if axis in request_data
+        }
+
+    @action(detail=True, methods=["post"], url_path="share")
+    def share(self, request: Request, pk: str | None = None) -> Response:
+        """Apply a replace-style share state for the resource.
+
+        HTTP entry gate is the host viewset's ``get_permissions``, which
+        differs per host. Per-axis authorization (owner / org admin /
+        shared user / group member) and scope checks (org-membership for
+        users, group-membership for groups) live in
+        ``ShareAuthorizationService``.
+        """
+        from inbox.events import notify_resource_shared, users_with_access
+        from tenant_account_v2.share_notifications import (
+            notify_resource_group_share_changed,
+        )
+        from tenant_account_v2.sharing_helpers import ShareAuthorizationService
+
+        resource = self.get_object()  # type: ignore[attr-defined]
+        desired = _extract_desired_share_state(request.data)
+        # Only read an axis this request actually touches. authorize_and_commit
+        # takes long enough (auth checks, a DB write) that a concurrent request
+        # changing an axis this one left alone would otherwise land inside the
+        # window and get diffed as if this request made the change — the wrong
+        # actor's name in the notification.
+        users_before = (
+            self._read_axis(resource, "shared_users")
+            if "shared_users" in desired
+            else set()
+        )
+        groups_before = (
+            self._read_axis(resource, "shared_groups")
+            if "shared_groups" in desired
+            else set()
+        )
+        had_access = users_with_access(resource)
+        org_before = (
+            bool(getattr(resource, "shared_to_org", False))
+            if "shared_to_org" in desired
+            else None
+        )
+        ShareAuthorizationService.authorize_and_commit(
+            actor=request.user, resource=resource, desired=desired
+        )
+        # ``authorize_and_commit`` has already committed here, on the current
+        # deployment: ``ATOMIC_REQUESTS`` is a settings knob, currently off, so
+        # this view isn't wrapped in a transaction and the diffs below read
+        # persisted state. Flipping that knob would flip this premise too.
+        resource.refresh_from_db()
+        # Only the two per-recipient axes notify. ``shared_to_org`` is left out
+        # deliberately: a toggle has no recipient list short of the whole org,
+        # and it is read below as a reason someone KEPT access, not lost it.
+        users_after = (
+            self._read_axis(resource, "shared_users")
+            if "shared_users" in desired
+            else users_before
+        )
+        groups_after = (
+            self._read_axis(resource, "shared_groups")
+            if "shared_groups" in desired
+            else groups_before
+        )
+        from platform_audit.resources import record_sharing_change
+
+        record_sharing_change(
+            request,
+            resource,
+            users=(users_before, users_after) if "shared_users" in desired else None,
+            groups=(groups_before, groups_after) if "shared_groups" in desired else None,
+            shared_to_org=(
+                (org_before, bool(resource.shared_to_org))
+                if org_before is not None
+                else None
+            ),
+        )
+        notify_resource_group_share_changed(
+            resource=resource,
+            added=groups_after - groups_before,
+            removed=groups_before - groups_after,
+            actor=request.user,
+        )
+        self._notify_shared_users(
+            resource, users_after - users_before, users_before - users_after, request.user
+        )
+        notify_resource_shared(
+            resource=resource,
+            users=users_after - users_before,
+            groups=groups_after - groups_before,
+            actor=request.user,
+            had_access=had_access,
+        )
+        return Response(status=status.HTTP_200_OK)
+
+    def _notify_shared_users(
+        self,
+        instance: Any,
+        added: set[Any],
+        removed: set[Any],
+        actor: Any,
+        /,
+    ) -> None:
+        """Email users granted or denied direct access. Best-effort.
+
+        Resource type and name come from the host's ``OwnerManagementMixin``
+        seam. The share has already committed by the time this runs, so no
+        failure here — a raising seam, a dropped DB connection — may surface
+        as a 500 on a share that succeeded.
+        """
+        try:
+            context = self._notification_context(instance)  # type: ignore[attr-defined]
+            if context is None:
+                return
+            if added:
+                _send_share_notification(instance, context, added, actor)
+            revoked = _users_left_without_access(instance, removed)
+            if revoked:
+                _send_revoke_notification(instance, context, revoked, actor)
+        except Exception:
+            logger.exception("Failed to send share notifications for %s", instance.pk)
+
+    @action(detail=True, methods=["get"], url_path="effective-members")
+    def effective_members(self, request: Request, pk: str | None = None) -> Response:
+        """Return all users with access (direct/group/org), priority-deduped."""
+        # Lazy import — ``tenant_account_v2`` is the canonical home of the
+        # helper; importing at module load would pull a circular dep through
+        # the permissions package.
+        from tenant_account_v2.group_serializers import EffectiveMemberSerializer
+        from tenant_account_v2.sharing_helpers import compute_effective_members
+
+        # ``get_object`` is provided by the DRF ``GenericAPIView`` host class.
+        members = compute_effective_members(self.get_object())  # type: ignore[attr-defined]
+        return Response(EffectiveMemberSerializer(members, many=True).data)
+
+    @staticmethod
+    def _read_axis(instance: Model, axis: str) -> set[Any]:
+        """Return the current set of related objects on the given axis.
+
+        ``shared_users`` is the direct-viewer axis — since UN-2202 Phase 2 it
+        is backed by VIEWER membership rows, not an M2M (all mixin hosts are
+        membership-backed resources). ``shared_groups`` is stored
+        polymorphically in ``ResourceGroupShare`` — route reads through the
+        helper.
+        """
+        if axis == "shared_users":
+            return set(instance.viewers())  # type: ignore[attr-defined]
+        if axis == "shared_groups":
+            # Lazy import — ``tenant_account_v2`` depends on the permissions
+            # package being importable during Django app loading.
+            from tenant_account_v2.sharing_helpers import (
+                get_resource_share_groups,
+            )
+
+            return set(get_resource_share_groups(instance))
+        return set(getattr(instance, axis).all())

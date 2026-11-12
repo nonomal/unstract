@@ -1,7 +1,14 @@
-import Form from "@rjsf/antd";
+// P3-05: @rjsf/core instead of @rjsf/antd. This layout already supplies its own
+// `widgets` and `templates` for every field type, so the antd theme was only
+// contributing the wrapper chrome — there is no widget registry to rebuild.
+import Form from "@rjsf/core";
 import validator from "@rjsf/validator-ajv8";
 import PropTypes from "prop-types";
+import { useCallback, useMemo } from "react";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Alert } from "@/components/ui/shims/antd-leaves";
 
+import CustomMarkdown from "../../components/helpers/custom-markdown/CustomMarkdown.jsx";
 import { AltDateTimeWidget } from "../../components/rjsf-custom-widgets/alt-date-time-widget/AltDateTimeWidget.jsx";
 import { AltDateWidget } from "../../components/rjsf-custom-widgets/alt-date-widget/AltDateWidget.jsx";
 import { ArrayField } from "../../components/rjsf-custom-widgets/array-field/ArrayField.jsx";
@@ -13,10 +20,15 @@ import { DateWidget } from "../../components/rjsf-custom-widgets/date-widget/Dat
 import { EmailWidget } from "../../components/rjsf-custom-widgets/email-widget/EmailWidget.jsx";
 import { FileWidget } from "../../components/rjsf-custom-widgets/file-widget/FileWidget.jsx";
 import { HiddenWidget } from "../../components/rjsf-custom-widgets/hidden-widget/HiddenWidget.jsx";
+import { PasswordWidget } from "../../components/rjsf-custom-widgets/password-widget/PasswordWidget.jsx";
 import { SelectWidget } from "../../components/rjsf-custom-widgets/select-widget/SelectWidget.jsx";
+import { TextWidget } from "../../components/rjsf-custom-widgets/text-widget/TextWidget.jsx";
 import { TimeWidget } from "../../components/rjsf-custom-widgets/time-widget/TimeWidget.jsx";
+import { UpDownWidget } from "../../components/rjsf-custom-widgets/up-down-widget/UpDownWidget.jsx";
 import { URLWidget } from "../../components/rjsf-custom-widgets/url-widget/URLWidget.jsx";
 import { SpinnerLoader } from "../../components/widgets/spinner-loader/SpinnerLoader.jsx";
+import { CustomFieldTemplate } from "./CustomFieldTemplate.jsx";
+import { CustomObjectFieldTemplate } from "./CustomObjectFieldTemplate.jsx";
 import "./RjsfFormLayout.css";
 
 function RjsfFormLayout({
@@ -29,98 +41,282 @@ function RjsfFormLayout({
   validateAndSubmit,
   isStateUpdateRequired,
 }) {
-  schema.title = "";
-  schema.description = "";
-  const widgets = {
-    CheckboxWidget: CheckboxWidget,
-    DateWidget: DateWidget,
-    AltDateTimeWidget: AltDateTimeWidget,
-    AltDateWidget: AltDateWidget,
-    CheckboxesWidget: CheckboxesWidget,
-    ColorWidget: ColorWidget,
-    DateTimeWidget: DateTimeWidget,
-    EmailWidget: EmailWidget,
-    FileWidget: FileWidget,
-    HiddenWidget: HiddenWidget,
-    TimeWidget: TimeWidget,
-    URLWidget: URLWidget,
-    SelectWidget: SelectWidget,
-  };
+  const formSchema = useMemo(() => {
+    if (!schema) {
+      return {};
+    }
+    const rest = { ...schema };
+    delete rest.title;
+    delete rest.description;
+    // ui:order is a uiSchema directive, not a JSON Schema keyword.
+    delete rest["ui:order"];
+    return rest;
+  }, [schema]);
 
-  const fields = {
-    ArrayField: ArrayField,
-  };
+  const description = useMemo(() => schema?.description || "", [schema]);
 
-  const uiSchema = {
-    "ui:classNames": "my-rjsf-form",
-  };
+  const widgets = useMemo(
+    () => ({
+      AltDateTimeWidget,
+      AltDateWidget,
+      CheckboxWidget,
+      CheckboxesWidget,
+      ColorWidget,
+      DateTimeWidget,
+      DateWidget,
+      EmailWidget,
+      FileWidget,
+      HiddenWidget,
+      PasswordWidget,
+      SelectWidget,
+      TextWidget,
+      TimeWidget,
+      UpDownWidget,
+      URLWidget,
+    }),
+    [],
+  );
 
-  const removeBlankDefault = (schema) => {
-    /**
-     * We are removing the "required fields" default property if the value is null or "".
-     * We need this for applying the required field form valiation.
-     */
+  const fields = useMemo(
+    () => ({
+      ArrayField,
+    }),
+    [],
+  );
+
+  const uiSchema = useMemo(() => {
+    const base = { "ui:classNames": "my-rjsf-form" };
+    // Let a schema control field order, including dependency-injected fields.
+    if (Array.isArray(schema?.["ui:order"])) {
+      base["ui:order"] = schema["ui:order"];
+    }
+    return base;
+  }, [schema]);
+
+  const removeBlankDefault = useCallback((schema) => {
     if (schema?.properties && schema?.required) {
-      Object.keys(schema.properties).forEach((key) => {
+      const properties = schema.properties;
+      schema.required.forEach((key) => {
         if (
-          schema.required.includes(key) &&
-          (schema.properties[key].default === null ||
-            schema.properties[key].default === "")
+          properties[key] &&
+          (properties[key].default === null || properties[key].default === "")
         ) {
-          delete schema.properties[key].default;
+          delete properties[key].default;
         }
       });
     }
     return schema;
+  }, []);
+
+  // Validation message generators to reduce complexity
+  const validationMessageGenerators = {
+    // Numeric validations
+    minimum: (fieldTitle, params) =>
+      `'${fieldTitle}' must be at least ${params?.limit}`,
+    maximum: (fieldTitle, params) =>
+      `'${fieldTitle}' must not exceed ${params?.limit}`,
+    exclusiveMinimum: (fieldTitle, params) =>
+      `'${fieldTitle}' must be greater than ${params?.limit}`,
+    exclusiveMaximum: (fieldTitle, params) =>
+      `'${fieldTitle}' must be less than ${params?.limit}`,
+    multipleOf: (fieldTitle, params) =>
+      `'${fieldTitle}' must be a multiple of ${params?.multipleOf}`,
+
+    // String validations
+    minLength: (fieldTitle, params) =>
+      `'${fieldTitle}' must be at least ${params?.limit} characters`,
+    maxLength: (fieldTitle, params) =>
+      `'${fieldTitle}' must not exceed ${params?.limit} characters`,
+    pattern: (fieldTitle) => `'${fieldTitle}' must match the required format`,
+
+    // Array validations
+    minItems: (fieldTitle, params) =>
+      `'${fieldTitle}' must have at least ${params?.limit} items`,
+    maxItems: (fieldTitle, params) =>
+      `'${fieldTitle}' must not exceed ${params?.limit} items`,
+    uniqueItems: (fieldTitle) =>
+      `'${fieldTitle}' must contain only unique items`,
+
+    // Object validations
+    minProperties: (fieldTitle, params) =>
+      `'${fieldTitle}' must have at least ${params?.limit} properties`,
+    maxProperties: (fieldTitle, params) =>
+      `'${fieldTitle}' must not exceed ${params?.limit} properties`,
+
+    // Simple validations
+    const: (fieldTitle, params) =>
+      `'${fieldTitle}' must be exactly ${params?.allowedValue}`,
+    type: (fieldTitle, params) =>
+      `'${fieldTitle}' must be of type ${params?.type}`,
+    format: (fieldTitle, params) =>
+      `'${fieldTitle}' must be a valid ${params?.format}`,
+    additionalProperties: (fieldTitle, params) =>
+      `'${fieldTitle}' has an unsupported property '${params?.additionalProperty}'`,
+    dependentRequired: (fieldTitle, params) =>
+      `'${fieldTitle}' requires '${params?.missingProperty}'`,
   };
 
-  // Change the error message for required fields.
-  const transformErrors = (errors) => {
-    return errors.map((error) => {
-      if (error.name === "required") {
-        // Change the error message for the "required" validation
+  // Extract complex enum logic to separate function
+  const generateEnumMessage = useCallback((fieldTitle, fieldSchema) => {
+    let enumMessage = `'${fieldTitle}' must be one of the allowed values`;
+    if (fieldSchema?.enumNames && fieldSchema.enumNames.length > 0) {
+      const options = fieldSchema.enumNames;
+      const maxShow = 4; // Maximum options to show before truncating
+
+      if (options.length <= maxShow) {
+        // Show all options if list is small
+        enumMessage = `'${fieldTitle}' must be one of: ${options.join(", ")}`;
+      } else {
+        // Truncate long lists with "and X others" suffix
+        const firstFew = options.slice(0, maxShow).join(", ");
+        const remaining = options.length - maxShow;
+        enumMessage = `'${fieldTitle}' must be one of: ${firstFew} (and ${remaining} ${
+          remaining === 1 ? "other" : "others"
+        })`;
+      }
+    }
+    return enumMessage;
+  }, []);
+
+  const transformErrors = useCallback(
+    (errors) => {
+      return errors.map((error) => {
+        const { name, params, property } = error;
+
+        // Try to resolve nested schema/title from property path like ".a.b[0].c"
+        const path = (property || "").replace(/^\./, "");
+        const getFieldSchema = (root, pathStr) => {
+          if (!root || !pathStr) {
+            return undefined;
+          }
+          const tokens = pathStr
+            .replace(/\[(\d+)\]/g, ".$1")
+            .split(".")
+            .filter(Boolean);
+          let cur = root;
+          for (const tok of tokens) {
+            if (cur?.type === "array" && cur?.items) {
+              cur = cur.items;
+            }
+            if (cur?.properties?.[tok]) {
+              cur = cur.properties[tok];
+            }
+          }
+          return cur;
+        };
+        const schemaProps = schema?.properties ?? {};
+        const fieldSchema = getFieldSchema(schema, path);
+        const fieldName = path;
+        const fieldTitle = fieldSchema?.title || fieldName || "This field";
+
+        // Handle required fields separately (special case)
+        if (name === "required") {
+          const missingField = params?.missingProperty;
+          const missingSchema = schemaProps[missingField];
+          const missingTitle =
+            missingSchema?.title || missingField || "This field";
+          return {
+            ...error,
+            message: `'${missingTitle}' is required`,
+          };
+        }
+
+        // Handle enum separately due to complexity
+        if (name === "enum") {
+          return {
+            ...error,
+            message: generateEnumMessage(fieldTitle, fieldSchema),
+          };
+        }
+
+        // Use lookup table for simple cases
+        const messageGenerator = validationMessageGenerators[name];
+        if (messageGenerator) {
+          return {
+            ...error,
+            message: messageGenerator(fieldTitle, params),
+          };
+        }
+
+        // Default fallback
         return {
           ...error,
-          message: "This field is mandatory. Please provide a value.",
+          message: error.stack?.trim()
+            ? error.stack
+            : `'${fieldTitle}': ${error.message}`,
         };
-      }
-      return error;
-    });
-  };
+      });
+    },
+    [schema, generateEnumMessage, validationMessageGenerators],
+  );
 
-  // If required, the `formData` state can be dynamically updated to store the latest user input as they interact with the form.
-  const handleChange = (event) => {
-    if (!isStateUpdateRequired) {
-      return;
-    }
-    const data = event.formData;
-    setFormData(data);
-  };
+  const handleChange = useCallback(
+    (event) => {
+      if (!isStateUpdateRequired) {
+        return;
+      }
+      const data = event.formData;
+      setFormData(data);
+    },
+    [isStateUpdateRequired, setFormData],
+  );
+
+  // Apply CustomObjectFieldTemplate for file connector forms (those with fileReprocessingHandling)
+  const templates = useMemo(() => {
+    const isFileConnectorForm =
+      !!formSchema?.properties?.fileReprocessingHandling;
+
+    return isFileConnectorForm
+      ? {
+          FieldTemplate: CustomFieldTemplate,
+          ObjectFieldTemplate: CustomObjectFieldTemplate,
+        }
+      : {
+          FieldTemplate: CustomFieldTemplate,
+        };
+  }, [formSchema]);
 
   return (
     <>
       {isLoading ? (
         <SpinnerLoader />
       ) : (
-        <Form
-          form={formRef}
-          schema={removeBlankDefault(schema)}
-          uiSchema={uiSchema}
-          validator={validator}
-          widgets={widgets}
-          fields={fields}
-          formData={formData}
-          transformErrors={transformErrors}
-          onError={() => {}}
-          onSubmit={(e) => validateAndSubmit(e.formData)}
-          formContext={{
-            descriptionLocation: "tooltip",
-          }}
-          showErrorList={false}
-          onChange={handleChange}
-        >
-          {children}
-        </Form>
+        <Space direction="vertical" className="width-100">
+          {description && (
+            <Alert
+              message={<CustomMarkdown text={description} />}
+              type="info"
+            />
+          )}
+          <Form
+            ref={formRef}
+            schema={removeBlankDefault(formSchema)}
+            uiSchema={uiSchema}
+            validator={validator}
+            widgets={widgets}
+            fields={fields}
+            formData={formData}
+            transformErrors={transformErrors}
+            onError={() => {
+              /* intentionally empty */
+            }}
+            onSubmit={(e) => validateAndSubmit?.(e.formData)}
+            showErrorList={false}
+            onChange={handleChange}
+            templates={templates}
+            // Must be false: tool instance metadata contains fields like
+            // prompt_registry_id and tool_instance_id that are not defined
+            // in the RJSF schema (e.g. Prompt Studio tools). Setting this to
+            // true strips those fields from the form submission, causing the
+            // PATCH to /tool_instance/ to lose them — breaking workflow execution.
+            omitExtraData={false}
+            // Only applies when omitExtraData is true; explicitly false here
+            // to prevent live-stripping of any non-schema fields during edits.
+            liveOmit={false}
+          >
+            {children || <></>}
+          </Form>
+        </Space>
       )}
     </>
   );

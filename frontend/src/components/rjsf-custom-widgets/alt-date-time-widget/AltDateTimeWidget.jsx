@@ -1,10 +1,19 @@
-import { DatePicker, TimePicker } from "antd";
 import moment from "moment";
 import PropTypes from "prop-types";
+import { DatePicker, TimePicker } from "@/components/ui/shims/antd-datetime";
 
 import { RjsfWidgetLayout } from "../../../layouts/rjsf-widget-layout/RjsfWidgetLayout.jsx";
 
-const AltDateTimeWidget = ({ id, value, onChange, label, required }) => {
+const AltDateTimeWidget = ({
+  id,
+  value,
+  onChange,
+  label,
+  schema,
+  required,
+  readonly,
+}) => {
+  const description = schema?.description || "";
   const handleDateChange = (date) => {
     onChange(date?.toISOString());
   };
@@ -17,15 +26,21 @@ const AltDateTimeWidget = ({ id, value, onChange, label, required }) => {
   };
 
   return (
-    <RjsfWidgetLayout label={label} required={required}>
+    <RjsfWidgetLayout
+      label={label}
+      description={description}
+      required={required}
+    >
       <DatePicker
         id={id}
         value={value ? moment(value) : null}
         onChange={handleDateChange}
+        disabled={readonly}
       />
       <TimePicker
         value={value ? moment(value) : null}
         onChange={handleTimeChange}
+        disabled={readonly}
       />
     </RjsfWidgetLayout>
   );
@@ -36,7 +51,9 @@ AltDateTimeWidget.propTypes = {
   value: PropTypes.string,
   onChange: PropTypes.func.isRequired,
   label: PropTypes.string.isRequired,
-  required: PropTypes.bool,
+  schema: PropTypes.object.isRequired,
+  required: PropTypes.bool.isRequired,
+  readonly: PropTypes.bool.isRequired,
 };
 
 export { AltDateTimeWidget };

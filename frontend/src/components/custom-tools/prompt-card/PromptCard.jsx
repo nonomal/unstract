@@ -1,377 +1,414 @@
-import {
-  CheckCircleOutlined,
-  DeleteOutlined,
-  EditOutlined,
-  LeftOutlined,
-  LoadingOutlined,
-  PlayCircleOutlined,
-  RightOutlined,
-  SearchOutlined,
-  SyncOutlined,
-} from "@ant-design/icons";
-import {
-  Button,
-  Card,
-  Col,
-  Divider,
-  Row,
-  Select,
-  Space,
-  Spin,
-  Tag,
-  Tooltip,
-  Typography,
-} from "antd";
 import PropTypes from "prop-types";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 
 import {
-  defaultTokenUsage,
-  displayPromptResult,
-  generateUUID,
+  PROMPT_RUN_API_STATUSES,
   promptStudioUpdateStatus,
 } from "../../../helpers/GetStaticData";
-import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
+import usePostHogEvents from "../../../hooks/usePostHogEvents";
 import { useAlertStore } from "../../../store/alert-store";
 import { useCustomToolStore } from "../../../store/custom-tool-store";
-import { useSessionStore } from "../../../store/session-store";
 import { useSocketCustomToolStore } from "../../../store/socket-custom-tool";
-import { ConfirmModal } from "../../widgets/confirm-modal/ConfirmModal";
-import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
-import { EditableText } from "../editable-text/EditableText";
 import { OutputForDocModal } from "../output-for-doc-modal/OutputForDocModal";
+import { PromptCardItems } from "./PromptCardItems";
 import "./PromptCard.css";
+import { handleUpdateStatus } from "./constants";
 
-import { TokenUsage } from "../token-usage/TokenUsage";
-import usePostHogEvents from "../../../hooks/usePostHogEvents";
-import useTokenUsage from "../../../hooks/useTokenUsage";
-import { useTokenUsageStore } from "../../../store/token-usage-store";
+let useEnforceTypeSwitchGatePlugin;
+try {
+  const mod = await import(
+    "../../../plugins/lookup-studio/hooks/useEnforceTypeSwitchGate"
+  );
+  useEnforceTypeSwitchGatePlugin = mod.useEnforceTypeSwitchGate;
+} catch {
+  // Cloud plugin not present; gate falls back to no-op below.
+}
 
-const EvalBtn = null;
-const EvalMetrics = null;
-const EvalModal = null;
-const getEvalMetrics = (param1, param2) => {
-  return [];
-};
+const useEnforceTypeSwitchGate =
+  useEnforceTypeSwitchGatePlugin || (() => () => null);
 
-function PromptCard({
-  promptDetails,
-  handleChange,
-  handleDelete,
-  updateStatus,
-  updatePlaceHolder,
-}) {
-  const [enforceTypeList, setEnforceTypeList] = useState([]);
-  const [page, setPage] = useState(0);
-  const [isRunLoading, setIsRunLoading] = useState(false);
-  const [openEval, setOpenEval] = useState(false);
-  const [promptKey, setPromptKey] = useState("");
-  const [promptText, setPromptText] = useState("");
-  const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [isEditingPrompt, setIsEditingPrompt] = useState(false);
-  const [selectedLlmProfileId, setSelectedLlmProfileId] = useState(null);
-  const [result, setResult] = useState({
-    promptOutputId: null,
-    output: "",
-  });
-  const [coverage, setCoverage] = useState(0);
-  const [coverageTotal, setCoverageTotal] = useState(0);
-  const [isCoverageLoading, setIsCoverageLoading] = useState(false);
-  const [openOutputForDoc, setOpenOutputForDoc] = useState(false);
-  const [progressMsg, setProgressMsg] = useState({});
-  const [docOutputs, setDocOutputs] = useState({});
-  const divRef = useRef(null);
-  const {
-    getDropdownItems,
-    llmProfiles,
-    selectedDoc,
-    listOfDocs,
-    updateCustomTool,
-    details,
-    defaultLlmProfile,
-    disableLlmOrDocChange,
-    indexDocs,
-    summarizeIndexStatus,
-    singlePassExtractMode,
-    isSinglePassExtractLoading,
-  } = useCustomToolStore();
-  const { messages } = useSocketCustomToolStore();
-  const { sessionDetails } = useSessionStore();
-  const { setAlertDetails } = useAlertStore();
-  const axiosPrivate = useAxiosPrivate();
-  const handleException = useExceptionHandler();
-  const { setPostHogCustomEvent } = usePostHogEvents();
-  const { tokenUsage, setTokenUsage } = useTokenUsageStore();
-  const { getTokenUsage } = useTokenUsage();
+// Fields with an inline error renderer on the card. Anything else falls back
+// to the global alert, so widening the sanitizer cannot silence a rejection.
+const RENDERABLE_FIELD_ERRORS = new Set(["prompt_key"]);
 
-  useEffect(() => {
-    // Find the latest message that matches the criteria
-    const msg = [...messages]
-      .reverse()
-      .find(
-        (item) =>
-          (item?.component?.prompt_id === promptDetails?.prompt_id ||
-            item?.component?.prompt_key === promptKey) &&
-          (item?.level === "INFO" || item?.level === "ERROR")
-      );
-
-    // If no matching message is found, return early
-    if (!msg) {
-      return;
-    }
-
-    // Set the progress message state with the found message
-    setProgressMsg({
-      message: msg?.message || "",
-      level: msg?.level || "INFO",
+const PromptCard = memo(
+  ({
+    promptDetails,
+    handleChangePromptCard,
+    handleDelete,
+    updatePlaceHolder,
+    promptOutputs,
+    enforceTypeList,
+    allTableSettings,
+    setAllTableSettings,
+    setUpdatedPromptsCopy,
+    handlePromptRunRequest,
+    promptRunStatus,
+    coverageCountData,
+    isChallenge,
+  }) => {
+    const [promptDetailsState, setPromptDetailsState] = useState({});
+    const [isPromptDetailsStateUpdated, setIsPromptDetailsStateUpdated] =
+      useState(false);
+    const [updateStatus, setUpdateStatus] = useState({
+      promptId: null,
+      status: null,
     });
-  }, [messages]);
+    const [promptKey, setPromptKey] = useState("");
+    const [promptText, setPromptText] = useState("");
+    const [selectedLlmProfileId, setSelectedLlmProfileId] = useState(null);
+    const [fieldErrors, setFieldErrors] = useState({});
+    // Per-field attempt counter. The key input is debounced, not disabled
+    // while saving, so a slow rejection can land after a newer attempt has
+    // already been accepted; only the latest attempt may touch state.
+    const attemptGen = useRef({});
 
-  useEffect(() => {
-    const outputTypeData = getDropdownItems("output_type");
-    const dropdownList1 = Object.keys(outputTypeData).map((item) => {
-      return { value: outputTypeData[item] };
-    });
-    setEnforceTypeList(dropdownList1);
-  }, []);
+    const [isCoverageLoading, setIsCoverageLoading] = useState(false);
+    const [openOutputForDoc, setOpenOutputForDoc] = useState(false);
+    const [progressMsg, setProgressMsg] = useState({});
+    const [spsLoading, setSpsLoading] = useState({});
+    const {
+      llmProfiles,
+      selectedDoc,
+      details,
+      summarizeIndexStatus,
+      updateCustomTool,
+      singlePassExtractMode,
+    } = useCustomToolStore();
+    const { messages } = useSocketCustomToolStore();
+    const { setAlertDetails } = useAlertStore();
+    const { setPostHogCustomEvent } = usePostHogEvents();
+    const enforceTypeSwitchGate = useEnforceTypeSwitchGate();
 
-  useEffect(() => {
-    setSelectedLlmProfileId(promptDetails?.profile_manager || null);
-  }, [promptDetails]);
+    useEffect(() => {
+      if (
+        isPromptDetailsStateUpdated ||
+        !Object.keys(promptDetails || {})?.length
+      ) {
+        return;
+      }
+      setPromptDetailsState(promptDetails);
+      setIsPromptDetailsStateUpdated(true);
+    }, [promptDetails]);
 
-  useEffect(() => {
-    resetInfoMsgs();
-    if (isSinglePassExtractLoading) {
-      return;
-    }
+    // Initialize promptKey from props so the message filter can match
+    // per-prompt PROGRESS messages (executor sends component.prompt_key).
+    useEffect(() => {
+      if (promptDetailsState?.prompt_key && !promptKey) {
+        setPromptKey(promptDetailsState.prompt_key);
+      }
+    }, [promptDetailsState?.prompt_key]);
 
-    handleGetOutput();
-    handleGetCoverage();
-  }, [
-    selectedLlmProfileId,
-    selectedDoc,
-    listOfDocs,
-    singlePassExtractMode,
-    isSinglePassExtractLoading,
-  ]);
+    // Clear stale progress text when execution finishes.
+    useEffect(() => {
+      if (!isCoverageLoading) {
+        setProgressMsg({});
+      }
+    }, [isCoverageLoading]);
 
-  useEffect(() => {
-    let listOfIds = [...disableLlmOrDocChange];
-    const promptId = promptDetails?.prompt_id;
-    const isIncluded = listOfIds.includes(promptId);
-
-    if (
-      (isIncluded && isCoverageLoading) ||
-      (!isIncluded && !isCoverageLoading)
-    ) {
-      return;
-    }
-
-    if (isIncluded && !isCoverageLoading) {
-      listOfIds = listOfIds.filter((item) => item !== promptId);
-    }
-
-    if (!isIncluded && isCoverageLoading) {
-      listOfIds.push(promptId);
-    }
-    updateCustomTool({ disableLlmOrDocChange: listOfIds });
-  }, [isCoverageLoading]);
-
-  useEffect(() => {
-    if (page < 1) {
-      return;
-    }
-    const llmProfile = llmProfiles[page - 1];
-    if (llmProfile?.profile_id !== promptDetails?.profile_id) {
-      handleChange(
-        llmProfile?.profile_id,
-        promptDetails?.prompt_id,
-        "profile_manager"
-      );
-    }
-  }, [page]);
-
-  useEffect(() => {
-    if (isCoverageLoading && coverageTotal === listOfDocs?.length) {
-      setIsCoverageLoading(false);
-      setCoverageTotal(0);
-    }
-  }, [coverageTotal]);
-
-  const resetInfoMsgs = () => {
-    setProgressMsg({}); // Reset Progress Message
-  };
-
-  useEffect(() => {
-    const isProfilePresent = llmProfiles.some(
-      (profile) => profile.profile_id === selectedLlmProfileId
-    );
-
-    // If selectedLlmProfileId is not present, set it to null
-    if (!isProfilePresent) {
-      setSelectedLlmProfileId(null);
-    }
-
-    const llmProfileId = promptDetails?.profile_manager;
-    if (!llmProfileId) {
-      setPage(0);
-      return;
-    }
-    const index = llmProfiles.findIndex(
-      (item) => item?.profile_id === llmProfileId
-    );
-    setPage(index + 1);
-  }, [llmProfiles]);
-
-  const handlePageLeft = () => {
-    if (page <= 1) {
-      return;
-    }
-
-    const newPage = page - 1;
-    setPage(newPage);
-  };
-
-  const handlePageRight = () => {
-    if (page >= llmProfiles?.length) {
-      return;
-    }
-
-    const newPage = page + 1;
-    setPage(newPage);
-  };
-
-  const handleTypeChange = (value) => {
-    handleChange(value, promptDetails?.prompt_id, "enforce_type", true);
-  };
-
-  const handleDocOutputs = (docId, isLoading, output) => {
-    setDocOutputs((prev) => {
-      const updatedDocOutputs = { ...prev };
-      // Update the entry for the provided docId with isLoading and output
-      updatedDocOutputs[docId] = {
-        isLoading,
-        output,
-      };
-      return updatedDocOutputs;
-    });
-  };
-
-  // Generate the result for the currently selected document
-  const handleRun = () => {
-    try {
-      setPostHogCustomEvent("ps_prompt_run", {
-        info: "Click on 'Run Prompt' button (Multi Pass)",
-      });
-    } catch (err) {
-      // If an error occurs while setting custom posthog event, ignore it and continue
-    }
-
-    if (!promptDetails?.profile_manager?.length) {
-      setAlertDetails({
-        type: "error",
-        content: "LLM Profile is not selected",
-      });
-      return;
-    }
-
-    if (!selectedDoc) {
-      setAlertDetails({
-        type: "error",
-        content: "Document not selected",
-      });
-      return;
-    }
-
-    if (!promptKey) {
-      setAlertDetails({
-        type: "error",
-        content: "Prompt key cannot be empty",
-      });
-      return;
-    }
-
-    if (!promptText) {
-      setAlertDetails({
-        type: "error",
-        content: "Prompt cannot be empty",
-      });
-      return;
-    }
-
-    setIsRunLoading(true);
-    setIsCoverageLoading(true);
-    setCoverage(0);
-    setCoverageTotal(0);
-    setDocOutputs({});
-    resetInfoMsgs();
-
-    const docId = selectedDoc?.document_id;
-    const isSummaryIndexed = [...summarizeIndexStatus].find(
-      (item) => item?.docId === docId && item?.isIndexed === true
-    );
-
-    if (
-      !isSummaryIndexed &&
-      details?.summarize_as_source &&
-      details?.summarize_llm_profile
-    ) {
-      // Summary needs to be indexed before running the prompt
-      setIsRunLoading(false);
-      handleStepsAfterRunCompletion();
-      setAlertDetails({
-        type: "error",
-        content: `Summary needs to be indexed before running the prompt - ${selectedDoc?.document_name}.`,
-      });
-      return;
-    }
-
-    handleDocOutputs(docId, true, null);
-    handleRunApiRequest(docId)
-      .then((res) => {
-        const data = res?.data?.output;
-        const value = data[promptDetails?.prompt_key];
-        if (value || value === 0) {
-          setCoverage((prev) => prev + 1);
-        }
-        handleDocOutputs(docId, false, value);
-        handleGetOutput();
-      })
-      .catch((err) => {
-        setIsRunLoading(false);
-        handleDocOutputs(docId, false, null);
-        setAlertDetails(
-          handleException(err, `Failed to generate output for ${docId}`)
+    useEffect(() => {
+      // Find the latest message that matches the criteria
+      const msg = [...messages]
+        .reverse()
+        .find(
+          (item) =>
+            (item?.component?.prompt_id === promptDetailsState?.prompt_id ||
+              item?.component?.prompt_key === promptKey ||
+              item?.component?.tool_id === details?.tool_id) &&
+            (item?.level === "INFO" || item?.level === "ERROR"),
         );
-      })
-      .finally(() => {
-        handleStepsAfterRunCompletion();
+
+      // If no matching message is found, return early
+      if (!msg) {
+        return;
+      }
+
+      // Set the progress message state with the found message
+      setProgressMsg({
+        message: msg?.message || "",
+        level: msg?.level || "INFO",
       });
-  };
+    }, [messages, promptDetailsState?.prompt_id, promptKey, details?.tool_id]);
 
-  const handleStepsAfterRunCompletion = () => {
-    setCoverageTotal(1);
-    handleCoverage();
-  };
+    useEffect(() => {
+      setSelectedLlmProfileId(
+        promptDetailsState?.profile_manager || llmProfiles[0]?.profile_id,
+      );
+    }, [promptDetailsState]);
 
-  // Get the coverage for all the documents except the one that's currently selected
-  const handleCoverage = () => {
-    const listOfDocsToProcess = [...listOfDocs].filter(
-      (item) => item?.document_id !== selectedDoc?.document_id
-    );
+    useEffect(() => {
+      const promptRunStatusKeys = Object.keys(promptRunStatus);
 
-    if (listOfDocsToProcess?.length === 0) {
-      setIsCoverageLoading(false);
-      return;
-    }
+      const coverageLoading = promptRunStatusKeys.some(
+        (key) => promptRunStatus[key] === PROMPT_RUN_API_STATUSES.RUNNING,
+      );
+      setIsCoverageLoading(coverageLoading);
+    }, [promptRunStatus]);
 
-    let totalCoverageValue = 1;
-    listOfDocsToProcess.forEach((item) => {
-      const docId = item?.document_id;
+    const handleChange = async (
+      event,
+      promptId,
+      dropdownItem,
+      isUpdateStatus = false,
+    ) => {
+      let name = "";
+      let value = "";
+      if (dropdownItem?.length) {
+        name = dropdownItem;
+        value = event;
+      } else {
+        name = event.target.name;
+        value = event.target.value;
+      }
+
+      /*
+       * Functional update, NOT a spread of the captured snapshot. Header's
+       * debounced savers hold on to the `handleChange` from the render they
+       * were called in, so a save can land against newer state than it was
+       * built from. Spreading the snapshot wrote every *other* field back as
+       * it stood then: ticking "Enable Postprocessing Webhook" and typing the
+       * URL inside the 300ms toggle debounce made the URL save re-assert
+       * `enable_postprocessing_webhook: false`, unticking the box the user
+       * had just ticked (the PATCH itself only ever carries `name`, so the
+       * server kept both values and a refresh looked correct).
+       */
+      const prevValue = promptDetailsState?.[name];
+
+      const generation = (attemptGen.current[name] =
+        (attemptGen.current[name] || 0) + 1);
+      const isLatestAttempt = () => attemptGen.current[name] === generation;
+
+      const clearFieldError = () =>
+        setFieldErrors((prev) => {
+          if (!(name in prev)) return prev;
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
+
+      // New attempt — drop any prior inline error for this field.
+      clearFieldError();
+
+      handleUpdateStatus(
+        isUpdateStatus,
+        promptId,
+        promptStudioUpdateStatus.isUpdating,
+        setUpdateStatus,
+      );
+      setPromptDetailsState((prev) => ({ ...prev, [name]: value }));
+
+      // Collected here but applied in the rejection handler, so the inline
+      // error and the rollback below always land in the same render.
+      let inlineErrors = null;
+      const reportFieldError = (errors) => {
+        // A superseded attempt reports nothing: the newer one owns the field
+        // and surfaces its own outcome, so an alert here would contradict the
+        // value the user can see was accepted.
+        if (!isLatestAttempt()) {
+          return true;
+        }
+        const renderable = Object.entries(errors).filter(([attr]) =>
+          RENDERABLE_FIELD_ERRORS.has(attr),
+        );
+        // Nothing renderable — the caller falls back to the global alert so a
+        // rejected value can never fail silently.
+        if (!renderable.length) {
+          return false;
+        }
+        inlineErrors = Object.fromEntries(renderable);
+        return true;
+      };
+
+      return handleChangePromptCard(name, value, promptId, reportFieldError)
+        .then((res) => {
+          const data = res?.data;
+          setUpdatedPromptsCopy((prev) => {
+            prev[promptId] = data;
+            return prev;
+          });
+          if (isLatestAttempt()) {
+            clearFieldError();
+          }
+          handleUpdateStatus(
+            isUpdateStatus,
+            promptId,
+            promptStudioUpdateStatus.done,
+            setUpdateStatus,
+          );
+        })
+        .catch((err) => {
+          handleUpdateStatus(isUpdateStatus, promptId, null, setUpdateStatus);
+          if (isLatestAttempt()) {
+            // Roll the field back to the stored value even when the rejected
+            // text stays in the input: outputs, highlights and confidence are
+            // keyed off prompt_key and have to track the server.
+            setPromptDetailsState((prev) => ({ ...prev, [name]: prevValue }));
+            if (inlineErrors) {
+              setFieldErrors((prev) => ({ ...prev, ...inlineErrors }));
+            }
+          }
+          // Callers keeping their own copy of the value (Header's webhook and
+          // toggle state) roll back off this rejection.
+          throw err;
+        })
+        .finally(() => {
+          if (isUpdateStatus) {
+            setTimeout(() => {
+              handleUpdateStatus(true, promptId, null, setUpdateStatus);
+            }, 3000);
+          }
+        });
+    };
+
+    const handleSelectDefaultLLM = (llmProfileId) => {
+      setSelectedLlmProfileId(llmProfileId);
+      // Error already surfaced by handleChange; no local copy to roll back.
+      handleChange(
+        llmProfileId,
+        promptDetailsState?.prompt_id,
+        "profile_manager",
+      ).catch(() => {});
+    };
+
+    const addCoordsToFlattened = (coords, flattened) => {
+      if (Array.isArray(coords)) {
+        // Strip 5th element (confidence) if present, keep only first 4 elements
+        const coordsOnly = coords.length >= 5 ? coords.slice(0, 4) : coords;
+        flattened.push(coordsOnly);
+      }
+    };
+
+    const processNestedArray = (nestedValue, flattened) => {
+      if (Array.isArray(nestedValue)) {
+        nestedValue.forEach((coords) => {
+          addCoordsToFlattened(coords, flattened);
+        });
+      }
+    };
+
+    const processObjectValues = (item, flattened) => {
+      if (typeof item === "object" && !Array.isArray(item)) {
+        Object.values(item).forEach((value) => {
+          processNestedArray(value, flattened);
+        });
+      }
+    };
+
+    const processArrayItem = (item, flattened) => {
+      if (Array.isArray(item)) {
+        addCoordsToFlattened(item, flattened);
+      } else {
+        processObjectValues(item, flattened);
+      }
+    };
+
+    const flattenHighlightData = (data) => {
+      if (!data || typeof data !== "object") {
+        return data;
+      }
+
+      const flattened = [];
+      Object.values(data).forEach((value) => {
+        if (Array.isArray(value)) {
+          value.forEach((item) => {
+            processArrayItem(item, flattened);
+          });
+        }
+      });
+      return flattened;
+    };
+
+    const handleSelectHighlight = (
+      highlightData,
+      highlightedPrompt,
+      highlightedProfile,
+      confidenceData,
+    ) => {
+      if (details?.enable_highlight) {
+        const processedHighlight =
+          singlePassExtractMode &&
+          typeof highlightData === "object" &&
+          !Array.isArray(highlightData)
+            ? flattenHighlightData(highlightData)
+            : highlightData;
+
+        updateCustomTool({
+          selectedHighlight: {
+            highlight: processedHighlight,
+            highlightedPrompt: highlightedPrompt,
+            highlightedProfile: highlightedProfile,
+            confidence: confidenceData,
+          },
+        });
+      }
+    };
+
+    const handleTypeChange = (value) => {
+      const block = enforceTypeSwitchGate(promptDetailsState?.prompt_id, value);
+      if (block) {
+        setAlertDetails({ type: "error", content: block.reason });
+        return;
+      }
+      handleChange(
+        value,
+        promptDetailsState?.prompt_id,
+        "enforce_type",
+        true,
+      ).catch(() => {});
+    };
+
+    const handleSpsLoading = (docId, isLoadingStatus) => {
+      setSpsLoading((prev) => ({
+        ...prev,
+        [docId]: isLoadingStatus,
+      }));
+    };
+
+    // Generate the result for the currently selected document
+    const handleRun = (promptRunType, promptId, profileId, documentId) => {
+      try {
+        setPostHogCustomEvent("ps_prompt_run", {
+          info: "Click on 'Run Prompt' button (Multi Pass)",
+        });
+      } catch {
+        // Analytics failure should not block prompt execution
+      }
+
+      const validateInputs = () => {
+        if (!selectedDoc) {
+          setAlertDetails({
+            type: "error",
+            content: "Document not selected",
+          });
+          return true;
+        }
+
+        if (!promptKey) {
+          setAlertDetails({
+            type: "error",
+            content: "Prompt key cannot be empty",
+          });
+          return true;
+        }
+
+        if (!promptText) {
+          setAlertDetails({
+            type: "error",
+            content: "Prompt cannot be empty",
+          });
+          return true;
+        }
+
+        return false;
+      };
+
+      if (validateInputs()) {
+        return;
+      }
+
+      const docId = selectedDoc?.document_id;
       const isSummaryIndexed = [...summarizeIndexStatus].find(
-        (indexStatus) =>
-          indexStatus?.docId === docId && indexStatus?.isIndexed === true
+        (item) => item?.docId === docId && item?.isIndexed === true,
       );
 
       if (
@@ -380,513 +417,75 @@ function PromptCard({
         details?.summarize_llm_profile
       ) {
         // Summary needs to be indexed before running the prompt
-        totalCoverageValue++;
-        setCoverageTotal(totalCoverageValue);
         setAlertDetails({
           type: "error",
-          content: `Summary needs to be indexed before running the prompt - ${item?.document_name}.`,
+          content: `Summary needs to be indexed before running the prompt - ${selectedDoc?.document_name}.`,
         });
         return;
       }
 
-      handleDocOutputs(docId, true, null);
-      handleRunApiRequest(docId)
-        .then((res) => {
-          const data = res?.data?.output;
-          const outputValue = data[promptDetails?.prompt_key];
-          if (outputValue || outputValue === 0) {
-            setCoverage((prev) => prev + 1);
-          }
-          handleDocOutputs(docId, false, outputValue);
-        })
-        .catch((err) => {
-          handleDocOutputs(docId, false, null);
-          setAlertDetails(
-            handleException(err, `Failed to generate output for ${docId}`)
-          );
-        })
-        .finally(() => {
-          totalCoverageValue++;
-          setCoverageTotal(totalCoverageValue);
-        });
-    });
-  };
-
-  const handleRunApiRequest = async (docId) => {
-    const promptId = promptDetails?.prompt_id;
-    const runId = generateUUID();
-
-    // Update the token usage state with default token usage for a specific document ID
-    const tokenUsageId = promptId + "__" + docId;
-    setTokenUsage(tokenUsageId, defaultTokenUsage);
-
-    // Set up an interval to fetch token usage data at regular intervals
-    const intervalId = setInterval(
-      () => getTokenUsage(runId, tokenUsageId),
-      5000 // Fetch token usage data every 5000 milliseconds (5 seconds)
-    );
-
-    const body = {
-      document_id: docId,
-      id: promptId,
-      run_id: runId,
+      handlePromptRunRequest(promptRunType, promptId, profileId, documentId);
     };
 
-    const requestOptions = {
-      method: "POST",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/fetch_response/${details?.tool_id}`,
-      headers: {
-        "X-CSRFToken": sessionDetails?.csrfToken,
-        "Content-Type": "application/json",
-      },
-      data: body,
-    };
-
-    return axiosPrivate(requestOptions)
-      .then((res) => res)
-      .catch((err) => {
-        throw err;
-      })
-      .finally(() => {
-        clearInterval(intervalId);
-        getTokenUsage(runId, tokenUsageId);
-      });
-  };
-
-  const handleGetOutput = () => {
-    if (!selectedDoc || (!singlePassExtractMode && !selectedLlmProfileId)) {
-      setResult({
-        promptOutputId: null,
-        output: "",
-      });
-      return;
-    }
-
-    setIsRunLoading(true);
-    handleOutputApiRequest(true)
-      .then((res) => {
-        const data = res?.data;
-        if (!data || data?.length === 0) {
-          setResult({
-            promptOutputId: null,
-            output: "",
-          });
-          return;
-        }
-
-        const outputResult = data[0];
-        setResult({
-          promptOutputId: outputResult?.prompt_output_id,
-          output: outputResult?.output,
-          evalMetrics: getEvalMetrics(
-            promptDetails?.evaluate,
-            outputResult?.eval_metrics || []
-          ),
-        });
-      })
-      .catch((err) => {
-        setAlertDetails(handleException(err, "Failed to generate the result"));
-      })
-      .finally(() => {
-        setIsRunLoading(false);
-      });
-  };
-
-  const handleGetCoverage = () => {
-    if (
-      (singlePassExtractMode && !defaultLlmProfile) ||
-      (!singlePassExtractMode && !selectedLlmProfileId)
-    ) {
-      setCoverage(0);
-      return;
-    }
-
-    handleOutputApiRequest(false)
-      .then((res) => {
-        const data = res?.data;
-        handleGetCoverageData(data);
-      })
-      .catch((err) => {
-        setAlertDetails(handleException(err, "Failed to generate the result"));
-      });
-  };
-
-  const handleOutputApiRequest = async (isOutput) => {
-    let profileManager = selectedLlmProfileId;
-    if (singlePassExtractMode) {
-      profileManager = defaultLlmProfile;
-    }
-    let url = `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/prompt-output/?tool_id=${details?.tool_id}&prompt_id=${promptDetails?.prompt_id}&profile_manager=${profileManager}&is_single_pass_extract=${singlePassExtractMode}`;
-
-    if (isOutput) {
-      url += `&document_manager=${selectedDoc?.document_id}`;
-    }
-
-    const requestOptions = {
-      method: "GET",
-      url,
-      headers: {
-        "X-CSRFToken": sessionDetails?.csrfToken,
-      },
-    };
-
-    return axiosPrivate(requestOptions)
-      .then((res) => {
-        const data = res?.data || [];
-
-        if (singlePassExtractMode) {
-          const tokenUsageId = `single_pass__${selectedDoc?.document_id}`;
-          const usage = data.find((item) => item?.run_id !== undefined);
-
-          if (!tokenUsage[tokenUsageId] && usage) {
-            setTokenUsage(tokenUsageId, usage?.token_usage);
-          }
-        } else {
-          data.forEach((item) => {
-            const tokenUsageId = `${item?.prompt_id}__${item?.document_manager}`;
-
-            if (tokenUsage[tokenUsageId] === undefined) {
-              setTokenUsage(tokenUsageId, item?.token_usage);
-            }
-          });
-        }
-        return res;
-      })
-      .catch((err) => {
-        throw err;
-      });
-  };
-
-  const handleGetCoverageData = (data) => {
-    const coverageValue = data.reduce((acc, item) => {
-      if (item?.output || item?.output === 0) {
-        return acc + 1;
-      } else {
-        return acc;
-      }
-    }, 0);
-    setCoverage(coverageValue);
-  };
-
-  const enableEdit = (event) => {
-    event.stopPropagation();
-    setIsEditingTitle(true);
-    setIsEditingPrompt(true);
-  };
-
-  return (
-    <>
-      <Card className="prompt-card">
-        <div className="prompt-card-div prompt-card-bg-col1 prompt-card-rad">
-          <Space direction="vertical" className="width-100" ref={divRef}>
-            <Row>
-              <Col span={12}>
-                <EditableText
-                  isEditing={isEditingTitle}
-                  setIsEditing={setIsEditingTitle}
-                  text={promptKey}
-                  setText={setPromptKey}
-                  promptId={promptDetails?.prompt_id}
-                  defaultText={promptDetails?.prompt_key}
-                  handleChange={handleChange}
-                  placeHolder={updatePlaceHolder}
-                />
-              </Col>
-              <Col span={12} className="display-flex-right">
-                {progressMsg?.message && (
-                  <Tooltip title={progressMsg?.message || ""}>
-                    <Tag
-                      icon={isCoverageLoading && <LoadingOutlined spin />}
-                      color={
-                        progressMsg?.level === "ERROR" ? "error" : "processing"
-                      }
-                      className="display-flex-align-center"
-                    >
-                      <div className="tag-max-width ellipsis">
-                        {progressMsg?.message}
-                      </div>
-                    </Tag>
-                  </Tooltip>
-                )}
-                {updateStatus?.promptId === promptDetails?.prompt_id && (
-                  <>
-                    {updateStatus?.status ===
-                      promptStudioUpdateStatus.isUpdating && (
-                      <Tag
-                        icon={<SyncOutlined spin />}
-                        color="processing"
-                        className="display-flex-align-center"
-                      >
-                        Updating
-                      </Tag>
-                    )}
-                    {updateStatus?.status === promptStudioUpdateStatus.done && (
-                      <Tag
-                        icon={<CheckCircleOutlined />}
-                        color="success"
-                        className="display-flex-align-center"
-                      >
-                        Done
-                      </Tag>
-                    )}
-                    {updateStatus?.status ===
-                      promptStudioUpdateStatus.validationError && (
-                      <Tag
-                        icon={<CheckCircleOutlined />}
-                        color="error"
-                        className="display-flex-align-center"
-                      >
-                        Invalid JSON Key
-                      </Tag>
-                    )}
-                  </>
-                )}
-                <Tooltip title="Edit">
-                  <Button
-                    size="small"
-                    type="text"
-                    className="display-flex-align-center prompt-card-action-button"
-                    onClick={enableEdit}
-                    disabled={
-                      disableLlmOrDocChange.includes(
-                        promptDetails?.prompt_id
-                      ) ||
-                      isSinglePassExtractLoading ||
-                      indexDocs.includes(selectedDoc?.document_id)
-                    }
-                  >
-                    <EditOutlined className="prompt-card-actions-head" />
-                  </Button>
-                </Tooltip>
-                {!singlePassExtractMode && (
-                  <Tooltip title="Run">
-                    <Button
-                      size="small"
-                      type="text"
-                      className="prompt-card-action-button"
-                      onClick={handleRun}
-                      disabled={
-                        (updateStatus?.promptId === promptDetails?.prompt_id &&
-                          updateStatus?.status ===
-                            promptStudioUpdateStatus.isUpdating) ||
-                        disableLlmOrDocChange.includes(
-                          promptDetails?.prompt_id
-                        ) ||
-                        indexDocs.includes(selectedDoc?.document_id)
-                      }
-                    >
-                      <PlayCircleOutlined className="prompt-card-actions-head" />
-                    </Button>
-                  </Tooltip>
-                )}
-                <ConfirmModal
-                  handleConfirm={() => handleDelete(promptDetails?.prompt_id)}
-                  content="The prompt will be permanently deleted."
-                >
-                  <Tooltip title="Delete">
-                    <Button
-                      size="small"
-                      type="text"
-                      className="prompt-card-action-button"
-                      disabled={
-                        disableLlmOrDocChange.includes(
-                          promptDetails?.prompt_id
-                        ) ||
-                        isSinglePassExtractLoading ||
-                        indexDocs.includes(selectedDoc?.document_id)
-                      }
-                    >
-                      <DeleteOutlined className="prompt-card-actions-head" />
-                    </Button>
-                  </Tooltip>
-                </ConfirmModal>
-              </Col>
-            </Row>
-            <EditableText
-              isEditing={isEditingPrompt}
-              setIsEditing={setIsEditingPrompt}
-              text={promptText}
-              setText={setPromptText}
-              promptId={promptDetails?.prompt_id}
-              defaultText={promptDetails.prompt}
-              handleChange={handleChange}
-              isTextarea={true}
-              placeHolder={updatePlaceHolder}
-            />
-          </Space>
-        </div>
-        <>
-          <Divider className="prompt-card-divider" />
-          <Space
-            direction="vertical"
-            className={`prompt-card-comp-layout ${
-              !(isRunLoading || result?.output || result?.output === 0) &&
-              "prompt-card-comp-layout-border"
-            }`}
-          >
-            <div className="prompt-card-llm-profiles">
-              <Space direction="horizontal">
-                {EvalBtn && !singlePassExtractMode && (
-                  <EvalBtn
-                    btnText={promptDetails?.evaluate ? "On" : "Off"}
-                    promptId={promptDetails.prompt_id}
-                    setOpenEval={setOpenEval}
-                  />
-                )}
-                <Button
-                  size="small"
-                  type="link"
-                  className="display-flex-align-center prompt-card-action-button"
-                  onClick={() => setOpenOutputForDoc(true)}
-                >
-                  <Space>
-                    {isCoverageLoading ? (
-                      <SpinnerLoader size="small" />
-                    ) : (
-                      <SearchOutlined className="font-size-12" />
-                    )}
-                    <Typography.Link className="font-size-12">
-                      Coverage: {coverage} of {listOfDocs?.length || 0} docs
-                    </Typography.Link>
-                  </Space>
-                </Button>
-              </Space>
-              <Space>
-                {!singlePassExtractMode && (
-                  <TokenUsage
-                    tokenUsageId={
-                      promptDetails?.prompt_id + "__" + selectedDoc?.document_id
-                    }
-                  />
-                )}
-                <Select
-                  className="prompt-card-select-type"
-                  size="small"
-                  placeholder="Enforce Type"
-                  optionFilterProp="children"
-                  options={enforceTypeList}
-                  value={promptDetails?.enforce_type || null}
-                  disabled={
-                    disableLlmOrDocChange.includes(promptDetails?.prompt_id) ||
-                    isSinglePassExtractLoading ||
-                    indexDocs.includes(selectedDoc?.document_id)
-                  }
-                  onChange={(value) => handleTypeChange(value)}
-                />
-              </Space>
-            </div>
-            <div className="prompt-card-llm-profiles">
-              {!singlePassExtractMode && (
-                <>
-                  {llmProfiles?.length > 0 &&
-                  promptDetails?.profile_manager?.length > 0 &&
-                  selectedLlmProfileId ? (
-                    <div>
-                      {llmProfiles
-                        .filter(
-                          (profile) =>
-                            profile.profile_id === selectedLlmProfileId
-                        )
-                        .map((profile, index) => (
-                          <div key={index}>
-                            <Tag>{profile.llm}</Tag>
-                            <Tag>{profile.vector_store}</Tag>
-                            <Tag>{profile.embedding_model}</Tag>
-                            <Tag>{profile.x2text}</Tag>
-                            <Tag>{`${profile.chunk_size}/${profile.chunk_overlap}/${profile.retrieval_strategy}/${profile.similarity_top_k}/${profile.section}`}</Tag>
-                          </div>
-                        ))}
-                    </div>
-                  ) : (
-                    <div>
-                      <Typography.Text className="font-size-12">
-                        No LLM Profile Selected
-                      </Typography.Text>
-                    </div>
-                  )}
-                </>
-              )}
-              {!singlePassExtractMode && (
-                <div className="display-flex-right prompt-card-paginate-div">
-                  <Button
-                    type="text"
-                    size="small"
-                    className="prompt-card-action-button"
-                    disabled={
-                      page <= 1 ||
-                      disableLlmOrDocChange.includes(
-                        promptDetails?.prompt_id
-                      ) ||
-                      isSinglePassExtractLoading ||
-                      indexDocs.includes(selectedDoc?.document_id)
-                    }
-                    onClick={handlePageLeft}
-                  >
-                    <LeftOutlined className="prompt-card-paginate" />
-                  </Button>
-                  <Button
-                    type="text"
-                    size="small"
-                    className="prompt-card-action-button"
-                    disabled={
-                      page >= llmProfiles?.length ||
-                      disableLlmOrDocChange.includes(
-                        promptDetails?.prompt_id
-                      ) ||
-                      isSinglePassExtractLoading ||
-                      indexDocs.includes(selectedDoc?.document_id)
-                    }
-                    onClick={handlePageRight}
-                  >
-                    <RightOutlined className="prompt-card-paginate" />
-                  </Button>
-                </div>
-              )}
-            </div>
-            {EvalMetrics && <EvalMetrics result={result} />}
-          </Space>
-        </>
-        {(isRunLoading || result?.output || result?.output === 0) && (
-          <>
-            <Divider className="prompt-card-divider" />
-            <div className="prompt-card-result prompt-card-div">
-              {isRunLoading ? (
-                <Spin indicator={<SpinnerLoader size="small" />} />
-              ) : (
-                <Typography.Paragraph className="prompt-card-res font-size-12">
-                  <div>{displayPromptResult(result?.output, true)}</div>
-                </Typography.Paragraph>
-              )}
-            </div>
-          </>
-        )}
-      </Card>
-      {EvalModal && !singlePassExtractMode && (
-        <EvalModal
-          open={openEval}
-          setOpen={setOpenEval}
-          promptDetails={promptDetails}
+    return (
+      <>
+        <PromptCardItems
+          promptDetails={promptDetailsState}
+          enforceTypeList={enforceTypeList}
+          allTableSettings={allTableSettings}
+          promptKey={promptKey}
+          setAllTableSettings={setAllTableSettings}
+          setPromptKey={setPromptKey}
+          promptText={promptText}
+          setPromptText={setPromptText}
+          progressMsg={progressMsg}
+          handleRun={handleRun}
           handleChange={handleChange}
+          handleTypeChange={handleTypeChange}
+          handleDelete={handleDelete}
+          updateStatus={updateStatus}
+          updatePlaceHolder={updatePlaceHolder}
+          isCoverageLoading={isCoverageLoading}
+          setOpenOutputForDoc={setOpenOutputForDoc}
+          selectedLlmProfileId={selectedLlmProfileId}
+          handleSelectDefaultLLM={handleSelectDefaultLLM}
+          spsLoading={spsLoading}
+          handleSpsLoading={handleSpsLoading}
+          promptOutputs={promptOutputs}
+          promptRunStatus={promptRunStatus}
+          coverageCountData={coverageCountData}
+          isChallenge={isChallenge}
+          handleSelectHighlight={handleSelectHighlight}
+          fieldErrors={fieldErrors}
         />
-      )}
-      <OutputForDocModal
-        open={openOutputForDoc}
-        setOpen={setOpenOutputForDoc}
-        promptId={promptDetails?.prompt_id}
-        promptKey={promptDetails?.prompt_key}
-        profileManagerId={promptDetails?.profile_manager}
-        docOutputs={docOutputs}
-      />
-    </>
-  );
-}
+        <OutputForDocModal
+          open={openOutputForDoc}
+          setOpen={setOpenOutputForDoc}
+          promptId={promptDetailsState?.prompt_id}
+          promptKey={promptDetailsState?.prompt_key}
+          profileManagerId={selectedLlmProfileId}
+        />
+      </>
+    );
+  },
+);
+
+PromptCard.displayName = "PromptCard";
 
 PromptCard.propTypes = {
   promptDetails: PropTypes.object.isRequired,
-  handleChange: PropTypes.func.isRequired,
+  handleChangePromptCard: PropTypes.func.isRequired,
   handleDelete: PropTypes.func.isRequired,
-  updateStatus: PropTypes.object.isRequired,
   updatePlaceHolder: PropTypes.string,
+  promptOutputs: PropTypes.object.isRequired,
+  enforceTypeList: PropTypes.array.isRequired,
+  allTableSettings: PropTypes.array.isRequired,
+  setAllTableSettings: PropTypes.func.isRequired,
+  setUpdatedPromptsCopy: PropTypes.func.isRequired,
+  handlePromptRunRequest: PropTypes.func.isRequired,
+  promptRunStatus: PropTypes.object.isRequired,
+  coverageCountData: PropTypes.array,
+  isChallenge: PropTypes.bool.isRequired,
 };
 
 export { PromptCard };

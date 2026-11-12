@@ -1,12 +1,14 @@
-import { Table, Modal, Button } from "antd";
 import PropTypes from "prop-types";
 import { useState } from "react";
-
-import { useSessionStore } from "../../../store/session-store.js";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Modal } from "@/components/ui/shims/antd-overlays";
+import { Table } from "@/components/ui/shims/antd-structure";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate.js";
-import { useAlertStore } from "../../../store/alert-store.js";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
+import { useAlertStore } from "../../../store/alert-store.js";
+import { useSessionStore } from "../../../store/session-store.js";
 import "./LogsModel.css";
+import CustomMarkdown from "../../helpers/custom-markdown/CustomMarkdown.jsx";
 
 const LogsModal = ({
   open,
@@ -14,6 +16,7 @@ const LogsModal = ({
   logRecord,
   totalLogs,
   fetchExecutionLogs,
+  loading = false,
 }) => {
   const [selectedLogId, setSelectedLogId] = useState(null);
   const [logDescModalOpen, setLogDescModalOpen] = useState(false);
@@ -38,16 +41,16 @@ const LogsModal = ({
     };
     axiosPrivate(requestOptions)
       .then((res) => {
-        const logDetails = res.data.results.map((item) => ({
-          id: item.id,
-          log: item.data?.log,
-          type: item.data?.type,
-          stage: item.data?.stage,
-          level: item.data?.level,
-          event_time: item.event_time,
+        const logDetails = res?.data?.results?.map((item) => ({
+          id: item?.id,
+          log: item?.data?.log,
+          type: item?.data?.type,
+          stage: item?.data?.stage,
+          level: item?.data?.level,
+          event_time: item?.event_time,
         }));
         setLogDetails(logDetails);
-        setTotalCount(res.data.count);
+        setTotalCount(res?.data?.count);
       })
       .catch((err) => {
         setAlertDetails(handleException(err));
@@ -74,7 +77,7 @@ const LogsModal = ({
         return (
           <Button
             type="link"
-            onClick={() => handleLogIdClick(record.execution_id)}
+            onClick={() => handleLogIdClick(record?.execution_id)}
           >
             {text}
           </Button>
@@ -85,7 +88,7 @@ const LogsModal = ({
       title: "Status",
       dataIndex: "status",
       key: "status",
-      render: (level) => <span className={level.toLowerCase()}>{level}</span>,
+      render: (level) => <span className={level?.toLowerCase()}>{level}</span>,
     },
   ];
 
@@ -104,14 +107,16 @@ const LogsModal = ({
       title: "Log Level",
       dataIndex: "level",
       key: "level",
-      render: (level) => <span className={level.toLowerCase()}>{level}</span>,
+      render: (level) => <span className={level?.toLowerCase()}>{level}</span>,
     },
     {
       title: "Log",
       dataIndex: "log",
       key: "log",
+      render: (log) => <CustomMarkdown text={log || ""} />,
     },
   ];
+
   return (
     <>
       <Modal
@@ -127,6 +132,7 @@ const LogsModal = ({
           dataSource={logRecord}
           rowKey="id"
           align="left"
+          loading={loading}
           pagination={{
             total: totalLogs,
             onChange: (page, pageSize) => {
@@ -169,6 +175,7 @@ LogsModal.propTypes = {
   logRecord: PropTypes.array.isRequired,
   totalLogs: PropTypes.number.isRequired,
   fetchExecutionLogs: PropTypes.func.isRequired,
+  loading: PropTypes.bool,
 };
 
 export { LogsModal };

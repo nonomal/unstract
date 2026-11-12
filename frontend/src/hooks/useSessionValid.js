@@ -1,32 +1,89 @@
 import axios from "axios";
 import Cookies from "js-cookie";
 import { useNavigate } from "react-router-dom";
-
+import { listFlags } from "../helpers/FeatureFlagsData.js";
 import { getSessionData } from "../helpers/GetSessionData";
-
+import { usableAdapters } from "../helpers/GetStaticData";
+import { isOrgSwitchViaLogin } from "../helpers/orgSwitchLogin.js";
 import { useExceptionHandler } from "../hooks/useExceptionHandler.jsx";
+import { useAlertStore } from "../store/alert-store";
 import { useSessionStore } from "../store/session-store";
 import { useUserSession } from "./useUserSession.js";
 
-let getTrialDetails;
 let isPlatformAdmin;
 try {
-  getTrialDetails = require("../plugins/subscription/trial-helper/fetchTrialDetails.jsx");
-  isPlatformAdmin =
-    require("../plugins/hooks/usePlatformAdmin.js").usePlatformAdmin();
-} catch (err) {
+  const mod = await import("../plugins/hooks/usePlatformAdmin.js");
+  isPlatformAdmin = mod.usePlatformAdmin();
+} catch {
   // Plugin not available
 }
 
+let selectedProduct;
+let selectedProductStore;
+let PRODUCT_NAMES = {};
+
+try {
+  selectedProductStore = await import(
+    "../plugins/store/select-product-store.js"
+  );
+  const helperMod = await import("../plugins/llm-whisperer/helper");
+  // Guard against empty/missing module export
+  PRODUCT_NAMES = helperMod.PRODUCT_NAMES ?? {};
+} catch {
+  // Ignore if hook not available
+}
 function useSessionValid() {
   const setSessionDetails = useSessionStore((state) => state.setSessionDetails);
   const handleException = useExceptionHandler();
+  const { setAlertDetails } = useAlertStore();
   const navigate = useNavigate();
   const userSession = useUserSession();
+
+  try {
+    if (selectedProductStore?.useSelectedProductStore) {
+      selectedProduct = selectedProductStore?.useSelectedProductStore(
+        (state) => state?.selectedProduct,
+      );
+    }
+  } catch {
+    // Plugin hook may throw during initialization
+  }
+  const navToSelectProduct = (
+    userSessionData,
+    selectedProductStore,
+    selectedProduct,
+  ) => {
+    if (
+      userSessionData &&
+      selectedProductStore &&
+      Object.keys(PRODUCT_NAMES).length !== 0 &&
+      !Object.values(PRODUCT_NAMES).includes(selectedProduct)
+    ) {
+      navigate("/selectProduct");
+      return true; // Indicate that navigation has occurred
+    }
+    return false;
+  };
   return async () => {
+    let userAndOrgDetails = null;
     try {
       const userSessionData = await userSession();
+
+      // Return if the user is not authenticated
+      if (!userSessionData) {
+        return;
+      }
+
       const signedInOrgId = userSessionData?.organization_id;
+      const shouldNavigate = navToSelectProduct(
+        userSessionData,
+        selectedProductStore,
+        selectedProduct,
+      );
+      if (shouldNavigate) {
+        return; // Exit early, don't run the remaining steps
+      }
+      const isUnstract = !(selectedProduct && selectedProduct !== "unstract");
 
       // API to get the list of organizations
       const requestOptions = {
@@ -36,13 +93,12 @@ function useSessionValid() {
       const getOrgsRes = await axios(requestOptions);
       const orgs = getOrgsRes?.data?.organizations;
       if (!orgs?.length) {
-        throw Error("Organizations not available.");
+        throw new Error("Organizations not available.");
       }
       if (orgs?.length > 1 && !signedInOrgId?.length) {
         navigate("/setOrg", { state: orgs });
         return;
       }
-      let userAndOrgDetails = null;
       const orgId = signedInOrgId || orgs[0].id;
       const csrfToken = Cookies.get("csrftoken");
 
@@ -58,11 +114,13 @@ function useSessionValid() {
           window.location.reload();
         }
       });
+
       userAndOrgDetails = setOrgRes?.data?.user;
       userAndOrgDetails["orgName"] = setOrgRes?.data?.organization?.name;
       userAndOrgDetails["orgId"] = orgId;
       userAndOrgDetails["csrfToken"] = csrfToken;
       userAndOrgDetails["logEventsId"] = setOrgRes?.data?.log_events_id;
+      userAndOrgDetails["is_staff"] = userSessionData?.is_staff;
 
       requestOptions["method"] = "GET";
 
@@ -82,37 +140,42 @@ function useSessionValid() {
         .pop()
         .split(";")[0];
       userAndOrgDetails["zCode"] = zCode;
+      if (isUnstract) {
+        requestOptions["method"] = "GET";
 
-      requestOptions["method"] = "GET";
-
-      requestOptions["url"] = `/api/v1/unstract/${orgId}/adapter/`;
-      requestOptions["headers"] = {
-        "X-CSRFToken": csrfToken,
-      };
-      const getAdapterDetails = await axios(requestOptions);
-      const adapterTypes = [
-        ...new Set(
-          getAdapterDetails?.data?.map((obj) => obj.adapter_type.toLowerCase())
-        ),
-      ];
-      userAndOrgDetails["adapters"] = adapterTypes;
-
-      if (getTrialDetails) {
-        const remainingTrialDays = await getTrialDetails.fetchTrialDetails(
-          orgId,
-          csrfToken
-        );
-        if (remainingTrialDays)
-          userAndOrgDetails["remainingTrialDays"] = remainingTrialDays;
+        requestOptions["url"] = `/api/v1/unstract/${orgId}/adapter/`;
+        requestOptions["headers"] = {
+          "X-CSRFToken": csrfToken,
+        };
+        const getAdapterDetails = await axios(requestOptions);
+        const adapterTypes = [
+          ...new Set(
+            usableAdapters(getAdapterDetails?.data).map((obj) =>
+              obj.adapter_type.toLowerCase(),
+            ),
+          ),
+        ];
+        userAndOrgDetails["adapters"] = adapterTypes;
       }
+
+      if (isUnstract) {
+        const flags = await listFlags(orgId, csrfToken);
+        userAndOrgDetails["flags"] = flags;
+      }
+
       userAndOrgDetails["allOrganization"] = orgs;
       if (isPlatformAdmin) {
         userAndOrgDetails["isPlatformAdmin"] = await isPlatformAdmin();
       }
-      // Set the session details
-      setSessionDetails(getSessionData(userAndOrgDetails));
+      userAndOrgDetails["role"] = userSessionData.role;
+      userAndOrgDetails["provider"] = userSessionData.provider;
+      userAndOrgDetails["disable_sso_idp_authorization"] =
+        userSessionData.disable_sso_idp_authorization;
+      userAndOrgDetails["orgSwitchViaLogin"] =
+        isOrgSwitchViaLogin(userSessionData);
     } catch (err) {
       // TODO: Throw popup error message
+      // REVIEW: Add condition to check for trial period status
       if (err.response?.status === 402) {
         handleException(err);
       }
@@ -124,6 +187,10 @@ function useSessionValid() {
         window.location.href = `/error?code=${code}&domain=${domainName}`;
         // May be need a logout button there or auto logout
       }
+      setAlertDetails(handleException(err));
+    } finally {
+      // Set the session details
+      setSessionDetails(getSessionData(userAndOrgDetails));
     }
   };
 }

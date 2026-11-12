@@ -1,22 +1,38 @@
 /* Styles for ConfigureDs */
 
 .config-layout {
-    width: 100%;
-    padding-bottom: 15px;
+  width: 100%;
+  padding-bottom: 15px;
 }
 
 .config-row {
-    margin-top: 10px;
+  margin-top: 10px;
 }
 
 .config-col1 {
-    padding-right: 5px;
+  padding-right: 5px;
 }
 
 .config-col2 {
-    padding-right: 5px;
+  padding-right: 5px;
 }
 
 .config-tc-btn {
-    background-color: #4BB543 !important;
+  background-color: #4bb543 !important;
+}
+
+.config-doc-link {
+  text-align: right;
+  margin-bottom: 8px;
+}
+
+.config-doc-icon {
+  font-size: 16px;
+  /* width/height, not font-size alone: antd shipped an icon FONT (sized by
+   * font-size); lucide ships SVGs, which ignore it and fall back to their
+   * own 24px default. font-size is kept for any text in the same element. */
+  width: 16px;
+  height: 16px;
+  color: var(--primary);
+  cursor: pointer;
 }

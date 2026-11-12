@@ -1,5 +1,5 @@
-import { Spin } from "antd";
 import PropTypes from "prop-types";
+import { Spin } from "@/components/ui/shims/antd-leaves";
 
 import "./SpinnerLoader.css";
 
@@ -18,12 +18,14 @@ function SpinnerLoader({
   align = "center",
 }) {
   return (
-    <div
-      className={`spinner-loader-layout ${
-        align === SPINNER_ALIGNMENT.DEFAULT ? "" : "center"
-      }`}
-    >
-      <Spin delay={delay} tip={text} size={size} />
+    <div className="width-100 height-100">
+      <div
+        className={`spinner-loader-layout ${
+          align === SPINNER_ALIGNMENT.DEFAULT ? "" : "center"
+        }`}
+      >
+        <Spin delay={delay} tip={text} size={size} />
+      </div>
     </div>
   );
 }

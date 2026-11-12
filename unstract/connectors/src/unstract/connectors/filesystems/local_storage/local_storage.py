@@ -1,16 +1,18 @@
 import logging
 import os
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from fsspec.implementations.local import LocalFileSystem
 
+from unstract.connectors.exceptions import ConnectorError
 from unstract.connectors.filesystems.unstract_file_system import UnstractFileSystem
 
 logger = logging.getLogger(__name__)
 
 
 class LocalStorageFS(UnstractFileSystem):
-    def __init__(self, settings: Optional[dict] = None):  # type:ignore
+    def __init__(self, settings: dict | None = None):  # type:ignore
         super().__init__("LocalStorage")
         self.path = settings["path"]  # type:ignore
         self.local = LocalFileSystem()
@@ -58,11 +60,84 @@ class LocalStorageFS(UnstractFileSystem):
     def get_fsspec_fs(self) -> Any:
         return self.local
 
+    def extract_metadata_file_hash(self, metadata: dict[str, Any]) -> str | None:
+        """Extracts a unique file hash from metadata.
+
+        Args:
+            metadata (dict): Metadata dictionary obtained from fsspec.
+
+        Returns:
+            Optional[str]: The file hash in hexadecimal format or None if not found.
+        """
+        logger.error(f"[LocalStorage] File hash not found for the metadata: {metadata}")
+        return None
+
+    def is_dir_by_metadata(self, metadata: dict[str, Any]) -> bool:
+        """Check if the given path is a directory.
+
+        Args:
+            metadata (dict): Metadata dictionary obtained from fsspec or cloud API.
+
+        Returns:
+            bool: True if the path is a directory, False otherwise.
+        """
+        return metadata.get("type") == "directory"
+
+    def extract_modified_date(self, metadata: dict[str, Any]) -> datetime | None:
+        """Extract the last modified date from local filesystem metadata.
+
+        Args:
+            metadata: File metadata dictionary from fsspec
+
+        Returns:
+            datetime object or None if not available
+        """
+        # Try common keys across providers
+        mtime = None
+        for key in ("mtime", "modified", "last_modified", "LastModified"):
+            if key in metadata:
+                mtime = metadata[key]
+                break
+        if isinstance(mtime, datetime):
+            dt = mtime if mtime.tzinfo else mtime.replace(tzinfo=UTC)
+            return dt.astimezone(UTC)
+        if isinstance(mtime, (int, float)):
+            # Unix timestamp (seconds)
+            return datetime.fromtimestamp(mtime, tz=UTC)
+        if isinstance(mtime, str):
+            s = mtime.strip()
+            # Handle trailing 'Z'
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except ValueError:
+                # Fall back: numeric string
+                try:
+                    return datetime.fromtimestamp(float(s), tz=UTC)
+                except Exception:
+                    logger.debug(
+                        f"[LocalStorage] Unparseable modified date in metadata: {metadata}"
+                    )
+                    return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt.astimezone(UTC)
+        logger.debug(f"[LocalStorage] No modified date found in metadata: {metadata}")
+        return None
+
     def test_credentials(self, *args, **kwargs) -> bool:  # type:ignore
         """To test credentials for LocalStorage."""
+        is_dir = False
         try:
-            self.get_fsspec_fs().isdir("/")
+            is_dir = bool(self.get_fsspec_fs().isdir("/"))
         except Exception as e:
-            logger.error(f"Test creds failed: {e}")
-            return False
+            raise ConnectorError(
+                f"Error while connecting to local storage: {str(e)}"
+            ) from e
+        if not is_dir:
+            raise ConnectorError(
+                "Unable to connect to local storage, "
+                "please check the connection settings."
+            )
         return True

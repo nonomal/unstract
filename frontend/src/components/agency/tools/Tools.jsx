@@ -1,14 +1,14 @@
 import debounce from "lodash/debounce";
+import { Search } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { SearchOutlined } from "@ant-design/icons";
-import { Input } from "antd";
+import { Input } from "@/components/ui/shims/antd-inputs";
 import "./Tools.css";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
+import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import { useAlertStore } from "../../../store/alert-store";
 import { useSessionStore } from "../../../store/session-store";
 import { ListOfTools } from "../list-of-tools/ListOfTools";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 
 function Tools() {
   const [listOfTools, setListOfTools] = useState([]);
@@ -58,7 +58,7 @@ function Tools() {
     debounce(({ target: { value } }) => {
       setSearch(value);
     }, 600),
-    []
+    [],
   );
 
   return (
@@ -68,7 +68,7 @@ function Tools() {
           className="tool-chest-input"
           placeholder="Search for tool"
           onChange={onSearchDebounce}
-          prefix={<SearchOutlined className="icon" />}
+          prefix={<Search className="icon" />}
         />
       </div>
       <div className="wf-tools-list">

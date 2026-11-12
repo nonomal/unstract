@@ -1,5 +1,7 @@
 import os
 
+from s3fs.core import S3FileSystem
+
 from unstract.connectors.filesystems.minio.minio import MinioFS
 
 
@@ -8,6 +10,15 @@ class UnstractCloudStorage(MinioFS):
 
     Implemented with Google Cloud Storage through Minio.
     """
+
+    # UCS credentials always have full access to UCS buckets, so skip the
+    # per-bucket access probe that MinioFS runs on its fsspec filesystem.
+    # The probe adds latency and could hide a bucket on a transient S3 error.
+    _FS_CLASS = S3FileSystem
+    # UCS restricts access via its own `path` setting, not `bucket` — its
+    # schema never carries `bucket`, so MinioFS's required-bucket check
+    # doesn't apply here.
+    _REQUIRES_BUCKET = False
 
     @staticmethod
     def get_id() -> str:
@@ -23,7 +34,7 @@ class UnstractCloudStorage(MinioFS):
 
     @staticmethod
     def get_icon() -> str:
-        return "/icons/connector-icons/Pandora%20Storage.png"
+        return "/icons/connector-icons/Unstract%20Storage.png"
 
     @staticmethod
     def get_json_schema() -> str:

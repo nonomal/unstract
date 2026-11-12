@@ -1,37 +1,84 @@
 import http
-import json
 import logging
 import os
-from typing import Any, Optional
+import re
+import uuid
+from importlib import import_module
+from typing import Any
 
-import redis
 import socketio
+from account_v2.constants import ROW_BACKED_SESSION_ENGINES
 from django.conf import settings
+from django.contrib.auth import (
+    BACKEND_SESSION_KEY,
+    HASH_SESSION_KEY,
+    SESSION_KEY,
+    load_backend,
+)
 from django.core.wsgi import WSGIHandler
-from unstract.workflow_execution.enums import LogType
-from utils.constants import ExecutionLogConstants
-from utils.dto import LogDataDTO
+from django.db import close_old_connections
+from django.utils.crypto import constant_time_compare
 
-from unstract.core.constants import LogFieldName
+from unstract.core.cache.redis_client import create_redis_client
+from unstract.core.data_models import LogDataDTO
+from unstract.core.log_utils import get_validated_log_data, store_execution_log
+from utils.constants import ExecutionLogConstants
+from utils.cors_origin import RegexOrigin
 
 logger = logging.getLogger(__name__)
+
+_SESSION_KEY_RE = re.compile(r"[a-z0-9]{32}")
+# Socket ids per signed-in session, so that ending a session can disconnect its
+# sockets on every worker: a worker can list only its own sockets.
+_SESSION_SOCKETS_PREFIX = "session_sockets:"
+_SOCKET_SESSION_PREFIX = "socket_session:"
+
+
+_cors_allowed_origins: list[Any] = list(settings.CORS_ALLOWED_ORIGINS)
+for _pattern in getattr(settings, "CORS_ALLOWED_ORIGIN_REGEXES", []):
+    _cors_allowed_origins.append(RegexOrigin(_pattern))
+
+_kombu_kwargs: dict[str, Any] = {"url": settings.SOCKET_IO_MANAGER_URL}
+if getattr(settings, "SOCKET_IO_TRANSPORT_OPTIONS", None):
+    _kombu_kwargs["connection_options"] = {
+        "transport_options": settings.SOCKET_IO_TRANSPORT_OPTIONS
+    }
 
 sio = socketio.Server(
     # Allowed values: {threading, eventlet, gevent, gevent_uwsgi}
     async_mode="threading",
-    cors_allowed_origins=settings.CORS_ALLOWED_ORIGINS,
+    cors_allowed_origins=_cors_allowed_origins,
     logger=False,
     engineio_logger=False,
     always_connect=True,
-    client_manager=socketio.KombuManager(url=settings.SOCKET_IO_MANAGER_URL),
+    client_manager=socketio.KombuManager(**_kombu_kwargs),
 )
 
-redis_conn = redis.Redis(
-    host=settings.REDIS_HOST,
-    port=int(settings.REDIS_PORT),
-    username=settings.REDIS_USER,
-    password=settings.REDIS_PASSWORD,
-)
+
+def _reset_pubsub_host_id() -> None:
+    """Give each forked worker its own pub/sub identity.
+
+    python-socketio (5.11+) drops pub/sub messages carrying its own
+    ``host_id``, on the assumption the publisher already delivered them
+    locally. With ``gunicorn --preload`` this module runs once in the master,
+    so every forked worker would inherit the same ``host_id`` and silently
+    discard events published by a sibling worker — e.g. a Prompt Studio result
+    whose ``/internal/emit-websocket/`` call landed on the other worker than
+    the browser's socket.
+    """
+    sio.manager.host_id = uuid.uuid4().hex
+
+
+os.register_at_fork(after_in_child=_reset_pubsub_host_id)
+
+_redis_conn = None
+
+
+def _get_redis_conn():
+    global _redis_conn
+    if _redis_conn is None:
+        _redis_conn = create_redis_client(decode_responses=False)
+    return _redis_conn
 
 
 @sio.event
@@ -43,8 +90,29 @@ def connect(sid: str, environ: Any, auth: Any) -> None:
     logger.info(f"[{os.getpid()}] Client with SID:{sid} connected")
     session_id = _get_user_session_id_from_cookies(sid, environ)
     if session_id:
+        # Fail closed: a socket that ending its session could not reach would
+        # keep receiving that session's and its user's events.
+        if not _track_session_socket(sid, session_id):
+            sio.disconnect(sid)
+            return
         sio.enter_room(sid, session_id)
         logger.info(f"Entered room {session_id} for socket {sid}")
+        user_id = _get_user_id(sid, session_id)
+        if user_id:
+            # Per-user events, such as the inbox unread count.
+            user_room = f"user:{user_id}"
+            sio.enter_room(sid, user_room)
+            # Checked again after joining: a sign-out that commits between the
+            # check above and the join empties this room before the socket is in
+            # it. Either the socket joined first and that emptying evicts it, or
+            # it joined after and this check sees the session ended.
+            if _get_user_id(sid, session_id) != user_id:
+                logger.info(f"Session of socket {sid} ended while joining; left")
+                sio.leave_room(sid, user_room)
+        else:
+            logger.info(
+                f"No signed-in user for the session of socket {sid}; no user room"
+            )
     else:
         sio.disconnect(sid)
 
@@ -52,9 +120,77 @@ def connect(sid: str, environ: Any, auth: Any) -> None:
 @sio.event
 def disconnect(sid: str) -> None:
     logger.info(f"[{os.getpid()}] Client with SID:{sid} disconnected")
+    _untrack_session_socket(sid)
 
 
-def _get_user_session_id_from_cookies(sid: str, environ: Any) -> Optional[str]:
+def _session_sockets_key(session_id: str) -> str:
+    return f"{_SESSION_SOCKETS_PREFIX}{session_id}"
+
+
+def _track_session_socket(sid: str, session_id: str) -> bool:
+    """Whether the socket was recorded against its session."""
+    try:
+        conn = _get_redis_conn()
+        key = _session_sockets_key(session_id)
+        conn.sadd(key, sid)
+        conn.expire(key, settings.SESSION_COOKIE_AGE)
+        conn.set(
+            f"{_SOCKET_SESSION_PREFIX}{sid}", session_id, ex=settings.SESSION_COOKIE_AGE
+        )
+        return True
+    except Exception:
+        logger.warning(
+            f"Could not track socket {sid} for its session; refusing it", exc_info=True
+        )
+        return False
+
+
+def _untrack_session_socket(sid: str) -> None:
+    try:
+        conn = _get_redis_conn()
+        reverse_key = f"{_SOCKET_SESSION_PREFIX}{sid}"
+        session_id = conn.get(reverse_key)
+        if session_id:
+            if isinstance(session_id, bytes):
+                session_id = session_id.decode()
+            conn.srem(_session_sockets_key(session_id), sid)
+            conn.delete(reverse_key)
+    except Exception:
+        logger.warning(f"Could not untrack socket {sid}", exc_info=True)
+
+
+def renew_session_sockets(session_id: str, ttl: int) -> None:
+    """Extend a live session's socket tracking by `ttl` seconds.
+
+    Tracking is given the session's lifetime at connect, but activity can extend
+    the session while its sockets stay connected. Renewed from each activity
+    refresh, the tracking cannot lapse while the session is in use, so ending
+    the session always finds its sockets.
+    """
+    conn = _get_redis_conn()
+    key = _session_sockets_key(session_id)
+    if not conn.expire(key, ttl):
+        return
+    for sid in conn.smembers(key):
+        sid = sid.decode() if isinstance(sid, bytes) else sid
+        conn.expire(f"{_SOCKET_SESSION_PREFIX}{sid}", ttl)
+
+
+def disconnect_session_sockets(session_id: str) -> None:
+    """Disconnect every socket of a session, on whichever worker holds it.
+
+    Sockets are authenticated only when they connect, so this is what stops an
+    ended session's sockets receiving events in any room, the per-user one
+    included.
+    """
+    conn = _get_redis_conn()
+    key = _session_sockets_key(session_id)
+    for sid in conn.smembers(key):
+        sio.disconnect(sid.decode() if isinstance(sid, bytes) else sid)
+    conn.delete(key)
+
+
+def _get_user_session_id_from_cookies(sid: str, environ: Any) -> str | None:
     """Get the user session ID from cookies.
 
     Args:
@@ -75,73 +211,84 @@ def _get_user_session_id_from_cookies(sid: str, environ: Any) -> Optional[str]:
     if not session_id:
         logger.warning(f"No session ID found in cookies for SID {sid}")
         return None
+    # Django session keys are 32 lowercase letters and digits. Anything else,
+    # such as "user:5", could name another room, so it is refused before any
+    # session lookup.
+    if not _SESSION_KEY_RE.fullmatch(session_id.value):
+        logger.warning(f"Malformed session ID in cookies for SID {sid}")
+        return None
 
     return session_id.value
 
 
-def _get_validated_log_data(json_data: Any) -> Optional[LogDataDTO]:
-    """Validate log data to persist history. This function takes log data in
-    JSON format, validates it, and returns a `LogDataDTO` object if the data is
-    valid. The validation process includes decoding bytes to string, parsing
-    the string as JSON, and checking for required fields and log type.
+def _get_user_id(sid: str, session_id: str) -> str | None:
+    """The signed-in user of a session, or None.
 
-    Args:
-        json_data (Any): Log data in JSON format
-    Returns:
-        Optional[LogDataDTO]: Log data DTO object
+    Applies the checks django.contrib.auth.get_user applies to an HTTP request
+    with the same cookie: the session's backend is still configured and still
+    returns the user (a deactivated user is refused), and the session hash still
+    matches (a password change signs the session out). Unlike get_user, it never
+    flushes or rotates the session, which the browser's cookie still names.
+
+    For the database-backed engines the session's row must also exist. The
+    cache-backed engine reads its cached copy, which can outlive a session that
+    was signed out, and that copy alone must not admit the socket to the user's
+    room. The HTTP side applies the same rule in `SessionTracker.touch()`.
     """
-    if isinstance(json_data, bytes):
-        json_data = json_data.decode("utf-8")
+    # Socket handlers run outside Django's request cycle, which is what normally
+    # closes stale connections.
+    close_old_connections()
+    try:
+        store = import_module(settings.SESSION_ENGINE).SessionStore(
+            session_key=session_id
+        )
+        user_id = store.get(SESSION_KEY)
+        backend_path = store.get(BACKEND_SESSION_KEY)
+        if user_id is None or backend_path not in settings.AUTHENTICATION_BACKENDS:
+            return None
+        if settings.SESSION_ENGINE in ROW_BACKED_SESSION_ENGINES:
+            from django.contrib.sessions.models import Session
 
-    if isinstance(json_data, str):
-        try:
-            # Parse the string as JSON
-            json_data = json.loads(json_data)
-        except json.JSONDecodeError:
-            logger.error(f"Error decoding JSON data while validating {json_data}")
-            return
+            if not Session.objects.filter(session_key=session_id).exists():
+                return None
+        user = load_backend(backend_path).get_user(user_id)
+        if user is None:
+            return None
+        if hasattr(user, "get_session_auth_hash"):
+            session_hash = store.get(HASH_SESSION_KEY)
+            hashes = [
+                user.get_session_auth_hash(),
+                *user.get_session_auth_fallback_hash(),
+            ]
+            if not session_hash or not any(
+                constant_time_compare(session_hash, h) for h in hashes
+            ):
+                return None
+        return user_id
+    except Exception:
+        logger.exception(f"Could not read the session of socket {sid}")
+        return None
+    finally:
+        close_old_connections()
 
-    if not isinstance(json_data, dict):
-        logger.warning(f"Getting invalid data type while validating {json_data}")
-        return
 
-    # Extract required fields from the JSON data
-    execution_id = json_data.get(LogFieldName.EXECUTION_ID)
-    organization_id = json_data.get(LogFieldName.ORGANIZATION_ID)
-    timestamp = json_data.get(LogFieldName.TIMESTAMP)
-    log_type = json_data.get(LogFieldName.TYPE)
+# Functions moved to unstract.core.log_utils for sharing with workers
+# Keep these as wrapper functions for backward compatibility
 
-    # Ensure the log type is LogType.LOG
-    if log_type != LogType.LOG.value:
-        return
 
-    # Check if all required fields are present
-    if not all((execution_id, organization_id, timestamp)):
-        logger.debug(f"Missing required fields while validating {json_data}")
-        return
-
-    return LogDataDTO(
-        execution_id=execution_id,
-        organization_id=organization_id,
-        timestamp=timestamp,
-        log_type=log_type,
-        data=json_data,
-    )
+def _get_validated_log_data(json_data: Any) -> LogDataDTO | None:
+    """Validate log data to persist history (backward compatibility wrapper)."""
+    return get_validated_log_data(json_data)
 
 
 def _store_execution_log(data: dict[str, Any]) -> None:
-    """Store execution log in database
-    Args:
-        data (dict[str, Any]): Execution log data
-    """
-    if not ExecutionLogConstants.IS_ENABLED:
-        return
-    try:
-        log_data = _get_validated_log_data(json_data=data)
-        if log_data:
-            redis_conn.rpush(ExecutionLogConstants.LOG_QUEUE_NAME, log_data.to_json())
-    except Exception as e:
-        logger.error(f"Error storing execution log: {e}")
+    """Store execution log in database (backward compatibility wrapper)."""
+    store_execution_log(
+        data=data,
+        redis_client=_get_redis_conn(),
+        log_queue_name=ExecutionLogConstants.LOG_QUEUE_NAME,
+        is_enabled=ExecutionLogConstants.IS_ENABLED,
+    )
 
 
 def _emit_websocket_event(room: str, event: str, data: dict[str, Any]) -> None:
@@ -165,7 +312,6 @@ def handle_user_logs(room: str, event: str, message: dict[str, Any]) -> None:
     Args:
         message (dict[str, Any]): log message
     """
-
     if not room or not event:
         logger.warning(f"Message received without room and event: {message}")
         return

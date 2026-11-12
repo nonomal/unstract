@@ -1,9 +1,9 @@
-import { BarChartOutlined } from "@ant-design/icons";
-import { Button, Space, Tabs, Tooltip } from "antd";
+import { List, Table } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Tooltip } from "@/components/ui/shims/antd-overlays";
+import { Tabs } from "@/components/ui/shims/antd-structure";
 
-import { promptType } from "../../../helpers/GetStaticData";
+import { getSequenceNumber, promptType } from "../../../helpers/GetStaticData";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import { useAlertStore } from "../../../store/alert-store";
@@ -14,14 +14,8 @@ import { DocumentParser } from "../document-parser/DocumentParser";
 import { Footer } from "../footer/Footer";
 import "./ToolsMain.css";
 import usePostHogEvents from "../../../hooks/usePostHogEvents";
-
-let RunSinglePassBtn;
-try {
-  RunSinglePassBtn =
-    require("../../../plugins/run-single-pass-btn/RunSinglePassBtn").RunSinglePassBtn;
-} catch {
-  // The variable is remain undefined if the component is not available
-}
+import usePromptOutput from "../../../hooks/usePromptOutput";
+import { ToolsMainActionBtns } from "./ToolsMainActionBtns";
 
 function ToolsMain() {
   const [activeKey, setActiveKey] = useState("1");
@@ -33,33 +27,66 @@ function ToolsMain() {
     defaultLlmProfile,
     selectedDoc,
     updateCustomTool,
-    disableLlmOrDocChange,
+    isMultiPassExtractLoading,
+    isSimplePromptStudio,
     singlePassExtractMode,
-    isSinglePassExtractLoading,
   } = useCustomToolStore();
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
   const handleException = useExceptionHandler();
-  const navigate = useNavigate();
   const { setPostHogCustomEvent } = usePostHogEvents();
+  const { promptOutputApi, updatePromptOutputState } = usePromptOutput();
 
   const items = [
     {
       key: "1",
-      label: "Document Parser",
+      label: isSimplePromptStudio ? (
+        <Tooltip title="Fields">
+          <List />
+        </Tooltip>
+      ) : (
+        "Document Parser"
+      ),
     },
     {
       key: "2",
-      label: "Combined Output",
-      disabled: prompts?.length === 0 || disableLlmOrDocChange?.length > 0,
+      label: isSimplePromptStudio ? (
+        <Tooltip title="Combined Output">
+          <Table />
+        </Tooltip>
+      ) : (
+        "Combined Output"
+      ),
+      disabled: prompts?.length === 0 || isMultiPassExtractLoading,
     },
   ];
+
+  useEffect(() => {
+    const { isSinglePassExtractLoading } = useCustomToolStore.getState();
+    if (isSinglePassExtractLoading) {
+      return;
+    }
+    promptOutputApi(
+      details?.tool_id,
+      selectedDoc?.document_id,
+      null,
+      null,
+      singlePassExtractMode,
+    )
+      .then((res) => {
+        const data = res?.data || [];
+        updatePromptOutputState(data, true);
+      })
+      .catch((err) => {
+        setAlertDetails(handleException(err, "Failed to fetch prompt outputs"));
+      });
+  }, [selectedDoc, singlePassExtractMode]);
 
   const getPromptKey = (len) => {
     const promptKey = `${details?.tool_name}_${len}`;
 
     const index = [...prompts].findIndex(
-      (item) => item?.prompt_key === promptKey
+      (item) => item?.prompt_key === promptKey,
     );
 
     if (index === -1) {
@@ -69,24 +96,13 @@ function ToolsMain() {
     return getPromptKey(len + 1);
   };
 
-  const getSequenceNumber = () => {
-    let maxSequenceNumber = 0;
-    prompts.forEach((item) => {
-      if (item?.sequence_number > maxSequenceNumber) {
-        maxSequenceNumber = item?.sequence_number;
-      }
-    });
-
-    return maxSequenceNumber + 1;
-  };
-
   const defaultPromptInstance = {
     prompt_key: getPromptKey(prompts?.length + 1),
     prompt: "",
     tool_id: details?.tool_id,
     prompt_type: promptType.prompt,
     profile_manager: defaultLlmProfile,
-    sequence_number: getSequenceNumber(),
+    sequence_number: getSequenceNumber(prompts),
   };
 
   const defaultNoteInstance = {
@@ -94,7 +110,7 @@ function ToolsMain() {
     prompt: "",
     tool_id: details?.tool_id,
     prompt_type: promptType.notes,
-    sequence_number: getSequenceNumber(),
+    sequence_number: getSequenceNumber(prompts),
   };
 
   useEffect(() => {
@@ -111,7 +127,8 @@ function ToolsMain() {
         info: `Clicked on + ${type} button`,
       });
     } catch (err) {
-      // If an error occurs while setting custom posthog event, ignore it and continue
+      // PostHog analytics failure should not block the user action
+      console.error("PostHog event failed", err);
     }
 
     let body = {};
@@ -146,38 +163,19 @@ function ToolsMain() {
       });
   };
 
-  const handleOutputAnalyzerBtnClick = () => {
-    navigate("outputAnalyzer");
-
-    try {
-      setPostHogCustomEvent("ps_output_analyser_seen", {
-        info: "Clicked on 'Output Analyzer' button",
-      });
-    } catch (err) {
-      // If an error occurs while setting custom posthog event, ignore it and continue
-    }
-  };
-
   return (
     <div className="tools-main-layout">
       <div className="doc-manager-header">
         <div className="tools-main-tabs">
-          <Tabs activeKey={activeKey} items={items} onChange={onChange} />
+          <Tabs
+            activeKey={activeKey}
+            items={items}
+            onChange={onChange}
+            moreIcon={<></>}
+          />
         </div>
         <div className="display-flex-align-center">
-          <Space>
-            {singlePassExtractMode && RunSinglePassBtn && <RunSinglePassBtn />}
-            <Tooltip title="Output Analyzer">
-              <Button
-                icon={<BarChartOutlined />}
-                onClick={handleOutputAnalyzerBtnClick}
-                disabled={
-                  disableLlmOrDocChange?.length > 0 ||
-                  isSinglePassExtractLoading
-                }
-              />
-            </Tooltip>
-          </Space>
+          <ToolsMainActionBtns />
         </div>
       </div>
       <div className="tools-main-body">
@@ -192,9 +190,11 @@ function ToolsMain() {
           <CombinedOutput docId={selectedDoc?.document_id} />
         )}
       </div>
-      <div className="tools-main-footer">
-        <Footer activeKey={activeKey} addPromptInstance={addPromptInstance} />
-      </div>
+      {!isSimplePromptStudio && (
+        <div className="tools-main-footer">
+          <Footer activeKey={activeKey} addPromptInstance={addPromptInstance} />
+        </div>
+      )}
     </div>
   );
 }

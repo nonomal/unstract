@@ -1,6 +1,8 @@
-import { EditOutlined, MinusOutlined } from "@ant-design/icons";
-import { Button, Input, Typography } from "antd";
+import { Minus, Pencil } from "lucide-react";
 import { useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Input } from "@/components/ui/shims/antd-inputs";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useAlertStore } from "../../../store/alert-store";
@@ -64,7 +66,7 @@ function Prompt() {
       .catch((err) => {
         setIsPromptOpen(true);
         setAlertDetails(
-          handleException(err, "Failed to generate the workflow")
+          handleException(err, "Failed to generate the workflow"),
         );
       })
       .finally(() => {
@@ -88,10 +90,9 @@ function Prompt() {
               <Button
                 size="small"
                 type="text"
+                icon={<Minus />}
                 onClick={() => setIsPromptOpen(false)}
-              >
-                <MinusOutlined />
-              </Button>
+              />
             </div>
           </div>
           <div className="wf-prompt-textarea">
@@ -122,10 +123,9 @@ function Prompt() {
             <Button
               size="small"
               type="text"
+              icon={<Pencil />}
               onClick={() => setIsPromptOpen(true)}
-            >
-              <EditOutlined />
-            </Button>
+            />
           </div>
         </div>
       )}

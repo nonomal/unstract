@@ -1,12 +1,16 @@
 """This module contains the Celery configuration for the backend project."""
 
+import logging
+import logging.config
 import os
+from pprint import pformat
 
 from celery import Celery
-from django.conf import settings
-from utils.constants import ExecutionLogConstants
+from celery.signals import task_postrun
 
-from backend.celery_task import TaskRegistry
+from backend.settings.base import LOGGING
+
+logger = logging.getLogger(__name__)
 
 # Set the default Django settings module for the 'celery' program.
 os.environ.setdefault(
@@ -14,30 +18,28 @@ os.environ.setdefault(
     os.environ.get("DJANGO_SETTINGS_MODULE", "backend.settings.dev"),
 )
 
+# Configure logging for celery worker using same config as Django
+logging.config.dictConfig(LOGGING)
+
 # Create a Celery instance. Default time zone is UTC.
 app = Celery("backend")
 
-# To register the custom tasks.
-TaskRegistry()
-
-# Use Redis as the message broker.
-app.conf.broker_url = settings.CELERY_BROKER_URL
-app.conf.result_backend = settings.CELERY_RESULT_BACKEND
-
-
 # Load task modules from all registered Django app configs.
-app.config_from_object("django.conf:settings", namespace="CELERY")
-
-# Autodiscover tasks in all installed apps.
+app.config_from_object("backend.celery_config.CeleryConfig")
 app.autodiscover_tasks()
 
-# Define the queues to purge when the Celery broker is restarted.
-queues_to_purge = [ExecutionLogConstants.CELERY_QUEUE_NAME]
-with app.connection() as connection:
-    channel = connection.channel()
+logger.debug(f"Celery Configuration:\n {pformat(app.conf.table(with_defaults=True))}")
 
-    for queue_name in queues_to_purge:
-        channel.queue_purge(queue_name)
 
-# Use the Django-Celery-Beat scheduler.
-app.conf.beat_scheduler = "django_celery_beat.schedulers:DatabaseScheduler"
+@task_postrun.connect
+def _drop_cached_organization(**kwargs: object) -> None:
+    """Backstop for tasks that set the organization id and never clear it.
+
+    Setting the id already drops the cached organization, so this only keeps a
+    pool worker (a prefork child process, or a thread under the threads pool)
+    from carrying it into a task that relies on a leftover id.
+    """
+    # Lazy: account_v2.models needs the app registry, ready once tasks run.
+    from utils.user_context import UserContext
+
+    UserContext.clear_organization_cache()

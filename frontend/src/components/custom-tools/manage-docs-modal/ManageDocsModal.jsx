@@ -1,24 +1,14 @@
-import {
-  CheckCircleFilled,
-  CloseCircleFilled,
-  DeleteOutlined,
-  PlusOutlined,
-  ReloadOutlined,
-} from "@ant-design/icons";
-import {
-  Button,
-  Divider,
-  Modal,
-  Radio,
-  Space,
-  Table,
-  Tag,
-  Tooltip,
-  Typography,
-  Upload,
-} from "antd";
+import { CircleCheck, CircleX, RotateCw, Trash2 } from "lucide-react";
 import PropTypes from "prop-types";
 import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Radio } from "@/components/ui/shims/antd-inputs";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Divider, Tag } from "@/components/ui/shims/antd-leaves";
+import { Modal, Tooltip } from "@/components/ui/shims/antd-overlays";
+import { Table, Upload } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
@@ -32,11 +22,34 @@ import SpaceWrapper from "../../widgets/space-wrapper/SpaceWrapper";
 import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
 import "./ManageDocsModal.css";
 import usePostHogEvents from "../../../hooks/usePostHogEvents";
+import { usePromptOutputStore } from "../../../store/prompt-output-store";
 
 let SummarizeStatusTitle = null;
 try {
-  SummarizeStatusTitle =
-    require("../../../plugins/summarize-status-title/SummarizeStatusTitle").SummarizeStatusTitle;
+  const mod = await import(
+    "../../../plugins/summarize-status-title/SummarizeStatusTitle"
+  );
+  SummarizeStatusTitle = mod.SummarizeStatusTitle;
+} catch {
+  // The component will remain null if it is not available
+}
+
+let publicIndexApi = null;
+try {
+  const mod = await import(
+    "../../../plugins/prompt-studio-public-share/helpers/PublicShareAPIs"
+  );
+  publicIndexApi = mod.publicIndexApi;
+} catch {
+  // The component will remain null if it is not available
+}
+
+let ConfirmMultiDoc = null;
+try {
+  const mod = await import(
+    "../../../plugins/prompt-studio-multi-doc/ConfirmMultiDoc"
+  );
+  ConfirmMultiDoc = mod.ConfirmMultiDoc;
 } catch {
   // The component will remain null if it is not available
 }
@@ -58,11 +71,17 @@ function ManageDocsModal({
   const [rawLlmProfile, setRawLlmProfile] = useState(null);
   const [isRawDataLoading, setIsRawDataLoading] = useState(false);
   const [summarizeLlmProfile, setSummarizeLlmProfile] = useState(null);
+  const [summarizeLlmAdapter, setSummarizeLlmAdapter] = useState(null);
   const [isSummarizeDataLoading, setIsSummarizeDataLoading] = useState(false);
   const [indexMessages, setIndexMessages] = useState({});
+  const [isModalVisible, setIsModalVisible] = useState(false);
+  const [fileToUpload, setFileToUpload] = useState(null);
   const [lastMessagesUpdate, setLastMessagesUpdate] = useState("");
+  const [resolveUpload, setResolveUpload] = useState(null);
+  const [rejectUpload, setRejectUpload] = useState(null);
   const { sessionDetails } = useSessionStore();
   const { setAlertDetails } = useAlertStore();
+  const { id } = useParams();
   const {
     selectedDoc,
     listOfDocs,
@@ -70,21 +89,24 @@ function ManageDocsModal({
     updateCustomTool,
     details,
     defaultLlmProfile,
-    disableLlmOrDocChange,
+    isMultiPassExtractLoading,
     indexDocs,
     rawIndexStatus,
     summarizeIndexStatus,
     isSinglePassExtractLoading,
+    isPublicSource,
+    adapters = [],
   } = useCustomToolStore();
   const { messages } = useSocketCustomToolStore();
   const axiosPrivate = useAxiosPrivate();
   const handleException = useExceptionHandler();
   const { setPostHogCustomEvent } = usePostHogEvents();
+  const { promptOutputs, updatePromptOutput } = usePromptOutputStore();
 
   const successIndex = (
     <Typography.Text>
       <span style={{ marginRight: "8px" }}>
-        <CheckCircleFilled style={{ color: "#52C41A" }} />
+        <CircleCheck style={{ color: "#52C41A" }} />
       </span>{" "}
       Indexed
     </Typography.Text>
@@ -93,7 +115,7 @@ function ManageDocsModal({
   const failedIndex = (
     <Typography.Text>
       <span style={{ marginRight: "8px" }}>
-        <CloseCircleFilled style={{ color: "#FF4D4F" }} />
+        <CircleX style={{ color: "#FF4D4F" }} />
       </span>{" "}
       Not Indexed
     </Typography.Text>
@@ -125,7 +147,7 @@ function ManageDocsModal({
   const failedSummary = (
     <Typography.Text>
       <span style={{ marginRight: "8px" }}>
-        <CloseCircleFilled style={{ color: "#FF4D4F" }} />
+        <CircleX style={{ color: "#FF4D4F" }} />
       </span>{" "}
       Not Summarized
     </Typography.Text>
@@ -134,13 +156,18 @@ function ManageDocsModal({
   useEffect(() => {
     setRawLlmProfile(defaultLlmProfile);
     setSummarizeLlmProfile(details?.summarize_llm_profile);
+    setSummarizeLlmAdapter(
+      details?.summarize_llm_adapter?.adapter_id ??
+        details?.summarize_llm_adapter?.id ??
+        details?.summarize_llm_adapter ??
+        null,
+    );
   }, [defaultLlmProfile, details]);
 
   useEffect(() => {
     if (!open) {
       return;
     }
-
     handleGetIndexStatus(rawLlmProfile, indexTypes.raw);
   }, [indexDocs, rawLlmProfile, open]);
 
@@ -149,8 +176,19 @@ function ManageDocsModal({
       return;
     }
 
-    handleGetIndexStatus(summarizeLlmProfile, indexTypes.summarize);
-  }, [indexDocs, summarizeLlmProfile, open]);
+    // For index status, we always need a profile ID, not adapter ID
+    // If using new adapter approach, use default profile for index status
+    // If using old approach, use the summarize profile
+    const summarizeProfileId =
+      summarizeLlmProfile || (summarizeLlmAdapter ? defaultLlmProfile : null);
+    handleGetIndexStatus(summarizeProfileId, indexTypes.summarize);
+  }, [
+    indexDocs,
+    summarizeLlmAdapter,
+    summarizeLlmProfile,
+    defaultLlmProfile,
+    open,
+  ]);
 
   useEffect(() => {
     // Reverse the array to have the latest logs at the beginning
@@ -163,7 +201,7 @@ function ManageDocsModal({
 
     // Get the index of the last message received before the last update
     const lastIndex = [...newMessages].findIndex(
-      (item) => item?.timestamp === lastMessagesUpdate
+      (item) => item?.timestamp === lastMessagesUpdate,
     );
 
     // If the last update's message is found, keep only the new messages
@@ -171,9 +209,13 @@ function ManageDocsModal({
       newMessages = newMessages.slice(0, lastIndex);
     }
 
-    // Filter only INFO and ERROR logs
+    // Filter only INFO and ERROR logs that are NOT from answer_prompt.
+    // Answer prompt messages carry a prompt_key in their component;
+    // indexing messages do not.
     newMessages = newMessages.filter(
-      (item) => item?.level === "INFO" || item?.level === "ERROR"
+      (item) =>
+        (item?.level === "INFO" || item?.level === "ERROR") &&
+        !item?.component?.prompt_key,
     );
 
     // If there are no new INFO or ERROR messages, return early
@@ -243,10 +285,13 @@ function ManageDocsModal({
       handleIndexStatus(indexType, []);
       return;
     }
-
+    let url = `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/document-index/?profile_manager=${llmProfileId}`;
+    if (isPublicSource) {
+      url = publicIndexApi(id, llmProfileId);
+    }
     const requestOptions = {
       method: "GET",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/document-index/?profile_manager=${llmProfileId}`,
+      url,
     };
 
     handleLoading(indexType, true);
@@ -272,22 +317,51 @@ function ManageDocsModal({
 
   const getLlmProfileName = (llmProfile) => {
     const llmProfileName = llmProfiles.find(
-      (item) => item?.profile_id === llmProfile
+      (item) => item?.profile_id === llmProfile,
     );
 
     return llmProfileName?.profile_name || "No LLM Profile Selected";
   };
 
+  const isSummarizationConfigured = () =>
+    !!(summarizeLlmAdapter || summarizeLlmProfile);
+
+  const isSummarizationEnabled = () =>
+    isSummarizationConfigured() && details?.summarize_context;
+
+  const getSummarizeLlmDisplayName = () => {
+    // Check if new adapter approach is used
+    if (summarizeLlmAdapter) {
+      const selectedAdapterId =
+        typeof summarizeLlmAdapter === "object"
+          ? (summarizeLlmAdapter?.adapter_id ?? summarizeLlmAdapter?.id)
+          : summarizeLlmAdapter;
+      const adapter = adapters?.find(
+        (item) =>
+          item?.adapter_id === selectedAdapterId ||
+          item?.id === selectedAdapterId,
+      );
+      return adapter?.adapter_name || adapter?.name || "No adapter selected";
+    }
+
+    // Fall back to profile approach
+    if (summarizeLlmProfile) {
+      return getLlmProfileName(summarizeLlmProfile);
+    }
+
+    return "Summarization Not Configured";
+  };
+
   const columns = [
     {
-      title: "Document",
+      title: "Document Variants",
       dataIndex: "document",
       key: "document",
     },
     {
       title: (
         <Space className="w-100">
-          <Typography.Text>Index</Typography.Text>
+          <Typography.Text>Raw View</Typography.Text>
           <Typography.Text type="secondary">
             {"(" + getLlmProfileName(rawLlmProfile) + ")"}
           </Typography.Text>
@@ -296,39 +370,59 @@ function ManageDocsModal({
       ),
       dataIndex: "index",
       key: "index",
-      width: 260,
+      width: 300,
     },
     {
-      title: "Index",
+      title: "Actions",
       dataIndex: "reindex",
       key: "reindex",
-      width: 260,
+      width: 120,
     },
     {
-      title: "",
-      dataIndex: "delete",
-      key: "delete",
-      width: 30,
-    },
-    {
-      title: "",
+      title: "Select Default",
       dataIndex: "select",
       key: "select",
-      width: 30,
+      align: "center",
+      width: 120,
     },
   ];
 
   if (SummarizeStatusTitle) {
     columns.splice(2, 0, {
       title: (
-        <SummarizeStatusTitle
-          profileName={"(" + getLlmProfileName(summarizeLlmProfile) + ")"}
-          isLoading={isSummarizeDataLoading}
-        />
+        <Space className="w-100">
+          <Typography.Text>Summary View</Typography.Text>
+          <Typography.Text type="secondary">
+            {"(" + getSummarizeLlmDisplayName() + ")"}
+          </Typography.Text>
+          {isSummarizeDataLoading && <SpinnerLoader />}
+          {isSummarizationConfigured() && (
+            <Tooltip
+              title={
+                isSummarizationEnabled()
+                  ? "Summarization enabled"
+                  : "Summarization disabled"
+              }
+            >
+              <span
+                className={`summarization-status-circle ${
+                  isSummarizationEnabled()
+                    ? "summarization-status-enabled"
+                    : "summarization-status-disabled"
+                }`}
+                aria-label={
+                  isSummarizationEnabled()
+                    ? "Summarization enabled"
+                    : "Summarization disabled"
+                }
+              />
+            </Tooltip>
+          )}
+        </Space>
       ),
       dataIndex: "summary",
       key: "summary",
-      width: 260,
+      width: 300,
     });
   }
 
@@ -354,7 +448,7 @@ function ManageDocsModal({
         info: "Clicked on index button",
         document_name: item?.document_name,
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
@@ -377,51 +471,49 @@ function ManageDocsModal({
                 <Tooltip title="Index">
                   <Button
                     size="small"
-                    icon={<ReloadOutlined />}
+                    icon={<RotateCw />}
                     onClick={() => handleReIndexBtnClick(item)}
                     disabled={
-                      disableLlmOrDocChange?.length > 0 ||
+                      isMultiPassExtractLoading ||
                       isSinglePassExtractLoading ||
                       indexDocs.includes(item?.document_id) ||
                       isUploading ||
-                      !defaultLlmProfile
+                      !defaultLlmProfile ||
+                      isPublicSource
                     }
                   />
                 </Tooltip>
               )}
             </div>
+            <ConfirmModal
+              handleConfirm={() => handleDelete(item?.document_id)}
+              content="The document will be permanently deleted."
+            >
+              <Tooltip title="Delete">
+                <Button
+                  size="small"
+                  icon={<Trash2 />}
+                  disabled={
+                    isMultiPassExtractLoading ||
+                    isSinglePassExtractLoading ||
+                    indexDocs.includes(item?.document_id) ||
+                    isUploading ||
+                    isPublicSource
+                  }
+                />
+              </Tooltip>
+            </ConfirmModal>
             <div className="center">
               {infoIndex(indexMessages?.[item?.document_name])}
             </div>
           </Space>
-        ),
-        delete: (
-          <ConfirmModal
-            handleConfirm={() => handleDelete(item?.document_id)}
-            content="The document will be permanently deleted."
-          >
-            <Tooltip title="Delete">
-              <Button
-                size="small"
-                className="display-flex-align-center"
-                disabled={
-                  disableLlmOrDocChange?.length > 0 ||
-                  isSinglePassExtractLoading ||
-                  indexDocs.includes(item?.document_id) ||
-                  isUploading
-                }
-              >
-                <DeleteOutlined className="manage-llm-pro-icon" />
-              </Button>
-            </Tooltip>
-          </ConfirmModal>
         ),
         select: (
           <Radio
             checked={selectedDoc?.document_id === item?.document_id}
             onClick={() => handleDocChange(item)}
             disabled={
-              disableLlmOrDocChange?.length > 0 ||
+              isMultiPassExtractLoading ||
               isSinglePassExtractLoading ||
               indexDocs.includes(item?.document_id)
             }
@@ -430,15 +522,21 @@ function ManageDocsModal({
       };
     });
     setRows(newRows);
+    updateCustomTool({
+      selectedHighlight: null,
+    });
   }, [
     listOfDocs,
     selectedDoc,
-    disableLlmOrDocChange,
+    isMultiPassExtractLoading,
     rawIndexStatus,
     summarizeIndexStatus,
     indexDocs,
     messages,
     isSinglePassExtractLoading,
+    adapters,
+    summarizeLlmAdapter,
+    summarizeLlmProfile,
   ]);
 
   const beforeUpload = (file) => {
@@ -446,29 +544,84 @@ function ManageDocsModal({
       setPostHogCustomEvent("ps_uploaded_file", {
         info: "Clicked on '+ Upload New File' button",
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
 
+    const isFileAlreadyExist = (listOfDocs, fileName) => {
+      const fileNameWithoutExtension = fileName?.replace(/\.[^/.]+$/, ""); // Remove extension from file name
+
+      return [...listOfDocs]?.find(
+        (item) =>
+          item?.document_name?.replace(/\.[^/.]+$/, "") ===
+          fileNameWithoutExtension,
+      );
+    };
+
     return new Promise((resolve, reject) => {
+      setResolveUpload(() => resolve); // Save the resolve function
+      setRejectUpload(() => reject); // Save the reject function
+
       const reader = new FileReader();
       reader.readAsDataURL(file);
+
       reader.onload = () => {
         const fileName = file.name;
-        const fileAlreadyExists = [...listOfDocs].find(
-          (item) => item?.document_name === fileName
-        );
-        if (!fileAlreadyExists) {
-          resolve(file);
-        } else {
+        const fileType = file.type;
+        const fileAlreadyExists = isFileAlreadyExist(listOfDocs, fileName);
+
+        // Check if file name already exists
+        if (fileAlreadyExists) {
           setAlertDetails({
             type: "error",
             content: "File name already exists",
           });
           reject(new Error("File name already exists"));
+          return; // Stop further execution
+        }
+
+        // File types that can be uploaded directly without conversion
+        const DIRECT_UPLOAD_TYPES = new Set([
+          "application/pdf",
+          "text/plain",
+          "text/csv",
+          "application/vnd.ms-excel",
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "application/vnd.ms-excel.sheet.macroenabled.12",
+        ]);
+
+        if (!DIRECT_UPLOAD_TYPES.has(fileType)) {
+          // Non-direct types: show ConfirmMultiDoc modal or error
+          if (!ConfirmMultiDoc) {
+            setAlertDetails({
+              type: "error",
+              content: "Only PDF files are allowed",
+            });
+          }
+          setFileToUpload(file); // Store the file to be uploaded
+          setIsModalVisible(true); // Show the modal
+        } else {
+          // PDF, CSV, TXT, Excel — proceed with the upload immediately
+          resolve(file);
         }
       };
     });
+  };
+
+  // Function to handle the modal confirmation
+  const handleModalConfirm = () => {
+    if (resolveUpload && fileToUpload) {
+      setIsModalVisible(false); // Close the modal
+      resolveUpload(fileToUpload); // Resolve the promise to continue upload
+    }
+  };
+
+  // Function to handle modal cancellation
+  const handleModalCancel = () => {
+    if (rejectUpload) {
+      setIsModalVisible(false); // Close the modal without uploading
+      rejectUpload(new Error("Upload cancelled by user")); // Reject the promise and stop the upload
+    }
   };
 
   const handleUploadChange = async (info) => {
@@ -503,7 +656,7 @@ function ManageDocsModal({
       setIsUploading(false);
       setAlertDetails({
         type: "error",
-        content: "Failed to upload",
+        content: info?.file?.response?.errors[0]?.detail || "Failed to Upload",
       });
     }
   };
@@ -525,100 +678,138 @@ function ManageDocsModal({
     axiosPrivate(requestOptions)
       .then(() => {
         const newListOfDocs = [...listOfDocs].filter(
-          (item) => item?.document_id !== docId
+          (item) => item?.document_id !== docId,
         );
         updateCustomTool({ listOfDocs: newListOfDocs });
 
-        if (newListOfDocs?.length === 1 && selectedDoc?.document_id !== docId) {
-          const doc = newListOfDocs[1];
+        if (selectedDoc?.document_id === docId) {
+          const doc = newListOfDocs[0];
           handleDocChange(doc);
         }
-
-        if (docId === selectedDoc?.document_id) {
-          updateCustomTool({ selectedDoc: "" });
-          handleUpdateTool({ output: "" });
-        }
+        const updatedPromptDetails = removeIdFromCoverage(details, docId);
+        const updatedPromptOutput = removeIdFromCoverageOfPromptOutput(
+          promptOutputs,
+          docId,
+        );
+        updateCustomTool({ details: updatedPromptDetails });
+        updatePromptOutput(updatedPromptOutput);
       })
       .catch((err) => {
         setAlertDetails(handleException(err, "Failed to delete"));
       });
   };
 
+  const removeIdFromCoverage = (data, idToRemove) => {
+    if (data.prompts && Array.isArray(data.prompts)) {
+      data.prompts.forEach((prompt) => {
+        if (Array.isArray(prompt.coverage)) {
+          prompt.coverage = prompt.coverage.filter((id) => id !== idToRemove);
+        }
+      });
+    }
+    return data; // Return the updated data
+  };
+
+  const removeIdFromCoverageOfPromptOutput = (data, idToRemove) => {
+    return Object.entries(data).reduce((updatedData, [key, value]) => {
+      // Create a new object for the current entry
+      updatedData[key] = {
+        ...value,
+        // Update the coverage array if it exists
+        coverage: value?.coverage
+          ? value?.coverage?.filter((id) => id !== idToRemove)
+          : value?.coverage,
+      };
+      return updatedData;
+    }, {});
+  };
+
   return (
-    <Modal
-      className="pre-post-amble-modal"
-      open={open}
-      onCancel={() => setOpen(false)}
-      centered
-      footer={null}
-      maskClosable={false}
-      width={1400}
-    >
-      <div className="pre-post-amble-body">
-        <SpaceWrapper>
-          <Space>
-            <Typography.Text className="add-cus-tool-header">
-              Manage Documents
-            </Typography.Text>
-          </Space>
-          <div>
-            <Upload
-              name="file"
-              action={`/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/file/${details?.tool_id}`}
-              headers={{
-                "X-CSRFToken": sessionDetails.csrfToken,
-              }}
-              onChange={handleUploadChange}
-              disabled={isUploading || !defaultLlmProfile}
-              showUploadList={false}
-              accept=".pdf"
-              beforeUpload={beforeUpload}
-            >
-              <Tooltip
-                title={
-                  !defaultLlmProfile &&
-                  "Set the default LLM profile before uploading a document"
-                }
+    <>
+      <Modal
+        className="pre-post-amble-modal"
+        open={open}
+        onCancel={() => setOpen(false)}
+        centered
+        footer={null}
+        maskClosable={false}
+        width={1400}
+      >
+        <div className="pre-post-amble-body">
+          <SpaceWrapper>
+            <Space>
+              <Typography.Text className="add-cus-tool-header">
+                Manage Document Variants
+              </Typography.Text>
+            </Space>
+            <div>
+              <Upload.Dragger
+                name="file"
+                action={`/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/file/${details?.tool_id}`}
+                headers={{
+                  "X-CSRFToken": sessionDetails.csrfToken,
+                }}
+                onChange={handleUploadChange}
+                disabled={isUploading || !defaultLlmProfile}
+                showUploadList={false}
+                beforeUpload={beforeUpload}
               >
-                <Button
-                  className="width-100"
-                  icon={<PlusOutlined />}
-                  type="text"
-                  block
-                  loading={isUploading}
-                  disabled={
-                    !defaultLlmProfile ||
-                    disableLlmOrDocChange?.length > 0 ||
-                    isSinglePassExtractLoading
+                <Tooltip
+                  title={
+                    !defaultLlmProfile
+                      ? llmProfiles?.length
+                        ? "Set the default LLM profile before uploading a document"
+                        : "Add an LLM profile before uploading a document"
+                      : ""
                   }
                 >
-                  Upload New File
-                </Button>
-              </Tooltip>
-            </Upload>
-          </div>
-          <Divider className="manage-docs-div" />
-          <SpaceWrapper>
-            <div>
-              <Typography.Text strong>Uploaded files</Typography.Text>
+                  <span className="manage-docs-upload-tooltip-wrap">
+                    <Button
+                      type="text"
+                      loading={isUploading}
+                      disabled={
+                        !defaultLlmProfile ||
+                        isMultiPassExtractLoading ||
+                        isSinglePassExtractLoading ||
+                        isPublicSource
+                      }
+                    >
+                      Click or drag file to this area to upload
+                    </Button>
+                  </span>
+                </Tooltip>
+              </Upload.Dragger>
             </div>
-            {!listOfDocs || listOfDocs?.length === 0 ? (
-              <EmptyState text="Upload the document" />
-            ) : (
+            <Divider className="manage-docs-div" />
+            <SpaceWrapper>
               <div>
-                <Table
-                  columns={columns}
-                  dataSource={rows}
-                  size="small"
-                  bordered
-                  pagination={{ pageSize: 10 }}
-                />
+                <Typography.Text strong>Uploaded files</Typography.Text>
               </div>
-            )}
+              {!listOfDocs || listOfDocs?.length === 0 ? (
+                <EmptyState text="Upload the document" />
+              ) : (
+                <div>
+                  <Table
+                    columns={columns}
+                    dataSource={rows}
+                    size="small"
+                    bordered
+                    pagination={{ pageSize: 10 }}
+                  />
+                </div>
+              )}
+            </SpaceWrapper>
           </SpaceWrapper>
-        </SpaceWrapper>
-      </div>
-    </Modal>
+        </div>
+      </Modal>
+      {ConfirmMultiDoc && (
+        <ConfirmMultiDoc
+          handleModalCancel={handleModalCancel}
+          handleModalConfirm={handleModalConfirm}
+          isModalVisible={isModalVisible}
+        />
+      )}
+    </>
   );
 }
 
@@ -629,4 +820,5 @@ ManageDocsModal.propTypes = {
   handleUpdateTool: PropTypes.func.isRequired,
   handleDocChange: PropTypes.func.isRequired,
 };
+
 export { ManageDocsModal };

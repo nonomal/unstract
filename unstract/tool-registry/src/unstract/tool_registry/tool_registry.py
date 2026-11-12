@@ -1,7 +1,9 @@
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
+from unstract.sdk1.exceptions import FileStorageError
+from unstract.sdk1.file_storage import EnvHelper, FileStorage, StorageType
 from unstract.tool_registry.constants import PropKey, ToolJsonField, ToolKey
 from unstract.tool_registry.dto import Tool
 from unstract.tool_registry.exceptions import InvalidToolURLException
@@ -13,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
-    REGISTRY_FILE = "config/registry.yaml"
+    REGISTRY_FILE = "registry.yaml"
     PRIVATE_TOOL_CONFIG_FILE = "private_tools.json"
     PUBLIC_TOOL_CONFIG_FILE = "public_tools.json"
 
@@ -39,12 +41,39 @@ class ToolRegistry:
             - get_tool_properties_by_tool_id(): Get properties of a tool.
             - get_tool_icon__by_tool_id(): Get icon of a tool.
         """
-        directory = os.path.dirname(os.path.abspath(__file__))
+        directory = os.getenv("TOOL_REGISTRY_CONFIG_PATH")
+        if not directory:
+            raise ValueError(
+                "Env 'TOOL_REGISTRY_CONFIG_PATH' is not set, please add the tool "
+                "registry JSONs and YAML to a directory and set the env."
+            )
+
+        self.fs = self._get_storage_credentials()
+
         self.helper = ToolRegistryHelper(
             registry=os.path.join(directory, registry_file),
             private_tools_file=os.path.join(directory, private_tools),
             public_tools_file=os.path.join(directory, public_tools),
+            fs=self.fs,
         )
+
+    def _get_storage_credentials(self) -> FileStorage:
+        try:
+            fs = EnvHelper.get_storage(
+                StorageType.PERMANENT, "TOOL_REGISTRY_STORAGE_CREDENTIALS"
+            )
+            return fs
+        except KeyError as e:
+            logger.error(f"Required credentials is missing in the env: {str(e)}")
+            raise e
+        except FileStorageError as e:
+            logger.error(
+                "Error while initialising storage: %s",
+                e,
+                stack_info=True,
+                exc_info=True,
+            )
+            raise e
 
     def load_all_tools_to_disk(self) -> None:
         self.helper.load_all_tools_to_disk()
@@ -83,7 +112,7 @@ class ToolRegistry:
             self.helper.save_tools(data=tools)
             logger.info(f"Tool '{tool_id}' removed from tools file successfully.")
         except Exception as e:
-            logger.error(f"An error occurred: {str(e)}")
+            logger.exception(f"An error occurred: {str(e)}")
 
     def list_tools_urls(self) -> list[str]:
         """List all the tools available in the registry."""
@@ -110,7 +139,7 @@ class ToolRegistry:
             tools_list.append(tool_data)
         return tools_list
 
-    def get_tool_by_uid(self, uid: str) -> Optional[Tool]:
+    def get_tool_by_uid(self, uid: str) -> Tool | None:
         """Get tools from json.
 
         Args:
@@ -169,7 +198,7 @@ class ToolRegistry:
         else:
             tools = self.helper.get_all_tools_from_disk()
             for tool, configuration in tools.items():
-                data: Optional[dict[str, Any]] = configuration.get("properties")
+                data: dict[str, Any] | None = configuration.get("properties")
                 icon = configuration.get("icon", "")
                 if not data:
                     continue
@@ -201,10 +230,10 @@ class ToolRegistry:
                 tool_meta = ToolUtils.get_tool_meta_from_tool_url(registry_tool=tool)
                 if not tool_meta:
                     continue
-                properties: Optional[dict[str, Any]] = self.helper.get_tool_properties(
+                properties: dict[str, Any] | None = self.helper.get_tool_properties(
                     tool_meta=tool_meta
                 )
-                spec: Optional[dict[str, Any]] = self.helper.get_tool_spec(
+                spec: dict[str, Any] | None = self.helper.get_tool_spec(
                     tool_meta=tool_meta
                 )
                 icon = self.helper.get_tool_icon(tool_meta=tool_meta)

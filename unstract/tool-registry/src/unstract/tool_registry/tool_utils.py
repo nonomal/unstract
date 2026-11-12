@@ -1,13 +1,13 @@
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
-import yaml
-from unstract.adapters.enums import AdapterTypes
+from unstract.sdk1.constants import AdapterTypes
+from unstract.sdk1.file_storage import FileStorage, FileStorageProvider
 from unstract.tool_registry.constants import AdapterPropertyKey, Tools
 from unstract.tool_registry.dto import AdapterProperties, Spec, Tool, ToolMeta
-from unstract.tool_registry.exceptions import InvalidToolURLException
+from unstract.tool_registry.exceptions import InvalidToolURLException, RegistryNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class ToolUtils:
         docker_pattern = r"^docker:[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)*/[a-zA-Z0-9_.-]+$"
 
         # Define a regular expression pattern for local tool URLs
-        local_pattern = r"^local:[a-zA-Z0-9_.-:]+$"
+        local_pattern = r"^local:[a-zA-Z0-9_./:-]+$"
 
         # Check if the URL matches either the Docker image or local tool pattern
         if re.match(docker_pattern, image_url) or re.match(local_pattern, image_url):
@@ -55,47 +55,64 @@ class ToolUtils:
         )
 
     @staticmethod
-    def save_tools_in_to_disk(file_path: str, data: dict[str, Any]) -> None:
-        with open(file_path, "w") as json_file:
-            json.dump(data, json_file)
+    def save_tools_in_to_disk(
+        file_path: str,
+        data: dict[str, Any],
+        fs: FileStorage = FileStorage(FileStorageProvider.LOCAL),
+    ) -> None:
+        fs.json_dump(path=file_path, mode="w", encoding="utf-8", data=data)
 
     @staticmethod
-    def get_all_tools_from_disk(file_path: str) -> dict[str, Any]:
+    def get_all_tools_from_disk(
+        file_path: str, fs: FileStorage = FileStorage(FileStorageProvider.LOCAL)
+    ) -> dict[str, Any]:
         try:
-            with open(file_path) as json_file:
-                data: dict[str, Any] = json.load(json_file)
+            data = fs.json_load(file_path)
             return data
-        except json.JSONDecodeError:
-            logger.error("Tools from Disk: JSON decode error")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Error loading tools from {file_path}: {e}")
             return {}
 
     @staticmethod
-    def save_registry(file_path: str, data: dict[str, Any]) -> None:
-        with open(file_path, "w") as file:
-            yaml.dump(data, file, default_flow_style=False)
+    def save_registry(
+        file_path: str,
+        data: dict[str, Any],
+        fs: FileStorage = FileStorage(FileStorageProvider.LOCAL),
+    ) -> None:
+        fs.yaml_dump(path=file_path, mode="w", encoding="utf-8", data=data)
 
     @staticmethod
-    def get_registry(file_path: str) -> dict[str, Any]:
+    def get_registry(
+        file_path: str,
+        fs: FileStorage = FileStorage(FileStorageProvider.LOCAL),
+        raise_exc: bool = False,
+    ) -> dict[str, Any]:
         """Get Registry File.
 
         Args:
             file_path (str): file path of registry.yaml
+            fs (FileStorage): file storage to be used
 
         Returns:
             dict[str, Any]: yaml data
         """
         yml_data: dict[str, Any] = {}
         try:
-            with open(file_path) as file:
-                yml_data = yaml.safe_load(file)
+            logger.debug(f"Reading tool registry YAML: {file_path}")
+            yml_data = fs.yaml_load(file_path)
+
         except FileNotFoundError:
-            pass
+            logger.warning(f"Could not find tool registry YAML: {str(file_path)}")
+            if raise_exc:
+                raise RegistryNotFound()
         except Exception as error:
-            logger.error(f"Error While loading {str(file_path)} Error: {error}")
+            logger.error(f"Error while loading {str(file_path)}: {error}")
+            if raise_exc:
+                raise error
         return yml_data
 
     @staticmethod
-    def create_image_name(image_name: str, tag: Optional[str]) -> str:
+    def create_image_name(image_name: str, tag: str | None) -> str:
         if tag is not None:
             image_name_with_tag = f"{image_name}:{tag}"
             return image_name_with_tag
@@ -176,7 +193,7 @@ class ToolUtils:
         models: list[AdapterProperties],
         adapter_type: AdapterTypes,
         schema: Spec,
-        default_adapter_id: Optional[str] = None,
+        default_adapter_id: str | None = None,
     ) -> None:
         """Process adapter models and update the schema.
 

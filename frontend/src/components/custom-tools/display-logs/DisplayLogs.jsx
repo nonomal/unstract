@@ -1,9 +1,11 @@
 import { useEffect, useRef } from "react";
-import { Col, Row, Typography } from "antd";
+import { Col, Row } from "@/components/ui/shims/antd-layout";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import "../../agency/display-logs/DisplayLogs.css";
-import { useSocketCustomToolStore } from "../../../store/socket-custom-tool";
 import { getDateTimeString } from "../../../helpers/GetStaticData";
+import { useSocketCustomToolStore } from "../../../store/socket-custom-tool";
+import CustomMarkdown from "../../helpers/custom-markdown/CustomMarkdown";
 
 function DisplayLogs() {
   const bottomRef = useRef(null);
@@ -48,9 +50,10 @@ function DisplayLogs() {
                 </Typography>
               </Col>
               <Col span={8}>
-                <Typography className="display-logs-col">
-                  {message?.message}
-                </Typography>
+                <CustomMarkdown
+                  text={message?.message}
+                  styleClassName="display-logs-col"
+                />
               </Col>
             </Row>
             <div ref={bottomRef} />

@@ -1,8 +1,11 @@
-import { ArrowLeftOutlined } from "@ant-design/icons";
-import { Button, Select, Typography } from "antd";
+import { ArrowLeft } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Select } from "@/components/ui/shims/antd-inputs";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
+import { fetchAllPages } from "../../../helpers/pagination";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler.jsx";
 import { IslandLayout } from "../../../layouts/island-layout/IslandLayout.jsx";
@@ -12,7 +15,9 @@ import { CustomButton } from "../../widgets/custom-button/CustomButton.jsx";
 import SpaceWrapper from "../../widgets/space-wrapper/SpaceWrapper.jsx";
 import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader.jsx";
 import "./DefaultTriad.css";
+import "../settings/Settings.css";
 import usePostHogEvents from "../../../hooks/usePostHogEvents.js";
+import { SettingsLayout } from "../settings-layout/SettingsLayout.jsx";
 
 const { Option } = Select;
 
@@ -59,18 +64,15 @@ function DefaultTriad() {
   };
 
   const fetchData = () => {
-    const requestOptions = {
-      method: "GET",
+    fetchAllPages(axiosPrivate, {
       url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/`,
-    };
-    axiosPrivate(requestOptions)
-      .then((res) => {
-        const data = res?.data;
-        setAdapterList(data);
+    })
+      .then((adapters) => {
+        setAdapterList(adapters);
       })
       .catch((err) => {
         setAlertDetails(
-          handleException(err, "Failed to get the adapters list")
+          handleException(err, "Failed to get the adapters list"),
         );
       });
   };
@@ -126,7 +128,7 @@ function DefaultTriad() {
         info: "Selected default triad",
         adapter_name: adapterType,
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
@@ -142,8 +144,8 @@ function DefaultTriad() {
     // Filter out null or blank values
     body = Object.fromEntries(
       Object.entries(body).filter(
-        ([key, value]) => value !== null && value !== ""
-      )
+        ([key, value]) => value !== null && value !== "",
+      ),
     );
 
     const header = {
@@ -158,28 +160,28 @@ function DefaultTriad() {
     };
     axiosPrivate(requestOptions)
       .then((res) => {
-        setAlertDetails({
-          type: "success",
-          content: "Default triad setting saved successfully",
-        });
         fetchData();
         setIsSubmitEnabled(false);
       })
       .catch((err) => {
         setAlertDetails(
-          handleException(err, "Failed to update Default Triads")
+          handleException(err, "Failed to update Default Triads"),
         );
       });
   };
 
   return (
-    <>
+    <SettingsLayout>
       <div className="plt-set-head">
-        <Button size="small" type="text" onClick={() => navigate(-1)}>
-          <ArrowLeftOutlined />
+        <Button
+          size="small"
+          type="text"
+          onClick={() => navigate(`/${sessionDetails?.orgName}/tools`)}
+        >
+          <ArrowLeft />
         </Button>
         <Typography.Text className="plt-set-head-typo">
-          Default Triad
+          Default LLM Profile
         </Typography.Text>
       </div>
       <div className="plt-set-layout">
@@ -194,6 +196,7 @@ function DefaultTriad() {
                     {labelMap[type]}
                   </Typography>
                   <Select
+                    showSearch
                     placeholder={`Select ${labelMap[type]}`}
                     value={selectedValues[type] || undefined}
                     onChange={(value) => handleDropdownChange(type, value)}
@@ -202,8 +205,14 @@ function DefaultTriad() {
                     {dropdownData
                       .filter((data) => data?.adapter_type === type)
                       .map((data) => (
-                        <Option key={data?.id} value={data?.id}>
-                          {data?.adapter_name}
+                        <Option
+                          key={data?.id}
+                          value={data?.id}
+                          disabled={data?.is_deprecated}
+                        >
+                          {data?.is_deprecated
+                            ? `${data?.adapter_name} (deprecated)`
+                            : data?.adapter_name}
                         </Option>
                       ))}
                   </Select>
@@ -221,7 +230,7 @@ function DefaultTriad() {
           )}
         </IslandLayout>
       </div>
-    </>
+    </SettingsLayout>
   );
 }
 

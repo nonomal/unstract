@@ -15,10 +15,18 @@ function apiDeploymentsService() {
   };
 
   return {
-    getApiDeploymentsList: () => {
+    getApiDeploymentsList: (page = 1, pageSize = 10, search = "") => {
+      const params = {
+        page,
+        page_size: pageSize,
+      };
+      if (search) {
+        params.search = search;
+      }
       options = {
         url: `${path}/api/deployment/`,
         method: "GET",
+        params,
       };
       return axiosPrivate(options);
     },
@@ -28,6 +36,17 @@ function apiDeploymentsService() {
         method: "POST",
         headers: requestHeaders,
         data: record,
+      };
+      return axiosPrivate(options);
+    },
+    setApiDeploymentActive: (id, isActive) => {
+      // Only the flag: the gate admits shared users for an activation-only
+      // PATCH, and a full PUT would carry fields they may not change.
+      options = {
+        url: `${path}/api/deployment/${id}/`,
+        method: "PATCH",
+        headers: requestHeaders,
+        data: { is_active: isActive },
       };
       return axiosPrivate(options);
     },
@@ -86,6 +105,57 @@ function apiDeploymentsService() {
         method: "GET",
         url: `${path}/api/postman_collection/${id}/`,
         responseType: "blob",
+      };
+      return axiosPrivate(options);
+    },
+    getDeploymentsByWorkflowId: (workflowId) => {
+      options = {
+        method: "GET",
+        url: `${path}/api/deployment/?workflow=${workflowId}`,
+      };
+      return axiosPrivate(options);
+    },
+    getSharedUsers: (id) => {
+      options = {
+        method: "GET",
+        url: `${path}/api/deployment/${id}/users/`,
+      };
+      return axiosPrivate(options);
+    },
+    updateSharing: (id, sharedUsers, shareWithEveryone, sharedGroups = []) => {
+      options = {
+        method: "POST",
+        url: `${path}/api/deployment/${id}/share/`,
+        headers: requestHeaders,
+        data: {
+          shared_users: sharedUsers,
+          shared_to_org: shareWithEveryone,
+          shared_groups: sharedGroups,
+        },
+      };
+      return axiosPrivate(options);
+    },
+    getAllUsers: () => {
+      options = {
+        method: "GET",
+        url: `${path}/users/`,
+      };
+      return axiosPrivate(options);
+    },
+    addCoOwner: (id, userId) => {
+      options = {
+        method: "POST",
+        url: `${path}/api/deployment/${id}/owners/`,
+        headers: requestHeaders,
+        data: { user_id: userId },
+      };
+      return axiosPrivate(options);
+    },
+    removeCoOwner: (id, userId) => {
+      options = {
+        method: "DELETE",
+        url: `${path}/api/deployment/${id}/owners/${userId}/`,
+        headers: requestHeaders,
       };
       return axiosPrivate(options);
     },

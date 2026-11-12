@@ -1,0 +1,184 @@
+import { CircleHelp, Trash2 } from "lucide-react";
+import PropTypes from "prop-types";
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Select } from "@/components/ui/shims/antd-inputs";
+import { Avatar } from "@/components/ui/shims/antd-leaves";
+import { Modal, Popconfirm } from "@/components/ui/shims/antd-overlays";
+import { List } from "@/components/ui/shims/antd-structure";
+
+import { useExceptionHandler } from "../../hooks/useExceptionHandler.jsx";
+import { useAlertStore } from "../../store/alert-store";
+import { SpinnerLoader } from "../widgets/spinner-loader/SpinnerLoader.jsx";
+
+import { groupsService } from "./groups-service.js";
+
+// getAllOrgUsers may return a bare array, { members: [...] }, or { users: [...] }.
+// Mirror useShareModal's defensive handling so the candidate list can't
+// silently go empty if the response shape changes.
+const normalizeOrgUsers = (data) => {
+  let list = [];
+  if (Array.isArray(data)) {
+    list = data;
+  } else if (Array.isArray(data?.members)) {
+    list = data.members;
+  } else if (Array.isArray(data?.users)) {
+    list = data.users;
+  }
+  return list.map((user) => ({ id: user.id, email: user.email }));
+};
+
+function GroupMemberManager({ open, group, onClose }) {
+  const service = groupsService();
+  const handleException = useExceptionHandler();
+  const { setAlertDetails } = useAlertStore();
+
+  const [members, setMembers] = useState([]);
+  const [orgUsers, setOrgUsers] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [pendingAddIds, setPendingAddIds] = useState([]);
+
+  const loadMembers = () => {
+    if (!group?.id) {
+      return;
+    }
+    setLoading(true);
+    Promise.all([service.listGroupMembers(group.id), service.getAllOrgUsers()])
+      .then(([memberRes, usersRes]) => {
+        setMembers(memberRes?.data || []);
+        setOrgUsers(normalizeOrgUsers(usersRes?.data));
+      })
+      .catch((err) => setAlertDetails(handleException(err, "Failed to load")))
+      .finally(() => setLoading(false));
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: loadMembers is recreated every render; reload only when the dialog opens or the group changes
+  useEffect(() => {
+    if (open) {
+      loadMembers();
+      setPendingAddIds([]);
+    }
+  }, [open, group?.id]);
+
+  const memberIds = new Set(members.map((m) => m.user_id));
+  const candidateUsers = orgUsers.filter((u) => !memberIds.has(u.id));
+
+  const handleAdd = () => {
+    if (!pendingAddIds.length) {
+      return;
+    }
+    setLoading(true);
+    service
+      .addGroupMembers(group.id, pendingAddIds)
+      .then(() => {
+        setAlertDetails({ type: "success", content: "Members added" });
+        setPendingAddIds([]);
+        loadMembers();
+      })
+      .catch((err) =>
+        setAlertDetails(handleException(err, "Failed to add members")),
+      )
+      .finally(() => setLoading(false));
+  };
+
+  const handleRemove = (userId) => {
+    setLoading(true);
+    service
+      .removeGroupMember(group.id, userId)
+      .then(() => {
+        setAlertDetails({ type: "success", content: "Member removed" });
+        loadMembers();
+      })
+      .catch((err) =>
+        setAlertDetails(handleException(err, "Failed to remove member")),
+      )
+      .finally(() => setLoading(false));
+  };
+
+  return (
+    <Modal
+      title={`Members — ${group?.name || ""}`}
+      open={open}
+      onCancel={onClose}
+      onOk={handleAdd}
+      okText="Add selected"
+      okButtonProps={{
+        disabled: !pendingAddIds.length,
+      }}
+      cancelText="Close"
+      centered
+      width={520}
+    >
+      {loading ? (
+        <SpinnerLoader />
+      ) : (
+        <>
+          <Select
+            mode="multiple"
+            style={{ width: "100%", marginBottom: 12 }}
+            placeholder="Add members"
+            value={pendingAddIds}
+            onChange={setPendingAddIds}
+            options={candidateUsers.map((u) => ({
+              value: u.id,
+              label: u.email,
+            }))}
+            filterOption={(input, option) =>
+              (option?.label ?? "")
+                .toString()
+                .toLowerCase()
+                .includes(input.toLowerCase())
+            }
+            showSearch
+          />
+          <List
+            dataSource={members}
+            locale={{ emptyText: "No members yet" }}
+            renderItem={(item) => (
+              <List.Item
+                extra={
+                  <Popconfirm
+                    title="Remove member"
+                    description={`Remove ${item.email} from this group?`}
+                    okText="Remove"
+                    cancelText="Cancel"
+                    icon={<CircleHelp />}
+                    onConfirm={() => handleRemove(item.user_id)}
+                  >
+                    {/*
+                     * A named button, not a bare icon: the icon alone is
+                     * absent from the accessibility tree, leaving no way to
+                     * remove a member except with a mouse.
+                     */}
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<Trash2 />}
+                      aria-label={`Remove ${item.email} from this group`}
+                    />
+                  </Popconfirm>
+                }
+              >
+                <List.Item.Meta
+                  avatar={
+                    <Avatar>{(item.email || "?")[0].toUpperCase()}</Avatar>
+                  }
+                  title={item.display_name || item.email}
+                  description={item.email}
+                />
+              </List.Item>
+            )}
+          />
+        </>
+      )}
+    </Modal>
+  );
+}
+
+GroupMemberManager.propTypes = {
+  open: PropTypes.bool.isRequired,
+  group: PropTypes.object,
+  onClose: PropTypes.func,
+};
+
+export { GroupMemberManager };

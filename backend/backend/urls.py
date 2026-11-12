@@ -2,6 +2,7 @@
 
 The `urlpatterns` list routes URLs to views. For more information please see:
     https://docs.djangoproject.com/en/4.2/topics/http/urls/
+
 Examples:
 Function views
     1. Add an import:  from my_app import views
@@ -29,7 +30,7 @@ urlpatterns = [
     path("", include("file_management.urls")),
     path("", include("tool_instance.urls")),
     path("", include("pipeline.urls")),
-    path("", include("apps.urls")),
+    path("", include("feature_flag.urls")),
     path("workflow/", include("workflow_manager.urls")),
     path("platform/", include("platform_settings.urls")),
     path("api/", include("api.urls")),
@@ -59,13 +60,6 @@ urlpatterns = [
         UrlPathConstants.PROMPT_STUDIO,
         include("prompt_studio.prompt_studio_index_manager.urls"),
     ),
+    path("notifications/", include("notification.urls")),
+    path("internal/", include("backend.internal_base_urls")),
 ]
-
-try:
-    import pluggable_apps.subscription.urls  # noqa: F401
-
-    urlpatterns += [
-        path("", include("pluggable_apps.subscription.urls")),
-    ]
-except ImportError:
-    pass

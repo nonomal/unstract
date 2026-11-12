@@ -42,9 +42,6 @@
 *.idea
 *.vscode
 *.git
-**/.pdm.toml
-**/.pdm-build
-**/.pdm-python
 !LICENSE
 *.md
 !README.md
@@ -55,10 +52,9 @@ test*.py
 
 backend
 !frontend
-document-service
 platform-service
 prompt-service
 tools
 unstract
-worker
+runner
 x2text-service

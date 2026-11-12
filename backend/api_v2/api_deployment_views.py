@@ -1,0 +1,518 @@
+import json
+import logging
+import uuid
+from typing import Any
+
+from django.db.models import Count, F, IntegerField, OuterRef, QuerySet, Subquery
+from django.db.models.functions import Coalesce
+from django.http import HttpResponse
+from permissions.membership_views import OwnerManagementMixin
+from permissions.permission import (
+    IsOwner,
+    IsOwnerOrSharedUserOrSharedToOrg,
+    is_activation_only_patch,
+)
+from permissions.resource_share_views import ResourceShareManagementMixin
+from platform_api.openapi_schema import PlatformKeyAutoSchema
+from platform_audit.actions import Action
+from platform_audit.resources import record_resource_event, resource_ref
+from plugins import get_plugin
+from prompt_studio.prompt_studio_registry_v2.models import PromptStudioRegistry
+from rest_framework import serializers, status, views, viewsets
+from rest_framework.decorators import action
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.serializers import Serializer
+from tenant_account_v2.capabilities import Capability, RequiresCapability
+from tool_instance_v2.models import ToolInstance
+from utils.enums import CeleryTaskState
+from utils.hubspot_notify import notify_hubspot_event
+from utils.pagination import CustomPagination
+from workflow_manager.workflow_v2.dto import ExecutionResponse
+from workflow_manager.workflow_v2.list_aggregate_serializers import (
+    LIST_FILTER_ACTIONS,
+    list_filters_from,
+    workflow_filter_from,
+)
+from workflow_manager.workflow_v2.list_aggregates import (
+    RowFields,
+    aggregate_rows,
+    apply_list_filters,
+)
+from workflow_manager.workflow_v2.models.execution import WorkflowExecution
+
+from api_v2.api_deployment_dto_registry import ApiDeploymentDTORegistry
+from api_v2.constants import ApiExecution
+from api_v2.deployment_helper import DeploymentHelper
+from api_v2.dto import DeploymentExecutionDTO
+from api_v2.error_message import add_error_message
+from api_v2.exceptions import (
+    NoActiveAPIKeyError,
+    RateLimitExceeded,
+    contains_tool_not_found_error,
+)
+from api_v2.models import APIDeployment
+from api_v2.openapi_schema import (
+    API_DEPLOYMENT_LIST_SCHEMA,
+    DEPLOYMENT_EXECUTION_SCHEMA,
+    DeploymentAutoSchema,
+)
+from api_v2.rate_limiter import APIDeploymentRateLimiter
+from api_v2.serializers import (
+    APIDeploymentListSerializer,
+    APIDeploymentSerializer,
+    DeploymentAggregateSerializer,
+    DeploymentResponseSerializer,
+    ExecutionQuerySerializer,
+    ExecutionRequestSerializer,
+    SharedUserListSerializer,
+)
+
+notification_plugin = get_plugin("notification")
+if notification_plugin:
+    from plugins.notification.constants import ResourceType
+
+logger = logging.getLogger(__name__)
+
+# The last run is the one the list shows, annotated in get_queryset.
+DEPLOYMENT_ROW_FIELDS = RowFields(active="is_active", last_run="last_run_time_annotated")
+
+
+@DEPLOYMENT_EXECUTION_SCHEMA
+class DeploymentExecution(views.APIView):
+    schema = DeploymentAutoSchema()
+
+    def initialize_request(self, request: Request, *args: Any, **kwargs: Any) -> Request:
+        """To remove csrf request for public API.
+
+        Args:
+            request (Request): _description_
+
+        Returns:
+            Request: _description_
+        """
+        request.csrf_processing_done = True
+        return super().initialize_request(request, *args, **kwargs)
+
+    def handle_exception(self, exc: Exception) -> Response:
+        response = super().handle_exception(exc)
+        # On the status read `message` is the result payload, and published
+        # clients copy it out as the extraction result without checking.
+        if self.request.method == "POST":
+            add_error_message(response.data)
+        return response
+
+    @DeploymentHelper.validate_api_key
+    def post(
+        self,
+        request: Request,
+        org_name: str,
+        api_name: str,
+        deployment_execution_dto: DeploymentExecutionDTO,
+    ) -> Response:
+        api: APIDeployment = deployment_execution_dto.api
+        api_key: str = deployment_execution_dto.api_key
+        organization = api.organization
+
+        serializer = ExecutionRequestSerializer(
+            data=request.data,
+            context={
+                "api": api,
+                "api_key": api_key,
+                "global_key": deployment_execution_dto.global_key,
+            },
+        )
+        serializer.is_valid(raise_exception=True)
+        file_objs = serializer.validated_data.get(ApiExecution.FILES_FORM_DATA, [])
+        presigned_urls = serializer.validated_data.get(ApiExecution.PRESIGNED_URLS, [])
+        timeout = serializer.validated_data.get(ApiExecution.TIMEOUT_FORM_DATA)
+        include_metadata = serializer.validated_data.get(ApiExecution.INCLUDE_METADATA)
+        include_metrics = serializer.validated_data.get(ApiExecution.INCLUDE_METRICS)
+        include_extracted_text = serializer.validated_data.get(
+            ApiExecution.INCLUDE_EXTRACTED_TEXT
+        )
+        use_file_history = serializer.validated_data.get(ApiExecution.USE_FILE_HISTORY)
+        tag_names = serializer.validated_data.get(ApiExecution.TAGS)
+        llm_profile_id = serializer.validated_data.get(ApiExecution.LLM_PROFILE_ID)
+        hitl_queue_name = serializer.validated_data.get(ApiExecution.HITL_QUEUE_NAME)
+        hitl_packet_id = serializer.validated_data.get(ApiExecution.HITL_PACKET_ID)
+        custom_data = serializer.validated_data.get(ApiExecution.CUSTOM_DATA)
+
+        if presigned_urls:
+            DeploymentHelper.load_presigned_files(presigned_urls, file_objs)
+
+        # Generate execution ID for rate limiting
+        execution_id = str(uuid.uuid4())
+
+        # Check and acquire rate limit slot
+        can_proceed, limit_info = APIDeploymentRateLimiter.check_and_acquire(
+            organization, execution_id
+        )
+        if not can_proceed:
+            logger.warning(
+                f"Rate limit exceeded for org {organization.organization_id}: {limit_info}"
+            )
+            raise RateLimitExceeded(
+                current_usage=limit_info["current_usage"],
+                limit=limit_info["limit"],
+                limit_type=limit_info["limit_type"],
+            )
+
+        # Execute workflow with blanket exception handling
+        try:
+            response = DeploymentHelper.execute_workflow(
+                organization_name=org_name,
+                api=api,
+                file_objs=file_objs,
+                timeout=timeout,
+                include_metadata=include_metadata,
+                include_metrics=include_metrics,
+                include_extracted_text=include_extracted_text,
+                use_file_history=use_file_history,
+                tag_names=tag_names,
+                llm_profile_id=llm_profile_id,
+                hitl_queue_name=hitl_queue_name,
+                hitl_packet_id=hitl_packet_id,
+                custom_data=custom_data,
+                request_headers=dict(request.headers),
+                execution_id=execution_id,
+            )
+        except Exception as error:
+            # Release slot on any failure during workflow setup/execution
+            APIDeploymentRateLimiter.release_slot(organization, execution_id)
+            logger.exception(f"Workflow execution failed: {error}")
+            raise
+
+        # Determine response status based on execution result
+        execution_status = response.get("execution_status", "")
+        has_error = response.get("error") or execution_status == "ERROR"
+
+        if has_error:
+            # Check for tool not found in registry error - return 500 Internal Server Error
+            # This is a server-side deployment state issue, not a client-actionable error
+            if contains_tool_not_found_error(response):
+                logger.error(
+                    "API deployment failed: Tool not found in container registry"
+                )
+                return Response(
+                    {"message": response},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            # Other errors - return 422 Unprocessable Entity
+            logger.error("API deployment execution failed")
+            return Response(
+                {"message": response},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        # Success
+        return Response({"message": response}, status=status.HTTP_200_OK)
+
+    @DeploymentHelper.validate_api_key
+    def get(
+        self,
+        request: Request,
+        org_name: str,
+        api_name: str,
+        deployment_execution_dto: DeploymentExecutionDTO,
+    ) -> Response:
+        serializer = ExecutionQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+
+        execution_id = serializer.validated_data.get(ApiExecution.EXECUTION_ID)
+        include_metadata = serializer.validated_data.get(ApiExecution.INCLUDE_METADATA)
+        include_metrics = serializer.validated_data.get(ApiExecution.INCLUDE_METRICS)
+        include_extracted_text = serializer.validated_data.get(
+            ApiExecution.INCLUDE_EXTRACTED_TEXT
+        )
+
+        # Fetch execution status
+        response: ExecutionResponse = DeploymentHelper.get_execution_status(execution_id)
+
+        # Handle result already acknowledged
+        if response.result_acknowledged:
+            return Response(
+                data={
+                    "status": response.execution_status,
+                    "message": "Result already acknowledged",
+                },
+                status=status.HTTP_406_NOT_ACCEPTABLE,
+            )
+
+        # Determine response status based on execution state
+        execution_status_value = response.execution_status
+
+        # Check for tool not found in registry error - return 500 Internal Server Error
+        # This is a server-side deployment state issue, not a client-actionable error
+        if contains_tool_not_found_error(response):
+            logger.error("Execution failed: Tool not found in container registry")
+            return Response(
+                data={
+                    "status": execution_status_value,
+                    "message": response.result,
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # Check for ERROR status - return 422 Unprocessable Entity
+        if execution_status_value == "ERROR":
+            return Response(
+                data={
+                    "status": execution_status_value,
+                    "message": response.result,
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+        if execution_status_value == CeleryTaskState.COMPLETED.value:
+            response_status = status.HTTP_200_OK
+            DeploymentHelper.process_completed_execution(
+                response=response,
+                deployment_execution_dto=deployment_execution_dto,
+                include_metadata=include_metadata,
+                include_metrics=include_metrics,
+                include_extracted_text=include_extracted_text,
+            )
+        return Response(
+            data={
+                "status": response.execution_status,
+                "message": response.result,
+            },
+            status=response_status,
+        )
+
+
+@API_DEPLOYMENT_LIST_SCHEMA
+class APIDeploymentViewSet(
+    OwnerManagementMixin, ResourceShareManagementMixin, viewsets.ModelViewSet
+):
+    pagination_class = CustomPagination
+
+    # For schema generation only; get_queryset replaces it on every request.
+    queryset = APIDeployment.objects.none()
+
+    # Error examples have to match what the auth middleware sends.
+    schema = PlatformKeyAutoSchema()
+    notification_resource_name_field = "display_name"
+
+    def get_notification_resource_type(self, resource: Any) -> str | None:
+        if not notification_plugin:
+            return None
+        return ResourceType.API_DEPLOYMENT.value
+
+    def get_permissions(self) -> list[Any]:
+        # Enabling or disabling is use, not configuration, so it follows
+        # sharing. Everything else on these verbs stays with the owner.
+        if self.action == "partial_update" and is_activation_only_patch(
+            self.request, flag="is_active"
+        ):
+            return [IsOwnerOrSharedUserOrSharedToOrg()]
+        if self.action == "destroy":
+            # Ownership as before, narrowed by the org's deletion capability.
+            return [
+                IsOwner(),
+                RequiresCapability(Capability.DELETE_WORKFLOWS_AND_DEPLOYMENTS),
+            ]
+        if self.action in [
+            "partial_update",
+            "update",
+            "add_co_owner",
+            "remove_co_owner",
+        ]:
+            return [IsOwner()]
+        return [IsOwnerOrSharedUserOrSharedToOrg()]
+
+    def get_queryset(self) -> QuerySet | None:
+        # Subquery to get last run time for ordering
+        last_run_subquery = (
+            WorkflowExecution.objects.filter(pipeline_id=OuterRef("id"))
+            .order_by("-created_at")
+            .values("created_at")[:1]
+        )
+        run_count_subquery = (
+            WorkflowExecution.objects.filter(pipeline_id=OuterRef("id"))
+            .values("pipeline_id")
+            .annotate(total=Count("id"))
+            .values("total")
+        )
+
+        # Avoid per-row queries for owner/co-owner + creator fields in list views
+        queryset = (
+            APIDeployment.objects.for_user(self.request.user)
+            .select_related("created_by")
+            .prefetch_related("memberships__user")
+            .annotate(
+                last_run_time_annotated=Subquery(last_run_subquery),
+                run_count_annotated=Coalesce(
+                    Subquery(run_count_subquery, output_field=IntegerField()), 0
+                ),
+            )
+            # `pk` last because the primary ordering ties on every deployment
+            # that has never run, and a paging client would then see a row
+            # twice or not at all.
+            .order_by(F("last_run_time_annotated").desc(nulls_last=True), "pk")
+        )
+
+        # TODO: replace the hand-read params and their OpenApiParameter
+        # restatements with a FilterSet so the spec cannot drift from the code
+        workflow_filter = workflow_filter_from(self.request.query_params)
+        if workflow_filter:
+            queryset = queryset.filter(workflow_id=workflow_filter)
+
+        # Search by display name
+        search = self.request.query_params.get("search", None)
+        if search:
+            queryset = queryset.filter(display_name__icontains=search)
+
+        # Exact-match lookup (distinct from the icontains search above).
+        api_name = self.request.query_params.get("api_name")
+        if api_name:
+            queryset = queryset.filter(api_name=api_name)
+
+        return queryset
+
+    def filter_queryset(self, queryset: QuerySet) -> QuerySet:
+        queryset = super().filter_queryset(queryset)
+        if self.action not in LIST_FILTER_ACTIONS:
+            return queryset
+        filters = list_filters_from(self.request.query_params)
+        return apply_list_filters(queryset, filters, DEPLOYMENT_ROW_FIELDS)
+
+    def get_serializer_class(self) -> serializers.Serializer:
+        if self.action in ["list"]:
+            return APIDeploymentListSerializer
+        return APIDeploymentSerializer
+
+    @action(detail=False, methods=["get"])
+    def aggregate(self, request: Request) -> Response:
+        """Status counts and failing rows over the list's filtered rows.
+
+        Call it without ``status`` and ``failing`` to fill the counts while the
+        list is filtered by them.
+        """
+        rows = self.filter_queryset(self.get_queryset())
+        summary = aggregate_rows(rows, DEPLOYMENT_ROW_FIELDS)
+        return Response(DeploymentAggregateSerializer(summary).data)
+
+    @action(detail=True, methods=["get"])
+    def fetch_one(self, request: Request, pk: str | None = None) -> Response:
+        """Custom action to fetch a single instance."""
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+    def create(
+        self, request: Request, *args: tuple[Any], **kwargs: dict[str, Any]
+    ) -> Response:
+        # Check deployment count before create for HubSpot notification
+        deployment_count_before = APIDeployment.objects.count()
+
+        serializer: Serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        # ``created_by`` is audit-only; the creator's access flows through an
+        # OWNER membership row (UN-2202 co-owners).
+        serializer.instance.grant_owner(request.user)
+        api_key = DeploymentHelper.create_api_key(serializer=serializer, request=request)
+        record_resource_event(request, Action.RESOURCE_CREATED, serializer.instance)
+        response_serializer = DeploymentResponseSerializer(
+            {"api_key": api_key.api_key, **serializer.data}
+        )
+
+        # Notify HubSpot about first API deployment
+        notify_hubspot_event(
+            user=request.user,
+            event_name="API_DEPLOY",
+            is_first_for_org=deployment_count_before == 0,
+            action_label="API deployment",
+        )
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(
+            response_serializer.data,
+            status=status.HTTP_201_CREATED,
+            headers=headers,
+        )
+
+    def perform_destroy(self, instance: APIDeployment) -> None:
+        deleted = resource_ref(instance)
+        super().perform_destroy(instance)
+        record_resource_event(self.request, Action.RESOURCE_DELETED, deleted)
+
+    @action(detail=False, methods=["get"])
+    def by_prompt_studio_tool(self, request: Request) -> Response:
+        """Get API deployments for a specific prompt studio tool."""
+        tool_id = request.query_params.get("tool_id")
+        if not tool_id:
+            return Response(
+                {"error": "tool_id parameter is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            # Find the prompt studio registry for this custom tool
+            registry = PromptStudioRegistry.objects.get(custom_tool__tool_id=tool_id)
+
+            # Find workflows that contain tool instances with this prompt registry ID
+            tool_instances = ToolInstance.objects.filter(
+                tool_id=str(registry.prompt_registry_id)
+            )
+            workflow_ids = tool_instances.values_list("workflow_id", flat=True).distinct()
+
+            # Get API deployments for these workflows the user can access —
+            # ``created_by`` is audit-only; access flows through memberships,
+            # sharing, and the admin/SA bypasses (UN-2202).
+            deployments = (
+                APIDeployment.objects.for_user(request.user)
+                .select_related("created_by")
+                .prefetch_related("memberships__user")
+                .filter(workflow_id__in=workflow_ids)
+            )
+
+            serializer = APIDeploymentListSerializer(deployments, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except PromptStudioRegistry.DoesNotExist:
+            return Response([], status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception(f"Error fetching API deployments for tool {tool_id}: {e}")
+            return Response(
+                {"error": "Failed to fetch API deployments"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["get"])
+    def download_postman_collection(
+        self, request: Request, pk: str | None = None
+    ) -> Response:
+        """Downloads a Postman Collection of the API deployment instance."""
+        instance = self.get_object()
+        api_key_inst = instance.api_keys.filter(is_active=True).first()
+        if not api_key_inst:
+            logger.error(f"No active API key set for deployment {instance.pk}")
+            raise NoActiveAPIKeyError(deployment_name=instance.display_name)
+        dto_class = ApiDeploymentDTORegistry.get_dto()
+        postman_collection = dto_class.create(
+            instance=instance, api_key=api_key_inst.api_key
+        )
+        response = HttpResponse(
+            json.dumps(postman_collection.to_dict()), content_type="application/json"
+        )
+        response["Content-Disposition"] = (
+            f'attachment; filename="{instance.display_name}.json"'
+        )
+        return response
+
+    @action(detail=True, methods=["get"])
+    def list_of_shared_users(self, request: Request, pk: str | None = None) -> Response:
+        """List users who have access to this API deployment.
+
+        Viewer-tier by design (``get_permissions`` →
+        ``IsOwnerOrSharedUserOrSharedToOrg``): a shared user may open the owner
+        popup (co-owners spec §10). ``get_permissions`` ignores any
+        ``permission_classes`` set on the decorator, so none is set here.
+        """
+        instance = self.get_object()
+        serializer = SharedUserListSerializer(instance)
+        return Response(serializer.data)

@@ -1,0 +1,861 @@
+"""Tests for org-scoped group sharing (UN-2977 / mfbt UNS-612).
+
+Covers the security-sensitive surface: the ``ShareAuthorizationService``
+authorization matrix (incl. atomicity), the membership/orphan cleanup signals,
+``set_resource_share_groups`` diff semantics, the ``for_user()`` group-visibility
+filter, and the shareable-resource registry.
+
+Admin resolution (``is_org_admin`` / ``is_user_organization_admin``) is patched
+to a deterministic predicate so these tests exercise the sharing logic itself,
+not the active authentication plugin's role handling.
+"""
+
+import secrets
+from datetime import timedelta
+from unittest.mock import Mock, patch
+
+from account_v2.models import Organization, User
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import FieldDoesNotExist
+from django.test import TestCase
+from django.utils import timezone
+from permissions.roles import ResourceRole
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.test import APIRequestFactory, force_authenticate
+from utils.user_context import UserContext
+from workflow_manager.workflow_v2.models.workflow import Workflow
+
+from tenant_account_v2.group_notification_service import (
+    ResourceNotFoundError,
+    send_membership_changed,
+    send_resource_shared,
+)
+from tenant_account_v2.group_views import OrganizationGroupViewSet
+from tenant_account_v2.models import (
+    GroupMembership,
+    OrganizationGroup,
+    OrganizationMember,
+    ResourceGroupShare,
+)
+from tenant_account_v2.share_notifications import MembershipAction, ShareAction
+from tenant_account_v2.shareable_resources import SHAREABLE_RESOURCES
+from tenant_account_v2.sharing_helpers import (
+    ShareAuthorizationService,
+    get_resource_share_groups,
+    set_resource_share_groups,
+)
+from tenant_account_v2.users_view import OrganizationUserViewSet
+
+
+def _make_user(email: str, **kwargs) -> User:
+    return User.objects.create_user(
+        username=email, email=email, password=secrets.token_urlsafe(), **kwargs
+    )
+
+
+def _shared_group_ids(resource) -> set[int]:
+    return set(get_resource_share_groups(resource).values_list("id", flat=True))
+
+
+def _shared_user_ids(resource) -> set[int]:
+    """Direct-viewer user ids (VIEWER memberships, UN-2202)."""
+    return set(
+        resource.memberships.filter(role=ResourceRole.VIEWER).values_list(
+            "user_id", flat=True
+        )
+    )
+
+
+def _add_viewers(resource, *users) -> None:
+    """Add direct viewers as VIEWER rows (successor to ``shared_users.add``)."""
+    for user in users:
+        resource.memberships.get_or_create(
+            user=user, defaults={"role": ResourceRole.VIEWER}
+        )
+
+
+class GroupSharingTestBase(TestCase):
+    """Shared fixtures: one org with an owner, a group member, and an outsider."""
+
+    def setUp(self) -> None:
+        self.org = Organization.objects.create(
+            name="org-a", display_name="Org A", organization_id="org-a"
+        )
+        UserContext.set_organization_identifier(self.org.organization_id)
+
+        self.owner = _make_user("owner@example.com")
+        self.member = _make_user("member@example.com")  # belongs to self.group
+        self.outsider = _make_user("outsider@example.com")  # org member, no group
+        self.admin = _make_user("admin@example.com")
+        for user, role in (
+            (self.owner, "user"),
+            (self.member, "user"),
+            (self.outsider, "user"),
+            (self.admin, "admin"),
+        ):
+            OrganizationMember.objects.create(organization=self.org, user=user, role=role)
+
+        self.group = OrganizationGroup.objects.create(
+            organization=self.org, name="Team", created_by=self.owner
+        )
+        GroupMembership.objects.create(group=self.group, user=self.member)
+
+        self.workflow = Workflow.objects.create(
+            workflow_name="wf-1", organization=self.org, created_by=self.owner
+        )
+        # Creator's access flows through an OWNER membership row (UN-2202).
+        self.workflow.memberships.create(user=self.owner, role=ResourceRole.OWNER)
+
+
+class ShareAuthorizationServiceTests(GroupSharingTestBase):
+    """The authorization matrix from the UN-2977 plan."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Deterministic admin predicate — only ``self.admin`` is an admin.
+        patcher = patch(
+            "tenant_account_v2.sharing_helpers.is_org_admin",
+            side_effect=lambda user: getattr(user, "email", None) == self.admin.email,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _authorize(self, actor, desired) -> None:
+        ShareAuthorizationService.authorize_and_commit(
+            actor=actor, resource=self.workflow, desired=desired
+        )
+
+    def test_owner_can_add_and_remove_users(self) -> None:
+        self._authorize(self.owner, {"shared_users": [self.outsider.id]})
+        self.assertEqual(_shared_user_ids(self.workflow), {self.outsider.id})
+        self._authorize(self.owner, {"shared_users": []})
+        self.assertEqual(_shared_user_ids(self.workflow), set())
+
+    def test_owner_can_add_group_and_toggle_org(self) -> None:
+        self._authorize(
+            self.owner, {"shared_groups": [self.group.id], "shared_to_org": True}
+        )
+        self.assertEqual(_shared_group_ids(self.workflow), {self.group.id})
+        self.workflow.refresh_from_db()
+        self.assertTrue(self.workflow.shared_to_org)
+
+    def test_admin_can_remove_users(self) -> None:
+        _add_viewers(self.workflow, self.member)
+        self._authorize(self.admin, {"shared_users": []})
+        self.assertEqual(_shared_user_ids(self.workflow), set())
+
+    def test_unprivileged_cannot_remove_users(self) -> None:
+        _add_viewers(self.workflow, self.member, self.outsider)
+        with self.assertRaises(PermissionDenied):
+            # outsider (a shared user, not owner/admin) tries to drop member
+            self._authorize(self.outsider, {"shared_users": [self.outsider.id]})
+        self.assertEqual(
+            _shared_user_ids(self.workflow), {self.member.id, self.outsider.id}
+        )
+
+    def test_unprivileged_cannot_toggle_org(self) -> None:
+        with self.assertRaises(PermissionDenied):
+            self._authorize(self.outsider, {"shared_to_org": True})
+        self.workflow.refresh_from_db()
+        self.assertFalse(self.workflow.shared_to_org)
+
+    def test_group_member_can_add_only_their_groups(self) -> None:
+        other_group = OrganizationGroup.objects.create(
+            organization=self.org, name="Other", created_by=self.owner
+        )
+        # member belongs to self.group → allowed
+        self._authorize(self.member, {"shared_groups": [self.group.id]})
+        self.assertEqual(_shared_group_ids(self.workflow), {self.group.id})
+        # member is not in other_group → denied
+        with self.assertRaises(PermissionDenied):
+            self._authorize(
+                self.member, {"shared_groups": [self.group.id, other_group.id]}
+            )
+
+    def test_service_account_bypasses_authorization(self) -> None:
+        svc = _make_user("svc@example.com", is_service_account=True)
+        self._authorize(svc, {"shared_to_org": True})
+        self.workflow.refresh_from_db()
+        self.assertTrue(self.workflow.shared_to_org)
+
+    def test_authorize_is_atomic_on_partial_denial(self) -> None:
+        """A denial on any axis must leave every axis uncommitted."""
+        _add_viewers(self.workflow, self.outsider)
+        with self.assertRaises(PermissionDenied):
+            # users add is allowed for a shared user, but the org toggle isn't
+            self._authorize(
+                self.outsider,
+                {
+                    "shared_users": [self.outsider.id, self.member.id],
+                    "shared_to_org": True,
+                },
+            )
+        self.assertNotIn(self.member.id, _shared_user_ids(self.workflow))
+        self.workflow.refresh_from_db()
+        self.assertFalse(self.workflow.shared_to_org)
+
+
+class SetResourceShareGroupsTests(GroupSharingTestBase):
+    """Polymorphic ``.set()``-style diff semantics + cross-org guard."""
+
+    def _count(self) -> int:
+        return ResourceGroupShare.objects.filter(
+            content_type=ContentType.objects.get_for_model(Workflow),
+            object_id=str(self.workflow.pk),
+        ).count()
+
+    def test_add_remove_and_noop(self) -> None:
+        set_resource_share_groups(self.workflow, [self.group.id])
+        self.assertEqual(self._count(), 1)
+        set_resource_share_groups(self.workflow, [self.group.id])  # no-op
+        self.assertEqual(self._count(), 1)
+        set_resource_share_groups(self.workflow, [])  # remove
+        self.assertEqual(self._count(), 0)
+
+    def test_cross_org_group_rejected(self) -> None:
+        other_org = Organization.objects.create(
+            name="org-b", display_name="Org B", organization_id="org-b"
+        )
+        foreign_group = OrganizationGroup.objects.create(
+            organization=other_org, name="Foreign", created_by=self.owner
+        )
+        with self.assertRaises(ValueError):
+            set_resource_share_groups(self.workflow, [foreign_group.id])
+        self.assertEqual(self._count(), 0)
+
+
+class ForUserGroupVisibilityTests(GroupSharingTestBase):
+    """Group-shared resources appear for members and track membership live."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = patch(
+            "tenant_account_v2.organization_member_service."
+            "OrganizationMemberService.is_user_organization_admin",
+            return_value=False,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_group_share_visible_to_member_only(self) -> None:
+        set_resource_share_groups(self.workflow, [self.group.id])
+        self.assertIn(self.workflow, Workflow.objects.for_user(self.member))
+        self.assertNotIn(self.workflow, Workflow.objects.for_user(self.outsider))
+
+    def test_membership_change_takes_effect_immediately(self) -> None:
+        set_resource_share_groups(self.workflow, [self.group.id])
+        self.assertNotIn(self.workflow, Workflow.objects.for_user(self.outsider))
+        GroupMembership.objects.create(group=self.group, user=self.outsider)
+        self.assertIn(self.workflow, Workflow.objects.for_user(self.outsider))
+
+
+class SignalCleanupTests(GroupSharingTestBase):
+    """The two ``post_delete`` cleanups: rejoin-backdoor and orphan prevention."""
+
+    def test_org_member_removal_purges_memberships_and_direct_shares(self) -> None:
+        _add_viewers(self.workflow, self.member)
+        set_resource_share_groups(self.workflow, [self.group.id])
+
+        OrganizationMember.objects.get(user=self.member).delete()
+
+        self.assertFalse(
+            GroupMembership.objects.filter(user=self.member, group=self.group).exists()
+        )
+        self.assertNotIn(self.member.id, _shared_user_ids(self.workflow))
+
+    def test_org_member_removal_purges_co_owner_but_keeps_sole_owner(self) -> None:
+        """OWNER rows are purged on org exit EXCEPT where the departing user is
+        the last owner — closes the co-owner rejoin backdoor without orphaning a
+        solely-owned resource (UN-2202 review #2).
+        """
+        # self.member is a co-owner of the shared workflow (self.owner owns it
+        # too) and the SOLE owner of a second workflow.
+        self.workflow.memberships.create(user=self.member, role=ResourceRole.OWNER)
+        solo = Workflow.objects.create(
+            workflow_name="wf-solo", organization=self.org, created_by=self.member
+        )
+        solo.memberships.create(user=self.member, role=ResourceRole.OWNER)
+
+        OrganizationMember.objects.get(user=self.member).delete()
+
+        # co-owner row purged (owner remains) → rejoin backdoor closed
+        self.assertEqual(
+            set(
+                self.workflow.memberships.filter(role=ResourceRole.OWNER).values_list(
+                    "user_id", flat=True
+                )
+            ),
+            {self.owner.pk},
+        )
+        # sole-owner row kept → resource not orphaned (spec §7.4)
+        self.assertTrue(
+            solo.memberships.filter(user=self.member, role=ResourceRole.OWNER).exists()
+        )
+
+    def test_org_member_removal_ignores_stale_ex_member_owner_rows(self) -> None:
+        """A departed user's kept OWNER row is not "another owner": counting
+        it would purge the last LIVE owner, leaving the resource manageable by
+        nobody in the org (UN-2202 review #5).
+        """
+        wf = Workflow.objects.create(
+            workflow_name="wf-stale", organization=self.org, created_by=self.member
+        )
+        wf.memberships.create(user=self.member, role=ResourceRole.OWNER)
+
+        # Step 1: the sole owner departs — the carve-out keeps the (now
+        # stale) row.
+        OrganizationMember.objects.get(user=self.member).delete()
+        self.assertTrue(
+            wf.memberships.filter(user=self.member, role=ResourceRole.OWNER).exists()
+        )
+
+        # Step 2: an org admin later adds a live co-owner, who then departs.
+        wf.memberships.create(user=self.outsider, role=ResourceRole.OWNER)
+        OrganizationMember.objects.get(user=self.outsider).delete()
+
+        # The live owner's row survives — the stale row didn't count.
+        self.assertTrue(
+            wf.memberships.filter(user=self.outsider, role=ResourceRole.OWNER).exists()
+        )
+
+    def test_resource_delete_purges_group_shares(self) -> None:
+        set_resource_share_groups(self.workflow, [self.group.id])
+        content_type = ContentType.objects.get_for_model(Workflow)
+        workflow_pk = str(self.workflow.pk)
+
+        self.workflow.delete()
+
+        self.assertFalse(
+            ResourceGroupShare.objects.filter(
+                content_type=content_type, object_id=workflow_pk
+            ).exists()
+        )
+
+
+class GroupViewSetServiceAccountTests(GroupSharingTestBase):
+    """Service accounts (platform-key auth) may manage groups; plain members may not.
+
+    Admin resolution is patched to always-False so any write that succeeds
+    does so via the service-account allowance, not an accidental admin role.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.svc = _make_user("svc@example.com", is_service_account=True)
+        self.factory = APIRequestFactory()
+        patcher = patch(
+            "tenant_account_v2.sharing_helpers.is_org_admin", return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _call(self, actions, method, user, data=None, **url_kwargs):
+        view = OrganizationGroupViewSet.as_view(actions)
+        request = getattr(self.factory, method)("/groups/", data, format="json")
+        force_authenticate(request, user=user)
+        return view(request, **url_kwargs)
+
+    def test_service_account_can_create_group(self) -> None:
+        response = self._call(
+            {"post": "create"}, "post", self.svc, data={"name": "Cloned"}
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(
+            OrganizationGroup.objects.filter(
+                organization=self.org, name="Cloned"
+            ).exists()
+        )
+
+    def test_service_account_can_add_members(self) -> None:
+        response = self._call(
+            {"post": "members"},
+            "post",
+            self.svc,
+            data={"user_ids": [self.outsider.id]},
+            pk=str(self.group.pk),
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(
+            GroupMembership.objects.filter(group=self.group, user=self.outsider).exists()
+        )
+
+    def test_add_members_response_only_lists_newly_added(self) -> None:
+        # self.member is already in self.group (see GroupSharingTestBase);
+        # only self.outsider is new. The response, and the notification it
+        # feeds, must both narrow to the actual insert, not the request.
+        with patch(
+            "tenant_account_v2.group_views.notify_group_membership_changed"
+        ) as notify:
+            response = self._call(
+                {"post": "members"},
+                "post",
+                self.svc,
+                data={"user_ids": [self.member.id, self.outsider.id]},
+                pk=str(self.group.pk),
+            )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["added_user_ids"], [self.outsider.id])
+        self.assertEqual(
+            GroupMembership.objects.filter(group=self.group, user=self.member).count(), 1
+        )
+        # The regression this guards against: passing the full request list
+        # (including the already-a-member id) would still pass the earlier
+        # assertions above -- only this call proves the notification itself
+        # was narrowed, not just the DB write and the response.
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["user_ids"], [self.outsider.id])
+
+    def test_service_account_can_remove_member(self) -> None:
+        response = self._call(
+            {"delete": "remove_member"},
+            "delete",
+            self.svc,
+            pk=str(self.group.pk),
+            user_id=str(self.member.id),
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(
+            GroupMembership.objects.filter(group=self.group, user=self.member).exists()
+        )
+
+    def test_service_account_can_list_group_resources(self) -> None:
+        set_resource_share_groups(self.workflow, [self.group.id])
+        response = self._call(
+            {"get": "resources"}, "get", self.svc, pk=str(self.group.pk)
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            str(self.workflow.id), [item["resource_id"] for item in response.data]
+        )
+
+    def test_non_admin_member_still_403_on_writes(self) -> None:
+        cases = [
+            ({"post": "create"}, "post", {"name": "Nope"}, {}),
+            (
+                {"post": "members"},
+                "post",
+                {"user_ids": [self.outsider.id]},
+                {"pk": str(self.group.pk)},
+            ),
+            (
+                {"delete": "remove_member"},
+                "delete",
+                None,
+                {"pk": str(self.group.pk), "user_id": str(self.member.id)},
+            ),
+            ({"get": "resources"}, "get", None, {"pk": str(self.group.pk)}),
+        ]
+        for actions, method, data, url_kwargs in cases:
+            with self.subTest(action=next(iter(actions.values()))):
+                response = self._call(
+                    actions, method, self.member, data=data, **url_kwargs
+                )
+                self.assertEqual(response.status_code, 403)
+
+    def test_members_listing_flags_service_accounts(self) -> None:
+        GroupMembership.objects.create(group=self.group, user=self.svc)
+        response = self._call({"get": "members"}, "get", self.svc, pk=str(self.group.pk))
+        self.assertEqual(response.status_code, 200)
+        flags = {row["email"]: row["is_service_account"] for row in response.data}
+        self.assertTrue(flags[self.svc.email])
+        self.assertFalse(flags[self.member.email])
+
+    def test_non_admin_member_cannot_delete_group(self) -> None:
+        response = self._call(
+            {"delete": "destroy"}, "delete", self.member, pk=str(self.group.pk)
+        )
+        self.assertEqual(response.status_code, 403)
+        response = self._call(
+            {"delete": "destroy"}, "delete", self.svc, pk=str(self.group.pk)
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(OrganizationGroup.objects.filter(pk=self.group.pk).exists())
+
+
+class OrganizationMembersListingTests(GroupSharingTestBase):
+    """GET /users/ excludes service accounts; human rows carry the flag."""
+
+    def test_users_listing_excludes_service_accounts(self) -> None:
+        svc = _make_user("svc@example.com", is_service_account=True)
+        OrganizationMember.objects.create(organization=self.org, user=svc, role="user")
+
+        request = APIRequestFactory().get("/users/")
+        force_authenticate(request, user=self.admin)
+        view = OrganizationUserViewSet.as_view({"get": "get_organization_members"})
+        with patch(
+            "tenant_account_v2.users_view.UserSessionUtils.get_organization_id",
+            return_value=self.org.organization_id,
+        ):
+            response = view(request)
+
+        self.assertEqual(response.status_code, 200)
+        flags = {
+            row["email"]: row["is_service_account"] for row in response.data["members"]
+        }
+        self.assertNotIn(svc.email, flags)
+        self.assertFalse(flags[self.member.email])
+
+
+class ShareableResourceRegistryTests(TestCase):
+    """Each installed descriptor must resolve and expose its declared fields."""
+
+    def test_descriptors_resolve_and_fields_exist(self) -> None:
+        from django.apps import apps
+
+        for resource in SHAREABLE_RESOURCES:
+            try:
+                model = apps.get_model(resource.app_label, resource.model_name)
+            except LookupError:
+                continue  # cloud-only app absent in this deployment
+            for attr in ("id_field", "name_field"):
+                field_name = getattr(resource, attr)
+                try:
+                    model._meta.get_field(field_name)
+                except FieldDoesNotExist:
+                    self.fail(
+                        f"{resource.kind}.{attr}={field_name!r} is not a field on "
+                        f"{resource.app_label}.{resource.model_name}"
+                    )
+
+
+class ResourceShareNotificationTests(GroupSharingTestBase):
+    """Delivery side (``group_notification_service``): who actually gets mailed.
+
+    The email plugin is mocked, so these pin recipient selection — the live
+    re-read on a grant, the ``revoked_at`` cutoff, org scoping and retained
+    access — not template or transport behavior. The enqueue side is covered in
+    ``test_share_notification_dispatch`` (unit tier, no DB).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.service = Mock()
+        patcher = patch(
+            "tenant_account_v2.group_notification_service.notification_plugin",
+            {"service_class": Mock(return_value=self.service)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _send(
+        self,
+        *,
+        group_ids: list[int],
+        share_action: str = ShareAction.SHARED.value,
+        revoked_at=None,
+    ) -> bool:
+        return send_resource_shared(
+            organization=self.org,
+            group_ids=group_ids,
+            actor_id=self.owner.pk,
+            resource_kind="workflow",
+            resource_id=str(self.workflow.pk),
+            share_action=share_action,
+            revoked_at=revoked_at,
+        )
+
+    def _mailed(self) -> list[tuple[str, list[str]]]:
+        """``(group_name, sorted recipient emails)`` per email sent, in order."""
+        return [
+            (call.kwargs["group_name"], sorted(u.email for u in call.kwargs["shared_to"]))
+            for call in self.service.send_group_resource_shared_notification.call_args_list
+        ]
+
+    def test_grant_mails_current_group_members(self) -> None:
+        set_resource_share_groups(self.workflow, [self.group.id])
+        self._send(group_ids=[self.group.id])
+        self.assertEqual(self._mailed(), [("Team", ["member@example.com"])])
+
+    def test_grant_dropped_when_share_revoked_before_delivery(self) -> None:
+        # The queue can lag; announcing access the group no longer holds would
+        # disclose the resource name and id to members who cannot reach it.
+        set_resource_share_groups(self.workflow, [self.group.id])
+        set_resource_share_groups(self.workflow, [])
+        self._send(group_ids=[self.group.id])
+        self.service.send_group_resource_shared_notification.assert_not_called()
+
+    def test_revoke_mails_members_although_the_share_row_is_gone(self) -> None:
+        # Mirror image of the check above: on a revoke the row is *expected* to
+        # be absent, so the live re-read must not suppress the mail.
+        self._send(group_ids=[self.group.id], share_action=ShareAction.REVOKED.value)
+        self.assertEqual(self._mailed(), [("Team", ["member@example.com"])])
+        kwargs = self.service.send_group_resource_shared_notification.call_args.kwargs
+        self.assertEqual(kwargs["share_action"], "revoked")
+        self.assertEqual(kwargs["resource_type"], "workflow")
+        self.assertEqual(kwargs["resource_name"], "wf-1")
+
+    def test_multi_group_fan_out_keeps_each_group_and_its_own_members_separate(
+        self,
+    ) -> None:
+        # ``self.member`` is in both groups (overlapping); ``self.outsider`` is
+        # only in the second (disjoint). A naive union across groups would
+        # either merge them into one mail or mislabel which group a recipient
+        # actually belongs to -- both are exactly what one email per group
+        # exists to prevent.
+        other_group = OrganizationGroup.objects.create(
+            organization=self.org, name="Ops", created_by=self.owner
+        )
+        GroupMembership.objects.create(group=other_group, user=self.member)
+        GroupMembership.objects.create(group=other_group, user=self.outsider)
+        set_resource_share_groups(self.workflow, [self.group.id, other_group.id])
+
+        self._send(group_ids=[self.group.id, other_group.id])
+
+        self.assertEqual(
+            sorted(self._mailed()),
+            sorted(
+                [
+                    ("Team", ["member@example.com"]),
+                    ("Ops", ["member@example.com", "outsider@example.com"]),
+                ]
+            ),
+        )
+
+    def test_plugin_skip_result_is_not_a_failure(self) -> None:
+        # The plugin's tri-state None means "skipped" (unconfigured, disabled,
+        # bad input) -- never a reason to ask for redelivery.
+        set_resource_share_groups(self.workflow, [self.group.id])
+        self.service.send_group_resource_shared_notification.return_value = None
+        self.assertTrue(self._send(group_ids=[self.group.id]))
+
+    def test_all_groups_failing_asks_for_redelivery(self) -> None:
+        other_group = OrganizationGroup.objects.create(
+            organization=self.org, name="Ops", created_by=self.owner
+        )
+        GroupMembership.objects.create(group=other_group, user=self.outsider)
+        set_resource_share_groups(self.workflow, [self.group.id, other_group.id])
+        self.service.send_group_resource_shared_notification.return_value = False
+        self.assertFalse(self._send(group_ids=[self.group.id, other_group.id]))
+
+    def test_partial_group_failure_is_not_retried_and_every_group_is_attempted(
+        self,
+    ) -> None:
+        # A retry would re-mail the group that already succeeded -- accept the
+        # partial loss instead. Every group must still be attempted, not just
+        # the ones before the first failure: ThreadPoolExecutor.map's pending
+        # futures must not be cancelled by an early result.
+        other_group = OrganizationGroup.objects.create(
+            organization=self.org, name="Ops", created_by=self.owner
+        )
+        GroupMembership.objects.create(group=other_group, user=self.outsider)
+        set_resource_share_groups(self.workflow, [self.group.id, other_group.id])
+        self.service.send_group_resource_shared_notification.side_effect = [False, True]
+        result = self._send(group_ids=[self.group.id, other_group.id])
+        self.assertTrue(result)
+        self.assertEqual(
+            self.service.send_group_resource_shared_notification.call_count, 2
+        )
+
+    def test_group_from_another_org_is_never_mailed(self) -> None:
+        """The foreign group's member is deliberately also an org-A member.
+
+        Users belong to any number of orgs here, so without that the group has
+        no resolvable recipients and the test passes on an empty list rather
+        than on the org filter -- green even with the filter deleted.
+        """
+        other_org = Organization.objects.create(
+            name="org-b", display_name="Org B", organization_id="org-b"
+        )
+        foreign_group = OrganizationGroup.objects.create(
+            organization=other_org, name="Foreign", created_by=self.owner
+        )
+        dual = _make_user("dual@example.com")
+        OrganizationMember.objects.create(organization=self.org, user=dual, role="user")
+        OrganizationMember.objects.create(organization=other_org, user=dual, role="user")
+        GroupMembership.objects.create(group=foreign_group, user=dual)
+
+        for action in (ShareAction.SHARED.value, ShareAction.REVOKED.value):
+            self._send(group_ids=[foreign_group.id], share_action=action)
+        self.assertEqual(self._mailed(), [])
+
+    def test_group_member_outside_the_org_is_never_mailed(self) -> None:
+        """A group row that outlives the org membership must not produce mail.
+
+        Pins the outcome, not the layer: ``OrganizationMember``'s default
+        manager is org-scoped, so deleting the explicit filter in
+        ``_live_member_users`` changes nothing. ``OrganizationGroup`` has no
+        such manager, which is why the group-level filter IS pinnable -- see
+        ``test_group_from_another_org_is_never_mailed``.
+        """
+        other_org = Organization.objects.create(
+            name="org-d", display_name="Org D", organization_id="org-d"
+        )
+        # A member of ANOTHER org, not of no org: a user with no membership row
+        # at all is excluded by the table rather than by the org clause, which
+        # would leave this test green with the filter deleted.
+        stranger = _make_user("stranger@example.com")
+        OrganizationMember.objects.create(
+            organization=other_org, user=stranger, role="user"
+        )
+        GroupMembership.objects.create(group=self.group, user=stranger)
+        set_resource_share_groups(self.workflow, [self.group.id])
+        self._send(group_ids=[self.group.id])
+        self.assertEqual(self._mailed(), [("Team", ["member@example.com"])])
+
+    def test_actor_outside_the_org_is_not_resolved(self) -> None:
+        """The actor's name and email render into the outgoing mail, so an
+        actor from another org must not resolve. Outcome-level, like the
+        recipient case above: the org-scoped manager enforces it either way.
+        """
+        other_org = Organization.objects.create(
+            name="org-e", display_name="Org E", organization_id="org-e"
+        )
+        # Again a member of another org rather than of none, so the org clause
+        # is the only thing that can exclude them.
+        foreign_actor = _make_user("foreign-actor@example.com")
+        OrganizationMember.objects.create(
+            organization=other_org, user=foreign_actor, role="user"
+        )
+        # The grant direction drops a group with no live share row, which would
+        # stop the mail before the actor is ever resolved.
+        set_resource_share_groups(self.workflow, [self.group.id])
+        send_resource_shared(
+            organization=self.org,
+            group_ids=[self.group.id],
+            actor_id=foreign_actor.pk,
+            resource_kind="workflow",
+            resource_id=str(self.workflow.pk),
+            share_action=ShareAction.SHARED.value,
+            revoked_at=None,
+        )
+        self.service.send_group_resource_shared_notification.assert_not_called()
+
+    def test_resource_from_another_org_is_not_resolved(self) -> None:
+        """A resource id belonging to another org must not resolve.
+
+        For ``Workflow`` the org-scoped manager already enforces this, so this
+        pins the outcome rather than the explicit filter. That filter exists
+        for ``AgenticProject``, whose manager deliberately spans orgs -- a
+        cloud-only model, so the case it guards cannot be exercised here.
+        """
+        other_org = Organization.objects.create(
+            name="org-c", display_name="Org C", organization_id="org-c"
+        )
+        foreign_wf = Workflow.objects.create(
+            workflow_name="wf-other", organization=other_org, created_by=self.owner
+        )
+        with self.assertRaises(ResourceNotFoundError):
+            send_resource_shared(
+                organization=self.org,
+                group_ids=[self.group.id],
+                actor_id=self.owner.pk,
+                resource_kind="workflow",
+                resource_id=str(foreign_wf.pk),
+                share_action=ShareAction.SHARED.value,
+                revoked_at=None,
+            )
+        self.service.send_group_resource_shared_notification.assert_not_called()
+
+    def test_revoke_on_an_org_shared_resource_mails_nobody(self) -> None:
+        """Nobody lost access, so nobody is told.
+
+        The short-circuit that skips hydrating every org member to reach this
+        answer is an optimisation, not a behaviour change -- removing it leaves
+        this assertion green. Only a query count would pin that half.
+        """
+        self.workflow.shared_to_org = True
+        self.workflow.save(update_fields=["shared_to_org"])
+        self._send(group_ids=[self.group.id], share_action=ShareAction.REVOKED.value)
+        self.assertEqual(self._mailed(), [])
+
+    def test_revoke_does_not_tell_an_owner_they_lost_access(self) -> None:
+        """Owners sit outside ``compute_effective_members``, so they have to be
+        added back explicitly or an owner inside a revoked group is mailed a
+        false removal notice.
+        """
+        GroupMembership.objects.create(group=self.group, user=self.owner)
+        self._send(group_ids=[self.group.id], share_action=ShareAction.REVOKED.value)
+        self.assertEqual(self._mailed(), [("Team", ["member@example.com"])])
+
+    def test_revoke_does_not_tell_an_org_admin_they_lost_access(self) -> None:
+        """An admin reaches every resource in the org via ``for_user``, so a
+        revoke takes nothing from them.
+
+        The admin ROLE STRING differs between the OSS and auth0 auth plugins,
+        so the predicate is patched rather than resolved for real.
+        """
+        GroupMembership.objects.create(group=self.group, user=self.admin)
+        with patch(
+            "account_v2.authentication_controller.AuthenticationController"
+            ".is_admin_by_role",
+            side_effect=lambda role: role == "admin",
+        ):
+            self._send(group_ids=[self.group.id], share_action=ShareAction.REVOKED.value)
+        self.assertEqual(self._mailed(), [("Team", ["member@example.com"])])
+
+    def test_membership_removal_is_mailed_as_a_removal(self) -> None:
+        """The ADDED direction was the only one exercised, so hardcoding the
+        action passed every test while telling removed users they were added.
+        """
+        send_membership_changed(
+            organization=self.org,
+            group_id=self.group.id,
+            actor_id=self.owner.pk,
+            membership_action=MembershipAction.REMOVED.value,
+            user_ids=[self.member.pk],
+        )
+        kwargs = self.service.send_group_membership_notification.call_args.kwargs
+        self.assertEqual(kwargs["membership_action"], "removed")
+
+    def test_membership_recipients_are_revalidated_against_the_org(self) -> None:
+        """Leaving a group does not remove someone from the org, and leaving the
+        org does not delete their group rows -- so the recipient list is filtered
+        on OrganizationMember rather than taken from the payload.
+        """
+        stranger = _make_user("ex@example.com")
+        send_membership_changed(
+            organization=self.org,
+            group_id=self.group.id,
+            actor_id=self.owner.pk,
+            membership_action=MembershipAction.REMOVED.value,
+            user_ids=[self.member.pk, stranger.pk],
+        )
+        kwargs = self.service.send_group_membership_notification.call_args.kwargs
+        self.assertEqual([u.email for u in kwargs["recipients"]], ["member@example.com"])
+
+    def test_revoke_skips_members_who_joined_after_the_cutoff(self) -> None:
+        revoked_at = timezone.now()
+        latecomer = GroupMembership.objects.create(group=self.group, user=self.outsider)
+        # ``created_at`` is auto-set on save, so move it past the cutoff directly.
+        GroupMembership.objects.filter(pk=latecomer.pk).update(
+            created_at=revoked_at + timedelta(minutes=1)
+        )
+        self._send(
+            group_ids=[self.group.id],
+            share_action=ShareAction.REVOKED.value,
+            revoked_at=revoked_at,
+        )
+        # ``outsider`` never held access through this group, so no revoke notice.
+        self.assertEqual(self._mailed(), [("Team", ["member@example.com"])])
+
+    def test_revoke_skips_members_who_keep_access_another_way(self) -> None:
+        _add_viewers(self.workflow, self.member)
+        self._send(group_ids=[self.group.id], share_action=ShareAction.REVOKED.value)
+        # Nothing was lost — a direct VIEWER row still reaches the resource.
+        self.service.send_group_resource_shared_notification.assert_not_called()
+
+    def test_revoke_skips_members_who_keep_access_via_another_group(self) -> None:
+        # ``self.member`` is in both groups; only ``self.group`` is revoked.
+        other_group = OrganizationGroup.objects.create(
+            organization=self.org, name="Ops", created_by=self.owner
+        )
+        GroupMembership.objects.create(group=other_group, user=self.member)
+        set_resource_share_groups(self.workflow, [other_group.id])
+        self._send(group_ids=[self.group.id], share_action=ShareAction.REVOKED.value)
+        # Still reaches the resource through "Ops" -- nothing was lost.
+        self.service.send_group_resource_shared_notification.assert_not_called()
+
+    def test_membership_change_mails_only_the_changed_users(self) -> None:
+        send_membership_changed(
+            organization=self.org,
+            group_id=self.group.id,
+            actor_id=self.owner.pk,
+            membership_action=MembershipAction.ADDED.value,
+            user_ids=[self.outsider.pk],
+        )
+        kwargs = self.service.send_group_membership_notification.call_args.kwargs
+        self.assertEqual(kwargs["group_name"], "Team")
+        self.assertEqual(kwargs["membership_action"], "added")
+        self.assertEqual(
+            [u.email for u in kwargs["recipients"]], ["outsider@example.com"]
+        )

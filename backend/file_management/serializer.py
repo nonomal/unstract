@@ -1,6 +1,7 @@
-from file_management.constants import FileInformationKey
 from rest_framework import serializers
 from utils.FileValidator import FileValidator
+
+from file_management.constants import FileInformationKey
 
 
 class FileInfoSerializer(serializers.Serializer):
@@ -47,12 +48,6 @@ class FileUploadIdeSerializer(serializers.Serializer):
             )
         ],
     )
-
-
-class FileInfoIdeSerializer(serializers.Serializer):
-    document_id = serializers.CharField()
-    tool_id = serializers.CharField()
-    view_type = serializers.CharField(required=False)
 
 
 class FileListRequestIdeSerializer(serializers.Serializer):

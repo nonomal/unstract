@@ -1,18 +1,21 @@
-import { CheckCircleFilled } from "@ant-design/icons";
-import { Button, Card, Col, Layout, Row, Space, Typography } from "antd";
+import { CircleCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-
-import logo from "../../assets/UnstractLogoBlack.svg";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Col, Row, Space } from "@/components/ui/shims/antd-layout";
+import { Card, Layout } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
+import ConnectEmbedding from "../../assets/connect_embedding.svg";
 import ConnectLLM from "../../assets/connect_llm.svg";
 import ConnectVectorDb from "../../assets/connect_vector_db.svg";
-import ConnectEmbedding from "../../assets/connect_embedding.svg";
 import ConnectTextExtractor from "../../assets/connect_x2text.svg";
-import { onboardCompleted } from "../../helpers/GetStaticData.js";
+import logo from "../../assets/UnstractLogoBlack.svg";
+import { homePagePath, onboardCompleted } from "../../helpers/GetStaticData.js";
 import { useSessionStore } from "../../store/session-store.js";
 import { AddSourceModal } from "../input-output/add-source-modal/AddSourceModal.jsx";
 import { CustomButton } from "../widgets/custom-button/CustomButton.jsx";
 import "./onBoard.css";
+
 const { Content } = Layout;
 
 function OnBoard() {
@@ -22,7 +25,7 @@ function OnBoard() {
   const [openAddSourcesModal, setOpenAddSourcesModal] = useState(false);
   const [editItemId, setEditItemId] = useState(null);
   const [type, setType] = useState(null);
-  const homePageUrl = `/${orgName}/tools`;
+  const homePageUrl = `/${orgName}/${homePagePath}`;
   const [adaptersList, setAdaptersList] = useState(adapters || []);
   useEffect(() => {
     if (onboardCompleted(adaptersList)) {
@@ -112,7 +115,7 @@ function OnBoard() {
                   <Col span={4} align="center" justify="center">
                     {adaptersList?.includes(step.type) ? (
                       <div>
-                        <CheckCircleFilled className="configured-icon" />
+                        <CircleCheck className="configured-icon" />
                         <span className="configured-text">Configured</span>
                       </div>
                     ) : (

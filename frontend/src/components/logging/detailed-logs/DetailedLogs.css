@@ -1,0 +1,201 @@
+/* Flexbox layout for responsive table */
+.detailed-logs-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.detailed-logs-header {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+}
+
+.detailed-logs-cards {
+  flex: 0 0 auto;
+  /* Match the 24px gutter of .detailed-logs-header and of the table below, so
+   * the title, the cards and the table all share one left and right edge. */
+  padding: 0 24px 12px;
+}
+
+.detailed-logs-card-group {
+  /* stretch, so a card whose text wraps does not leave the others short */
+  align-items: stretch;
+  gap: 16px;
+}
+
+.detailed-logs-table-container {
+  flex: 1;
+  min-height: 0;
+  padding: 0 24px 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.detailed-logs-table-container .ant-table-wrapper {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.detailed-logs-table-container .ant-spin-nested-loading,
+.detailed-logs-table-container .ant-spin-container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.detailed-logs-table-container .ant-table {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.detailed-logs-table-container .ant-table-container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.detailed-logs-table-container .ant-table-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto !important;
+}
+
+.logging-card-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.logs-details-card {
+  width: 250px;
+  margin: 0;
+  padding: 0;
+  /* min-height, not a fixed height: at 60px the card clipped its own content,
+   * so a timestamp that wrapped to a second line spilled below the border. */
+  min-height: 64px;
+}
+
+/* The shim's card body carries Tailwind `p-6 pt-0`, which pinned the content to
+ * the top edge and left 24px of dead space beneath it. Centre it instead. */
+.logs-details-card .ant-card-body {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 12px 16px;
+}
+
+.logging-card-icons {
+  margin: 0 12px 0 0;
+  /* width/height, not font-size, and flex-shrink so the icon keeps its box:
+   * see the note on .column-settings-icon below. */
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.view-log-button {
+  /* the row's own 24px padding now supplies the gutter */
+  margin-right: 0;
+}
+
+/* Action column header with settings icon */
+.action-column-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-evenly;
+  width: 100%;
+}
+
+.column-settings-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.column-settings-trigger:hover {
+  background-color: rgba(0, 0, 0, 0.04);
+}
+
+.column-settings-icon {
+  font-size: 16px;
+  /* width/height, not font-size alone: antd shipped an icon FONT (sized by
+   * font-size); lucide ships SVGs, which ignore it and fall back to their
+   * own 24px default. font-size is kept for any text in the same element. */
+  width: 16px;
+  height: 16px;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.column-settings-trigger:hover .column-settings-icon {
+  color: var(--primary);
+}
+
+/* Thin scrollbar */
+.detailed-logs-table-container .ant-table-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.detailed-logs-table-container .ant-table-body::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+}
+
+.detailed-logs-table-container .ant-table-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.search-container {
+  padding: 8px;
+}
+
+.search-input {
+  width: 188px;
+  margin-bottom: 8px;
+  display: block;
+}
+
+/* Fix cursor in pagination dropdown */
+.detailed-logs-table-container .ant-pagination-options .ant-select-selector {
+  cursor: pointer;
+}
+
+.detailed-logs-table-container
+  .ant-pagination-options
+  .ant-select-selection-item {
+  cursor: pointer;
+}
+
+/* Status message text with ellipsis */
+.status-message-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Outlined copy button style - matches LLM Profiles / API Deployments */
+.copy-btn-outlined {
+  border: 1px solid #d9d9d9;
+  background: #fff;
+  color: rgba(0, 0, 0, 0.65);
+  margin-left: 8px;
+  height: auto;
+  min-width: auto;
+}
+
+.copy-btn-outlined:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}

@@ -1,6 +1,16 @@
+// Aliased: antd's `Upload` component (still in use until P3) would otherwise be
+// shadowed by the lucide icon of the same name.
+
+import { Upload as UploadIcon } from "lucide-react";
 import PropTypes from "prop-types";
-import { Modal, Upload, Button } from "antd";
-import { UploadOutlined } from "@ant-design/icons";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Modal } from "@/components/ui/shims/antd-overlays";
+import { Upload } from "@/components/ui/shims/antd-structure";
+import { message } from "@/hooks/useAppToast";
+import {
+  WORKFLOW_PAGE_MAX_FILES,
+  WORKFLOW_VALIDATION_MESSAGES,
+} from "./WfConstants.js";
 
 const FileUpload = ({
   open,
@@ -15,15 +25,27 @@ const FileUpload = ({
   };
 
   const beforeUpload = (file) => {
+    if (fileList.length >= WORKFLOW_PAGE_MAX_FILES) {
+      message.error(WORKFLOW_VALIDATION_MESSAGES.MAX_FILES_EXCEEDED);
+      return false;
+    }
     setFileList([...fileList, file]);
     return false;
   };
 
   const submitFile = () => {
+    if (fileList.length === 0) {
+      message.error(WORKFLOW_VALIDATION_MESSAGES.NO_FILES_SELECTED);
+      return;
+    }
+    if (fileList.length > WORKFLOW_PAGE_MAX_FILES) {
+      message.error(WORKFLOW_VALIDATION_MESSAGES.MAX_FILES_EXCEEDED);
+      return;
+    }
     continueWfExecution(
       wfExecutionParams[0],
       wfExecutionParams[1],
-      wfExecutionParams[2]
+      wfExecutionParams[2],
     );
     setOpen(false);
   };
@@ -47,8 +69,10 @@ const FileUpload = ({
         fileList={fileList}
         beforeUpload={beforeUpload}
         onRemove={onRemove}
+        maxCount={WORKFLOW_PAGE_MAX_FILES}
+        multiple={true}
       >
-        <Button icon={<UploadOutlined />}>Select File</Button>
+        <Button icon={<UploadIcon className="size-4" />}>Select File</Button>
       </Upload>
     </Modal>
   );

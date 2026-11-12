@@ -1,88 +1,428 @@
-import { BranchesOutlined } from "@ant-design/icons";
-import { Divider, Image, Layout, Space, Tooltip, Typography } from "antd";
+import { ChevronsRight, FileCheck, GitBranch } from "lucide-react";
 import PropTypes from "prop-types";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import "./SideNavBar.css";
-const { Sider } = Layout;
-
-import Workflows from "../../../assets/Workflows.svg";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Divider, Tag } from "@/components/ui/shims/antd-leaves";
+import { Popover, Tooltip } from "@/components/ui/shims/antd-overlays";
+import { Layout } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 import apiDeploy from "../../../assets/api-deployments.svg";
-import appdev from "../../../assets/appdev.svg";
+import ConnectorsIcon from "../../../assets/connectors.svg";
 import CustomTools from "../../../assets/custom-tools-icon.svg";
+import DashboardIcon from "../../../assets/dashboard.svg";
 import EmbeddingIcon from "../../../assets/embedding.svg";
 import etl from "../../../assets/etl.svg";
 import LlmIcon from "../../../assets/llm.svg";
 import PlatformSettingsIcon from "../../../assets/platform-settings.svg";
 import task from "../../../assets/task.svg";
-import VectorDbIcon from "../../../assets/vector-db.svg";
+import TerminalIcon from "../../../assets/terminal.svg";
 import TextExtractorIcon from "../../../assets/text-extractor.svg";
+import VectorDbIcon from "../../../assets/vector-db.svg";
+import Workflows from "../../../assets/Workflows.svg";
+import {
+  getLocalStorageValue,
+  setLocalStorageValue,
+} from "../../../helpers/localStorage";
 import { useSessionStore } from "../../../store/session-store";
 
-const SideNavBar = ({ collapsed }) => {
+import "./SideNavBar.css";
+import "../../settings/settings/Settings.css";
+
+const { Sider } = Layout;
+
+let getMenuItem;
+try {
+  getMenuItem = await import("../../../plugins/app-deployment/getMenuItem");
+} catch {
+  // Plugin unavailable.
+}
+
+let sideMenu;
+try {
+  sideMenu = await import("../../../plugins/hooks/useSideMenu");
+} catch {
+  // Plugin unavailable.
+}
+
+let unstractSubscriptionPlan;
+let unstractSubscriptionPlanStore;
+let UNSTRACT_SUBSCRIPTION_PLANS;
+try {
+  unstractSubscriptionPlanStore = await import(
+    "../../../plugins/store/unstract-subscription-plan-store"
+  );
+  const unstractSubscriptionConstants = await import(
+    "../../../plugins/unstract-subscription/helper/constants"
+  );
+  UNSTRACT_SUBSCRIPTION_PLANS =
+    unstractSubscriptionConstants?.UNSTRACT_SUBSCRIPTION_PLANS;
+} catch {
+  // Plugin unavailable.
+}
+
+let selectedProductStore;
+let selectedProduct;
+try {
+  selectedProductStore = await import(
+    "../../../plugins/store/select-product-store.js"
+  );
+} catch {
+  // Ignore if hook not available
+}
+
+let agenticPromptStudioEnabled = false;
+try {
+  await import("../../../plugins/agentic-prompt-studio");
+  agenticPromptStudioEnabled = true;
+} catch {
+  // Plugin unavailable
+}
+
+let lookupStudioEnabled = false;
+try {
+  await import("../../../plugins/lookup-studio");
+  lookupStudioEnabled = true;
+} catch {}
+
+let manualReviewSettingsEnabled = false;
+try {
+  await import("../../../plugins/manual-review/settings/Settings.jsx");
+  manualReviewSettingsEnabled = true;
+} catch {
+  // Plugin unavailable
+}
+
+const getSettingsMenuItems = (orgName, isAdmin) => [
+  {
+    key: "platform",
+    label: "Platform Settings",
+    path: `/${orgName}/settings/platform`,
+  },
+  ...(isAdmin
+    ? [
+        {
+          key: "platformApiKeys",
+          label: "Platform API Keys",
+          path: `/${orgName}/settings/platform-api-keys`,
+        },
+        {
+          key: "globalApiDeploymentKeys",
+          label: "Global API Deployment Keys",
+          path: `/${orgName}/settings/global-api-deployment-keys`,
+        },
+        {
+          key: "agentKvKeys",
+          label: "Agent-KV API Keys",
+          path: `/${orgName}/settings/agent-kv-keys`,
+        },
+      ]
+    : []),
+  {
+    key: "users",
+    label: "User Management",
+    path: `/${orgName}/users`,
+  },
+  ...(isAdmin
+    ? [
+        {
+          key: "groups",
+          label: "Groups",
+          path: `/${orgName}/groups`,
+        },
+      ]
+    : []),
+  {
+    key: "triad",
+    label: "Default LLM Profile",
+    path: `/${orgName}/settings/triad`,
+  },
+  ...(manualReviewSettingsEnabled
+    ? [
+        {
+          key: "review",
+          label: "Human In the Loop Settings",
+          path: `/${orgName}/settings/review`,
+        },
+      ]
+    : []),
+];
+
+const getActiveSettingsKey = () => {
+  const currentPath = globalThis.location.pathname;
+  if (currentPath.includes("/settings/global-api-deployment-keys")) {
+    return "globalApiDeploymentKeys";
+  }
+  if (currentPath.includes("/settings/platform-api-keys")) {
+    return "platformApiKeys";
+  }
+  // Before the "/settings/platform" test below, which is a prefix of nothing
+  // here but sits in a chain where the first match wins — the neighbouring
+  // key routes are ordered on the same basis.
+  if (currentPath.includes("/settings/agent-kv-keys")) {
+    return "agentKvKeys";
+  }
+  if (currentPath.includes("/settings/platform")) {
+    return "platform";
+  }
+  if (currentPath.includes("/users")) {
+    return "users";
+  }
+  if (currentPath.includes("/groups")) {
+    return "groups";
+  }
+  if (currentPath.includes("/settings/triad")) {
+    return "triad";
+  }
+  if (currentPath.includes("/settings/review")) {
+    return "review";
+  }
+  // See getActiveHITLKey: no key rather than defaulting to the first entry,
+  // which otherwise looks selected from everywhere in the app.
+  return null;
+};
+
+const SettingsPopoverContent = ({ orgName, navigate, isAdmin }) => {
+  const settingsMenuItems = getSettingsMenuItems(orgName, isAdmin);
+  const currentActiveKey = getActiveSettingsKey();
+
+  const handleMenuClick = (path) => {
+    navigate(path);
+  };
+
+  return (
+    <nav className="settings-sidebar-popover" data-testid="platform-menu">
+      {settingsMenuItems.map((menuItem) => (
+        <button
+          key={menuItem.key}
+          type="button"
+          data-testid={`platform-menu-item-${menuItem.key}`}
+          className={`settings-menu-item ${
+            currentActiveKey === menuItem.key ? "active" : ""
+          }`}
+          onClick={() => handleMenuClick(menuItem.path)}
+        >
+          {menuItem.label}
+        </button>
+      ))}
+    </nav>
+  );
+};
+
+SettingsPopoverContent.propTypes = {
+  orgName: PropTypes.string.isRequired,
+  navigate: PropTypes.func.isRequired,
+  isAdmin: PropTypes.bool,
+};
+
+const HITL_MENU_ITEMS = [
+  { key: "review", label: "Review", subPath: "/review" },
+  {
+    key: "approve",
+    label: "Approve",
+    subPath: "/review/approve",
+    supervisorOnly: true,
+  },
+  {
+    key: "download",
+    label: "Download & Sync",
+    subPath: "/review/download_and_sync",
+    supervisorOnly: true,
+  },
+];
+
+const getHITLMenuItems = (orgName, role) => {
+  const isSupervisorOrAdmin = [
+    "unstract_supervisor",
+    "unstract_admin",
+  ].includes(role);
+  return HITL_MENU_ITEMS.filter(
+    (item) => !item.supervisorOnly || isSupervisorOrAdmin,
+  ).map((item) => ({
+    key: item.key,
+    label: item.label,
+    path: `/${orgName}${item.subPath}`,
+  }));
+};
+
+const getActiveHITLKey = (orgName) => {
+  const currentPath = globalThis.location.pathname;
+  const base = `/${orgName}/review`;
+  if (currentPath.startsWith(`${base}/approve`)) {
+    return "approve";
+  }
+  if (currentPath.startsWith(`${base}/download_and_sync`)) {
+    return "download";
+  }
+  if (currentPath.startsWith(base)) {
+    return "review";
+  }
+  // No key when the current route is not under HITL at all. Falling back to
+  // "review" painted the first entry as selected from every other page in the
+  // app, which reads as "you are here" when you are not.
+  return null;
+};
+
+const HITLPopoverContent = ({ orgName, role, navigate }) => {
+  const hitlMenuItems = getHITLMenuItems(orgName, role);
+  const currentActiveKey = getActiveHITLKey(orgName);
+
+  return (
+    <nav className="settings-sidebar-popover" data-testid="hitl-menu">
+      {hitlMenuItems.map((menuItem) => (
+        <button
+          key={menuItem.key}
+          type="button"
+          data-testid={`hitl-menu-item-${menuItem.key}`}
+          className={`settings-menu-item ${
+            currentActiveKey === menuItem.key ? "active" : ""
+          }`}
+          onClick={() => navigate(menuItem.path)}
+        >
+          {menuItem.label}
+        </button>
+      ))}
+    </nav>
+  );
+};
+
+HITLPopoverContent.propTypes = {
+  orgName: PropTypes.string.isRequired,
+  role: PropTypes.string.isRequired,
+  navigate: PropTypes.func.isRequired,
+};
+
+const SideNavBar = ({ collapsed, setCollapsed }) => {
   const navigate = useNavigate();
   const { sessionDetails } = useSessionStore();
-  const { orgName } = sessionDetails;
+  const { orgName, flags, role } = sessionDetails;
 
-  const data = [
+  const [isPinned, setIsPinned] = useState(() =>
+    getLocalStorageValue("sidebarPinned", false),
+  );
+  const collapseTimeoutRef = useRef(null);
+
+  const clearCollapseTimeout = () => {
+    if (collapseTimeoutRef.current) {
+      clearTimeout(collapseTimeoutRef.current);
+      collapseTimeoutRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    setLocalStorageValue("sidebarPinned", isPinned);
+    if (isPinned) {
+      clearCollapseTimeout();
+      setCollapsed(false);
+    }
+    return clearCollapseTimeout;
+  }, [isPinned, setCollapsed]);
+
+  const handleMouseEnter = () => {
+    clearCollapseTimeout();
+    if (!isPinned) {
+      setCollapsed(false);
+    }
+  };
+
+  const handleMouseLeave = () => {
+    if (!isPinned) {
+      collapseTimeoutRef.current = setTimeout(() => setCollapsed(true), 300);
+    }
+  };
+
+  const togglePin = () => {
+    const newPinned = !isPinned;
+    setIsPinned(newPinned);
+    if (newPinned) {
+      setCollapsed(false);
+    }
+  };
+
+  try {
+    if (unstractSubscriptionPlanStore?.useUnstractSubscriptionPlanStore) {
+      unstractSubscriptionPlan =
+        unstractSubscriptionPlanStore?.useUnstractSubscriptionPlanStore(
+          (state) => state?.unstractSubscriptionPlan,
+        );
+    }
+  } catch (_error) {
+    // Do nothing
+  }
+
+  if (selectedProductStore?.useSelectedProductStore) {
+    selectedProduct = selectedProductStore.useSelectedProductStore(
+      (state) => state?.selectedProduct,
+    );
+  }
+
+  let menu;
+  if (sideMenu?.useSideMenu) {
+    menu = sideMenu.useSideMenu();
+  }
+
+  const unstractMenuItems = [
     {
       id: 1,
-      mainTitle: "MANAGE",
+      mainTitle: "BUILD",
       subMenu: [
         {
           id: 1.1,
-          title: "API Deployments",
-          description: "Unstructured to structured APIs",
-          image: apiDeploy,
-          path: `/${orgName}/api`,
-          active: window.location.pathname.startsWith(`/${orgName}/api`),
-        },
-        {
-          id: 1.2,
-          title: "App Deployments",
-          description: "Standalone unstructured data apps",
-          icon: BranchesOutlined,
-          image: appdev,
-          path: `/${orgName}/app`,
-          active: window.location.pathname.startsWith(`/${orgName}/app`),
+          title: "Prompt Studio",
+          description: "Create structured data from unstructured documents",
+          image: CustomTools,
+          path: `/${orgName}/tools`,
+          active: globalThis.location.pathname.startsWith(`/${orgName}/tools`),
         },
         {
           id: 1.3,
-          title: "ETL Pipelines",
-          description: "Unstructured to structured data pipelines",
-          image: etl,
-          path: `/${orgName}/etl`,
-          active: window.location.pathname.startsWith(`/${orgName}/etl`),
-        },
-        {
-          id: 1.4,
-          title: "Task Pipelines",
-          description: "Ad-hoc unstructured data task pipelines",
-          image: task,
-          path: `/${orgName}/task`,
-          active: window.location.pathname.startsWith(`/${orgName}/task`),
+          title: "Workflows",
+          description: "Build no-code data workflows for unstructured data",
+          icon: GitBranch,
+          image: Workflows,
+          path: `/${orgName}/workflows`,
+          active: globalThis.location.pathname.startsWith(
+            `/${orgName}/workflows`,
+          ),
         },
       ],
     },
     {
       id: 2,
-      mainTitle: "BUILD",
+      mainTitle: "MANAGE",
       subMenu: [
         {
-          id: 2.1,
-          title: "Workflows",
-          description: "Build no-code data workflows for unstructured data",
-          icon: BranchesOutlined,
-          image: Workflows,
-          path: `/${orgName}/workflows`,
-          active: window.location.pathname.startsWith(`/${orgName}/workflows`),
+          id: 2.2,
+          title: "API Deployments",
+          description: "Unstructured to structured APIs",
+          image: apiDeploy,
+          path: `/${orgName}/api`,
+          active: globalThis.location.pathname.startsWith(`/${orgName}/api`),
         },
         {
-          id: 2.2,
-          title: "Prompt Studio",
-          description: "Create structured data from unstructured documents",
-          image: CustomTools,
-          path: `/${orgName}/tools`,
-          active: window.location.pathname.startsWith(`/${orgName}/tools`),
+          id: 2.3,
+          title: "ETL Pipelines",
+          description: "Unstructured to structured data pipelines",
+          image: etl,
+          path: `/${orgName}/etl`,
+          active: globalThis.location.pathname.startsWith(`/${orgName}/etl`),
+        },
+        {
+          id: 2.4,
+          title: "Task Pipelines",
+          description: "Ad-hoc unstructured data task pipelines",
+          image: task,
+          path: `/${orgName}/task`,
+          active: globalThis.location.pathname.startsWith(`/${orgName}/task`),
+        },
+        {
+          id: 1.5,
+          title: "Logs",
+          description: "Records system events for monitoring and debugging",
+          image: TerminalIcon,
+          path: `/${orgName}/logs`,
+          active: globalThis.location.pathname.startsWith(`/${orgName}/logs`),
         },
       ],
     },
@@ -94,11 +434,11 @@ const SideNavBar = ({ collapsed }) => {
           id: 3.1,
           title: "LLMs",
           description: "Setup platform wide access to Large Language Models",
-          icon: BranchesOutlined,
+          icon: GitBranch,
           image: LlmIcon,
           path: `/${orgName}/settings/llms`,
-          active: window.location.pathname.startsWith(
-            `/${orgName}/settings/llms`
+          active: globalThis.location.pathname.startsWith(
+            `/${orgName}/settings/llms`,
           ),
         },
         {
@@ -107,8 +447,8 @@ const SideNavBar = ({ collapsed }) => {
           description: "Setup platform wide access to Vector DBs",
           image: VectorDbIcon,
           path: `/${orgName}/settings/vectorDbs`,
-          active: window.location.pathname.startsWith(
-            `/${orgName}/settings/vectorDbs`
+          active: globalThis.location.pathname.startsWith(
+            `/${orgName}/settings/vectorDbs`,
           ),
         },
         {
@@ -117,8 +457,8 @@ const SideNavBar = ({ collapsed }) => {
           description: "Setup platform wide access to Embedding models",
           image: EmbeddingIcon,
           path: `/${orgName}/settings/embedding`,
-          active: window.location.pathname.startsWith(
-            `/${orgName}/settings/embedding`
+          active: globalThis.location.pathname.startsWith(
+            `/${orgName}/settings/embedding`,
           ),
         },
         {
@@ -127,25 +467,146 @@ const SideNavBar = ({ collapsed }) => {
           description: "Setup platform wide access to Text extractor services",
           image: TextExtractorIcon,
           path: `/${orgName}/settings/textExtractor`,
-          active: window.location.pathname.startsWith(
-            `/${orgName}/settings/textExtractor`
+          active: globalThis.location.pathname.startsWith(
+            `/${orgName}/settings/textExtractor`,
           ),
         },
         {
           id: 3.5,
+          title: "Connectors",
+          description: "Manage connectors for data sources and destinations",
+          image: ConnectorsIcon,
+          path: `/${orgName}/settings/connectors`,
+          active: globalThis.location.pathname.startsWith(
+            `/${orgName}/settings/connectors`,
+          ),
+        },
+        {
+          id: 3.6,
           title: "Platform",
           description: "Settings for the platform",
           image: PlatformSettingsIcon,
-          path: `/${orgName}/settings`,
+          path: `/${orgName}/settings/platform`,
           active:
-            window.location.pathname === `/${orgName}/settings` ||
-            window.location.pathname === `/${orgName}/settings/platform` ||
-            window.location.pathname === `/${orgName}/settings/triad` ||
-            window.location.pathname === `/${orgName}/users`,
+            globalThis.location.pathname === `/${orgName}/settings` ||
+            globalThis.location.pathname === `/${orgName}/settings/platform` ||
+            globalThis.location.pathname ===
+              `/${orgName}/settings/platform-api-keys` ||
+            globalThis.location.pathname ===
+              `/${orgName}/settings/global-api-deployment-keys` ||
+            globalThis.location.pathname ===
+              `/${orgName}/settings/agent-kv-keys` ||
+            globalThis.location.pathname === `/${orgName}/settings/triad` ||
+            globalThis.location.pathname === `/${orgName}/settings/review` ||
+            globalThis.location.pathname === `/${orgName}/users` ||
+            globalThis.location.pathname === `/${orgName}/groups`,
         },
       ],
     },
   ];
+
+  // Dashboard menu item (available for both OSS and cloud)
+  unstractMenuItems[1].subMenu.unshift({
+    id: 2.0,
+    title: "Dashboard",
+    description: "View platform usage metrics and analytics",
+    image: DashboardIcon,
+    path: `/${orgName}/dashboard`,
+    active: globalThis.location.pathname.startsWith(`/${orgName}/dashboard`),
+  });
+
+  // If selectedProduct is verticals and menu is null, don't show any sidebar items
+  const data =
+    selectedProduct === "verticals" && menu === null
+      ? []
+      : menu || unstractMenuItems;
+
+  if (getMenuItem && flags?.app_deployment) {
+    data[1]?.subMenu?.splice(1, 0, getMenuItem.default(orgName));
+  }
+
+  // Memoize isUnstract calculation to avoid redundant computation
+  const isUnstract = useMemo(
+    () => !(selectedProduct && selectedProduct !== "unstract"),
+    [selectedProduct],
+  );
+
+  // Add Agentic Prompt Studio menu item if plugin is available and product is unstract
+  if (agenticPromptStudioEnabled && isUnstract) {
+    data[0]?.subMenu?.splice(1, 0, {
+      id: 1.2,
+      title: "Agentic Prompt Studio",
+      description: "Build and manage AI-powered extraction workflows",
+      image: CustomTools,
+      path: `/${orgName}/agentic-prompt-studio`,
+      active: globalThis.location.pathname.startsWith(
+        `/${orgName}/agentic-prompt-studio`,
+      ),
+      tag: "BETA",
+    });
+  }
+
+  // Keep Prompt Studio highlighted on /lookups. Replace, don't mutate —
+  // `data` may alias the `menu` prop.
+  if (lookupStudioEnabled && isUnstract && data[0]?.subMenu) {
+    const onLookupPath = globalThis.location.pathname.startsWith(
+      `/${orgName}/lookups`,
+    );
+    if (onLookupPath) {
+      data[0].subMenu = data[0].subMenu.map((el) =>
+        el.id === 1.1 ? { ...el, active: true } : el,
+      );
+    }
+  }
+
+  // Add HITL Review section if plugin is available and user has HITL role
+  const isHITLRole = [
+    "unstract_reviewer",
+    "unstract_supervisor",
+    "unstract_admin",
+  ].includes(role);
+  if (manualReviewSettingsEnabled && isHITLRole && isUnstract) {
+    const hasReviewSection = data.some((item) => item.mainTitle === "REVIEW");
+    const settingsIndex = data.findIndex(
+      (item) => item.mainTitle === "SETTINGS",
+    );
+    if (!hasReviewSection && settingsIndex !== -1) {
+      data.splice(settingsIndex, 0, {
+        id: 2.5,
+        mainTitle: "REVIEW",
+        subMenu: [
+          {
+            id: 2.51,
+            title: "HITL",
+            description: "Human-in-the-loop document review",
+            isHITL: true,
+            path: `/${orgName}/review`,
+            active: globalThis.location.pathname.startsWith(
+              `/${orgName}/review`,
+            ),
+          },
+        ],
+      });
+    }
+  }
+
+  const shouldDisableAll = useMemo(() => {
+    if (
+      !unstractSubscriptionPlan ||
+      !UNSTRACT_SUBSCRIPTION_PLANS ||
+      !isUnstract
+    ) {
+      return false;
+    }
+
+    return unstractSubscriptionPlan?.remainingDays < 0;
+  }, [unstractSubscriptionPlan, isUnstract]);
+
+  data?.forEach((mainMenuItem) => {
+    mainMenuItem?.subMenu?.forEach((subMenuItem) => {
+      subMenuItem.disable = shouldDisableAll;
+    });
+  });
 
   return (
     <Sider
@@ -155,19 +616,145 @@ const SideNavBar = ({ collapsed }) => {
       className="side-bar"
       width={240}
       collapsedWidth={65}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
     >
-      <div className="main-slider">
-        <div className="slider-wrap">
-          {data?.map((item, index) => {
-            return (
+      <div className="sidebar-content-wrapper">
+        <div className="main-slider">
+          <div className="slider-wrap">
+            {data?.map((item, index) => (
               <div key={item?.id}>
                 {!collapsed && (
                   <Typography className="sidebar-main-heading">
-                    {item.mainTitle}
+                    {item?.mainTitle}
                   </Typography>
                 )}
                 <Space direction="vertical" className="menu-item-body">
-                  {item.subMenu.map((el) => {
+                  {item?.subMenu?.map((el) => {
+                    // HITL item has a hover menu
+                    if (el.isHITL) {
+                      const handleHITLClick = () => {
+                        if (!el.disable) {
+                          navigate(el.path);
+                        }
+                      };
+
+                      const hitlContent = (
+                        <Tooltip title={collapsed ? el.title : ""}>
+                          <Space
+                            className={`space-styles ${
+                              el.active ? "space-styles-active" : ""
+                            } ${el.disable ? "space-styles-disable" : ""}`}
+                            onClick={handleHITLClick}
+                            data-testid={`sidebar-${el.title
+                              ?.toLowerCase()
+                              ?.replaceAll(/\s+/g, "-")}`}
+                          >
+                            <FileCheck className="sidebar-antd-icon" />
+                            {!collapsed && (
+                              <div>
+                                <Typography className="sidebar-item-text fs-14">
+                                  {el.title}
+                                </Typography>
+                                <Typography className="sidebar-item-text fs-11">
+                                  {el.description}
+                                </Typography>
+                              </div>
+                            )}
+                          </Space>
+                        </Tooltip>
+                      );
+
+                      if (el.disable) {
+                        return <div key={el.id}>{hitlContent}</div>;
+                      }
+
+                      return (
+                        <Popover
+                          key={el.id}
+                          content={
+                            <HITLPopoverContent
+                              orgName={orgName}
+                              role={role}
+                              navigate={navigate}
+                            />
+                          }
+                          trigger="hover"
+                          placement="rightTop"
+                          arrow={false}
+                          overlayClassName="settings-popover-overlay"
+                        >
+                          {hitlContent}
+                        </Popover>
+                      );
+                    }
+
+                    // Platform item has a hover menu and click navigates to platform settings
+                    if (el.id === 3.6) {
+                      const handlePlatformClick = () => {
+                        if (!el.disable) {
+                          navigate(el.path);
+                        }
+                      };
+
+                      const platformContent = (
+                        <Tooltip title={collapsed ? el.title : ""}>
+                          <Space
+                            className={`space-styles ${
+                              el.active ? "space-styles-active" : ""
+                            } ${el.disable ? "space-styles-disable" : ""}`}
+                            onClick={handlePlatformClick}
+                            data-testid={`sidebar-${el.title
+                              ?.toLowerCase()
+                              ?.replaceAll(/\s+/g, "-")}`}
+                          >
+                            <span
+                              className="menu-item-icon"
+                              style={{
+                                "--menu-item-icon": `url("${el.image}")`,
+                              }}
+                              role="img"
+                              aria-label="side_icon"
+                            />
+                            {!collapsed && (
+                              <div>
+                                <Typography className="sidebar-item-text fs-14">
+                                  {el.title}
+                                </Typography>
+                                <Typography className="sidebar-item-text fs-11">
+                                  {el.description}
+                                </Typography>
+                              </div>
+                            )}
+                          </Space>
+                        </Tooltip>
+                      );
+
+                      // Don't show popover when disabled
+                      if (el.disable) {
+                        return <div key={el.id}>{platformContent}</div>;
+                      }
+
+                      return (
+                        <Popover
+                          key={el.id}
+                          content={
+                            <SettingsPopoverContent
+                              orgName={orgName}
+                              navigate={navigate}
+                              isAdmin={sessionDetails?.isAdmin}
+                            />
+                          }
+                          trigger="hover"
+                          placement="rightTop"
+                          arrow={false}
+                          overlayClassName="settings-popover-overlay"
+                        >
+                          {platformContent}
+                        </Popover>
+                      );
+                    }
+
                     return (
                       <Tooltip key={el.id} title={collapsed ? el.title : ""}>
                         <Space
@@ -175,19 +762,34 @@ const SideNavBar = ({ collapsed }) => {
                             el.active ? "space-styles-active" : ""
                           } ${el.disable ? "space-styles-disable" : ""}`}
                           onClick={() => {
-                            !el.disable && navigate(el.path);
+                            if (!el.disable) {
+                              navigate(el.path);
+                            }
                           }}
+                          data-testid={`sidebar-${el.title
+                            ?.toLowerCase()
+                            ?.replaceAll(/\s+/g, "-")}`}
                         >
-                          <Image
-                            src={el.image}
-                            alt="side_icon"
+                          <span
                             className="menu-item-icon"
-                            preview={false}
+                            style={{
+                              "--menu-item-icon": `url("${el.image}")`,
+                            }}
+                            role="img"
+                            aria-label="side_icon"
                           />
                           {!collapsed && (
                             <div>
                               <Typography className="sidebar-item-text fs-14">
                                 {el.title}
+                                {el.tag && (
+                                  <Tag
+                                    color="blue"
+                                    className="sidebar-menu-tag"
+                                  >
+                                    {el.tag}
+                                  </Tag>
+                                )}
                               </Typography>
                               <Typography className="sidebar-item-text fs-11">
                                 {el.description}
@@ -203,16 +805,31 @@ const SideNavBar = ({ collapsed }) => {
                   <Divider className="sidebar-divider" />
                 )}
               </div>
-            );
-          })}
+            ))}
+          </div>
         </div>
       </div>
+      {!collapsed && (
+        <Button
+          type="text"
+          className="sidebar-toggle-container"
+          onClick={togglePin}
+          aria-pressed={isPinned}
+          aria-label={isPinned ? "Unpin sidebar" : "Pin sidebar"}
+          icon={
+            <ChevronsRight
+              className={`sidebar-toggle-icon${isPinned ? " pinned" : ""}`}
+            />
+          }
+        />
+      )}
     </Sider>
   );
 };
 
 SideNavBar.propTypes = {
   collapsed: PropTypes.bool.isRequired,
+  setCollapsed: PropTypes.func.isRequired,
 };
 
 export default SideNavBar;

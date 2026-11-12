@@ -1,22 +1,44 @@
-import { QuestionCircleOutlined } from "@ant-design/icons";
-import { Checkbox, Space, Tooltip, Typography } from "antd";
 import PropTypes from "prop-types";
+import { Checkbox } from "@/components/ui/shims/antd-inputs";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Typography } from "@/components/ui/shims/antd-typography";
+
 import "./CheckboxWidget.css";
-const CheckboxWidget = ({ id, value, onChange, label, schema }) => {
+import CustomMarkdown from "../../helpers/custom-markdown/CustomMarkdown";
+
+const CheckboxWidget = ({
+  id,
+  value,
+  onChange,
+  label,
+  schema,
+  required,
+  readonly,
+}) => {
   const description = schema?.description || "";
   const handleCheckboxChange = (event) => {
     onChange(event.target.checked);
   };
 
   return (
-    <Space className="checkbox-widget-main">
-      <Checkbox id={id} checked={value} onChange={handleCheckboxChange}>
-        <Typography>{label}</Typography>
+    <Space direction="vertical" className="checkbox-widget-main" size={0}>
+      <Checkbox
+        id={id}
+        checked={value}
+        onChange={handleCheckboxChange}
+        disabled={readonly}
+      >
+        <Typography>
+          {required && <span className="form-item-required">* </span>}
+          {label}
+        </Typography>
       </Checkbox>
       {description?.length > 0 && (
-        <Tooltip title={description}>
-          <QuestionCircleOutlined className="checkbox-widget-info-icon" />
-        </Tooltip>
+        <CustomMarkdown
+          text={description}
+          isSecondary={true}
+          styleClassName="rjsf-helper-font"
+        />
       )}
     </Space>
   );
@@ -28,6 +50,8 @@ CheckboxWidget.propTypes = {
   onChange: PropTypes.func.isRequired,
   label: PropTypes.string.isRequired,
   schema: PropTypes.object.isRequired,
+  required: PropTypes.bool,
+  readonly: PropTypes.bool.isRequired,
 };
 
 export { CheckboxWidget };

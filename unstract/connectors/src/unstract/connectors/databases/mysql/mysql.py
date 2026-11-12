@@ -1,14 +1,18 @@
-import datetime
 import os
 from typing import Any
 
 import pymysql
 from pymysql.connections import Connection
 
+from unstract.connectors.databases.mysql_handler import MysqlHandler
+from unstract.connectors.databases.sql_safety import (
+    QuoteStyle,
+    safe_identifier,
+)
 from unstract.connectors.databases.unstract_db import UnstractDB
 
 
-class MySQL(UnstractDB):
+class MySQL(UnstractDB, MysqlHandler):
     def __init__(self, settings: dict[str, Any]):
         super().__init__("MySQL")
 
@@ -49,6 +53,26 @@ class MySQL(UnstractDB):
     def can_read() -> bool:
         return True
 
+    def get_string_type(self) -> str:
+        return "longtext"
+
+    def get_quote_style(self) -> QuoteStyle:
+        return QuoteStyle.BACKTICK
+
+    def get_information_schema(self, table_name: str) -> dict[str, str]:
+        """Get information schema for MySQL database."""
+        # Try case-insensitive search since MySQL table names can be case-sensitive
+        query = (
+            "SELECT column_name, data_type FROM "
+            "information_schema.columns WHERE "
+            "UPPER(table_name) = UPPER(%s) AND table_schema = %s"
+        )
+        results = self.execute(query=query, params=(table_name, self.database))
+        column_types: dict[str, str] = self.get_db_column_types(
+            columns_with_types=results
+        )
+        return column_types
+
     def get_engine(self) -> Connection:  # type: ignore[type-arg]
         con = pymysql.connect(
             host=self.host,
@@ -59,22 +83,57 @@ class MySQL(UnstractDB):
         )
         return con
 
-    @staticmethod
-    def sql_to_db_mapping(value: str) -> str:
-        """
-        Gets the python datatype of value and converts python datatype
-        to corresponding DB datatype
+    def sql_to_db_mapping(self, value: Any, column_name: str | None = None) -> str:
+        """Override to handle JSON columns correctly for MySQL."""
+        return str(MysqlHandler.sql_to_db_mapping(value=value, column_name=column_name))
+
+    def get_create_table_base_query(self, table: str) -> str:
+        """Function to create a base create table sql query with MySQL specific types.
+
         Args:
-            value (str): _description_
+            table (str): db-connector table name
 
         Returns:
-            str: _description_
+            str: generates a create sql base query with the constant columns
         """
-        python_type = type(value)
-        mapping = {
-            str: "LONGTEXT",
-            int: "BIGINT",
-            float: "FLOAT",
-            datetime.datetime: "TIMESTAMP",
-        }
-        return mapping.get(python_type, "LONGTEXT")
+        qt = safe_identifier(table, QuoteStyle.BACKTICK)
+        sql_query = (
+            f"CREATE TABLE IF NOT EXISTS {qt} "
+            f"(id LONGTEXT, "
+            f"created_by LONGTEXT, created_at TIMESTAMP, "
+            f"metadata JSON, "
+            f"user_field_1 BOOLEAN DEFAULT FALSE, "
+            f"user_field_2 BIGINT DEFAULT 0, "
+            f"user_field_3 LONGTEXT DEFAULT NULL, "
+            f"status ENUM('ERROR', 'SUCCESS'), "
+            f"error_message LONGTEXT, "
+        )
+        return sql_query
+
+    def prepare_multi_column_migration(self, table_name: str, column_name: str) -> str:
+        qt = safe_identifier(table_name, QuoteStyle.BACKTICK)
+        qc = safe_identifier(f"{column_name}_v2", QuoteStyle.BACKTICK)
+        sql_query = (
+            f"ALTER TABLE {qt} "
+            f"ADD COLUMN {qc} JSON, "
+            f"ADD COLUMN metadata JSON, "
+            f"ADD COLUMN user_field_1 BOOLEAN DEFAULT FALSE, "
+            f"ADD COLUMN user_field_2 BIGINT DEFAULT 0, "
+            f"ADD COLUMN user_field_3 LONGTEXT DEFAULT NULL, "
+            f"ADD COLUMN status ENUM('ERROR', 'SUCCESS'), "
+            f"ADD COLUMN error_message LONGTEXT"
+        )
+        return sql_query
+
+    def execute_query(
+        self, engine: Any, sql_query: str, sql_values: Any, **kwargs: Any
+    ) -> None:
+        table_name = kwargs.get("table_name", None)
+        MysqlHandler.execute_query(
+            engine=engine,
+            sql_query=sql_query,
+            sql_values=sql_values,
+            database=self.database,
+            host=self.host,
+            table_name=table_name,
+        )

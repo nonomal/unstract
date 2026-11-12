@@ -1,20 +1,31 @@
-import { PlusOutlined } from "@ant-design/icons";
+import { Plus } from "lucide-react";
 import PropTypes from "prop-types";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { IslandLayout } from "../../../layouts/island-layout/IslandLayout";
-import { AddSourceModal } from "../../input-output/add-source-modal/AddSourceModal";
-import "../../input-output/data-source-card/DataSourceCard.css";
-import "./ToolSettings.css";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
+import { useCoOwnerManagement } from "../../../hooks/useCoOwnerManagement";
+import { useCopyToClipboard } from "../../../hooks/useCopyToClipboard";
+import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
+import {
+  applyPagedResponse,
+  buildPagedParams,
+  usePaginatedList,
+} from "../../../hooks/usePaginatedList";
+import usePostHogEvents from "../../../hooks/usePostHogEvents";
+import { IslandLayout } from "../../../layouts/island-layout/IslandLayout";
 import { useAlertStore } from "../../../store/alert-store";
 import { useSessionStore } from "../../../store/session-store";
-import { CustomButton } from "../../widgets/custom-button/CustomButton";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
+import { groupsService } from "../../groups/groups-service.js";
+import { AddSourceModal } from "../../input-output/add-source-modal/AddSourceModal";
+import "../../input-output/data-source-card/DataSourceCard.css";
 import { ToolNavBar } from "../../navigations/tool-nav-bar/ToolNavBar";
-import { ViewTools } from "../../custom-tools/view-tools/ViewTools";
+import { CoOwnerModal } from "../../widgets/co-owner-management/CoOwnerModal";
+import { CustomButton } from "../../widgets/custom-button/CustomButton";
+import { EmptyState } from "../../widgets/empty-state/EmptyState.jsx";
+import { ResourceTable } from "../../widgets/resource-table/ResourceTable";
 import { SharePermission } from "../../widgets/share-permission/SharePermission";
-import usePostHogEvents from "../../../hooks/usePostHogEvents";
+import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader.jsx";
+import "./ToolSettings.css";
 
 const titles = {
   llm: "LLMs",
@@ -25,103 +36,234 @@ const titles = {
 };
 
 const btnText = {
-  llm: "New LLM Profile",
-  vector_db: "New Vector DB Profile",
-  embedding: "New Embedding Profile",
+  llm: "New LLM",
+  vector_db: "New Vector DB",
+  embedding: "New Embedding",
   x2text: "New Text Extractor",
   ocr: "New OCR",
 };
 
+const DEFAULT_PAGE_SIZE = 10;
+
 function ToolSettings({ type }) {
-  const [tableRows, setTableRows] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isShareLoading, setIsShareLoading] = useState(false);
   const [adapterDetails, setAdapterDetails] = useState(null);
   const [userList, setUserList] = useState([]);
+  const [groupList, setGroupList] = useState([]);
+  const groupsApi = groupsService();
   const [openAddSourcesModal, setOpenAddSourcesModal] = useState(false);
   const [openSharePermissionModal, setOpenSharePermissionModal] =
     useState(false);
   const [isPermissonEdit, setIsPermissionEdit] = useState(false);
   const [editItemId, setEditItemId] = useState(null);
+  // undefined = not fetched yet (spinner); [] = fetched-empty (empty state)
+  const [displayList, setDisplayList] = useState();
+  // Fetch failure (vs. genuinely empty) — drives a retryable error state.
+  const [loadError, setLoadError] = useState(false);
   const { sessionDetails } = useSessionStore();
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
+  const copyToClipboard = useCopyToClipboard();
   const handleException = useExceptionHandler();
+  // Monotonic request token so a stale response can't overwrite a newer one.
+  const seqRef = useRef(0);
+
+  const adapterCoOwnerService = useMemo(
+    () => ({
+      getAllUsers: () =>
+        axiosPrivate({
+          method: "GET",
+          url: `/api/v1/unstract/${sessionDetails?.orgId}/users/`,
+        }),
+      getSharedUsers: (id) =>
+        axiosPrivate({
+          method: "GET",
+          url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/users/${id}/`,
+          headers: { "X-CSRFToken": sessionDetails?.csrfToken },
+        }),
+      addCoOwner: (id, userId) =>
+        axiosPrivate({
+          method: "POST",
+          url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/${id}/owners/`,
+          headers: {
+            "X-CSRFToken": sessionDetails?.csrfToken,
+            "Content-Type": "application/json",
+          },
+          data: { user_id: userId },
+        }),
+      removeCoOwner: (id, userId) =>
+        axiosPrivate({
+          method: "DELETE",
+          url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/${id}/owners/${userId}/`,
+          headers: { "X-CSRFToken": sessionDetails?.csrfToken },
+        }),
+    }),
+    [sessionDetails?.orgId, sessionDetails?.csrfToken],
+  );
+
+  const {
+    pagination,
+    setPagination,
+    searchTerm,
+    sort,
+    userSorted,
+    fetchRef,
+    requestList,
+    resetList,
+    syncRequested,
+    handlePaginationChange,
+    handleSearch,
+    handleSortChange,
+    handleListRefresh,
+  } = usePaginatedList({
+    defaultPageSize: DEFAULT_PAGE_SIZE,
+    defaultSortBy: "modified_at",
+    defaultOrder: "desc",
+  });
+
+  const coOwner = useCoOwnerManagement({
+    service: adapterCoOwnerService,
+    setAlertDetails,
+    onListRefresh: handleListRefresh,
+  });
   const { posthogEventText, setPostHogCustomEvent } = usePostHogEvents();
 
+  const getAdapters = useCallback(
+    (
+      page = 1,
+      pageSize = DEFAULT_PAGE_SIZE,
+      search = "",
+      sortBy = "",
+      order = "asc",
+    ) => {
+      if (!type) {
+        return;
+      }
+      const params = buildPagedParams({
+        page,
+        pageSize,
+        search,
+        sortBy,
+        order,
+      });
+      params.adapter_type = type.toUpperCase();
+      const seq = ++seqRef.current;
+      setLoadError(false);
+      setIsLoading(true);
+      return axiosPrivate({
+        method: "GET",
+        url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter`,
+        params,
+      })
+        .then((res) =>
+          applyPagedResponse({
+            data: res?.data,
+            page,
+            pageSize,
+            seq,
+            latestSeqRef: seqRef,
+            setList: setDisplayList,
+            setPagination,
+            refetchPrevPage: () =>
+              requestList(page - 1, pageSize, search, sortBy, order),
+          }),
+        )
+        .catch((err) => {
+          // A newer request superseded this one — don't surface its error.
+          if (seq !== seqRef.current) {
+            return;
+          }
+          setAlertDetails(handleException(err));
+          // Surface a retryable error instead of a misleading empty state.
+          setLoadError(true);
+          // Failed request — realign requestedRef with the still-shown view.
+          syncRequested();
+        })
+        .finally(() => {
+          // Only the newest request owns the shared loading state.
+          if (seq === seqRef.current) {
+            setIsLoading(false);
+          }
+        });
+    },
+    [
+      type,
+      sessionDetails?.orgId,
+      axiosPrivate,
+      setPagination,
+      setAlertDetails,
+      handleException,
+    ],
+  );
+  fetchRef.current = getAdapters;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset only when the adapter type changes, not when resetList's identity does
   useEffect(() => {
-    setTableRows([]);
+    setDisplayList(undefined);
     if (!type) {
       return;
     }
-    getAdapters();
+    // Persistent instance across adapter types: reset search/sort/requestedRef
+    // together so the new type starts clean and later refreshes don't replay
+    // the previous type's view.
+    resetList();
   }, [type]);
 
-  const getAdapters = () => {
-    const requestOptions = {
-      method: "GET",
-      url: `/api/v1/unstract/${
-        sessionDetails?.orgId
-      }/adapter?adapter_type=${type.toUpperCase()}`,
-    };
-    setIsLoading(true);
-    axiosPrivate(requestOptions)
-      .then((res) => {
-        setTableRows(res?.data);
-      })
-      .catch((err) => {
-        setAlertDetails(handleException(err));
-      })
-      .finally(() => {
-        setIsLoading(false);
-      });
-  };
-
-  const addNewItem = (row, isEdit) => {
-    if (isEdit) {
-      const rowsModified = [...tableRows].map((tableRow) => {
-        if (tableRow?.id !== row?.id) {
-          return tableRow;
-        }
-        tableRow["adapter_name"] = row?.adapter_name;
-        return tableRow;
-      });
-      setTableRows(rowsModified);
-    } else {
-      const rowsModified = [...tableRows];
-      rowsModified.push(row);
-      setTableRows(rowsModified);
-    }
-  };
+  // New/edited adapters land on some page under the active sort — refetch the
+  // current page to reflect server truth rather than splicing a stale array.
+  const addNewItem = () => handleListRefresh();
 
   const handleDelete = (_event, adapter) => {
-    const requestOptions = {
+    // Don't drive the shared list-loading from a row delete (as the other lists
+    // avoid): success refetches via handleListRefresh, which owns the spinner;
+    // failure just surfaces a toast. Keeps deletes out of the loading races.
+    axiosPrivate({
       method: "DELETE",
       url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/${adapter?.id}/`,
-      headers: {
-        "X-CSRFToken": sessionDetails?.csrfToken,
-      },
-    };
+      headers: { "X-CSRFToken": sessionDetails?.csrfToken },
+    })
+      .then(() => handleListRefresh())
+      .catch((err) => setAlertDetails(handleException(err)));
+  };
 
-    setIsLoading(true);
-    axiosPrivate(requestOptions)
-      .then((res) => {
-        const filteredList = tableRows.filter((row) => row?.id !== adapter?.id);
-        setTableRows(filteredList);
-        setAlertDetails({
-          type: "success",
-          content: "Successfully deleted",
-        });
-      })
-      .catch((err) => {
-        setAlertDetails(handleException(err));
-      })
-      .finally(() => {
-        setIsLoading(false);
+  /**
+   * Copy the adapter's INSTANCE id — what the Agent-KV API means by
+   * `adapters: {llm, lite_llm, x2text}`.
+   *
+   * `item.id`, NOT `item.adapter_id`. Both sit on the row and both look like
+   * identifiers; `adapter_id` is the provider descriptor
+   * (`anthropic|90ebd4cd-...`), shared by every instance of that provider, so
+   * the wrong one copies happily and fails much later at submit as "no such
+   * adapter in this organization".
+   */
+  const handleCopyId = (_event, item) => {
+    copyToClipboard(item?.id, "Adapter ID");
+  };
+
+  const handleEdit = (_event, item) => {
+    if (item?.is_deprecated) {
+      setAlertDetails({
+        type: "error",
+        content:
+          "This adapter has been deprecated and cannot be edited. Please remove it or use an alternative adapter.",
       });
+      return;
+    }
+    setEditItemId(item?.id);
   };
 
   const handleShare = (_event, adapter, isEdit) => {
+    // Check if adapter is deprecated
+    if (adapter?.is_deprecated) {
+      setAlertDetails({
+        type: "error",
+        content:
+          "This adapter has been deprecated and cannot be shared. Please remove it or use an alternative adapter.",
+      });
+      return;
+    }
+
     const requestOptions = {
       method: "GET",
       url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/users/${adapter.id}/`,
@@ -131,6 +273,13 @@ function ToolSettings({ type }) {
     };
     setIsShareLoading(true);
     getAllUsers();
+    groupsApi
+      .listGroups()
+      .then((res) => {
+        const items = Array.isArray(res?.data) ? res.data : [];
+        setGroupList(items.map((g) => ({ id: g.id, name: g.name })));
+      })
+      .catch(() => setGroupList([]));
     axiosPrivate(requestOptions)
       .then((res) => {
         setOpenSharePermissionModal(true);
@@ -159,7 +308,8 @@ function ToolSettings({ type }) {
           users.map((user) => ({
             id: user?.id,
             email: user?.email,
-          }))
+            is_admin: user?.is_admin,
+          })),
         );
       })
       .catch((err) => {
@@ -170,22 +320,40 @@ function ToolSettings({ type }) {
       });
   };
 
-  const onShare = (userIds, adapter) => {
+  const onShare = (userIds, adapter, shareWithEveryone, groupIds = []) => {
     const requestOptions = {
-      method: "PATCH",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/${adapter?.id}/`,
+      method: "POST",
+      url: `/api/v1/unstract/${sessionDetails?.orgId}/adapter/${adapter?.id}/share/`,
       headers: {
         "X-CSRFToken": sessionDetails?.csrfToken,
       },
-      data: { shared_users: userIds },
+      data: {
+        shared_users: userIds,
+        shared_to_org: shareWithEveryone || false,
+        shared_groups: groupIds,
+      },
     };
     axiosPrivate(requestOptions)
-      .then((response) => {
+      .then(() => {
         setOpenSharePermissionModal(false);
       })
       .catch((err) => {
-        setAlertDetails(handleException(err, "Failed to load"));
+        setAlertDetails(handleException(err, "Failed to update sharing"));
       });
+  };
+
+  const handleCoOwner = (_event, adapter) => {
+    if (!adapter?.id) {
+      return;
+    }
+    if (adapter?.is_deprecated) {
+      setAlertDetails({
+        type: "error",
+        content: "This adapter has been deprecated and cannot be managed.",
+      });
+      return;
+    }
+    coOwner.handleCoOwner(adapter.id);
   };
 
   const handleOpenAddSourceModal = () => {
@@ -195,7 +363,7 @@ function ToolSettings({ type }) {
       setPostHogCustomEvent(posthogEventText[type], {
         info: `Clicked on '+ ${btnText[type]}' button`,
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
@@ -204,38 +372,69 @@ function ToolSettings({ type }) {
     <div className="plt-tool-settings-layout">
       <ToolNavBar
         title={titles[type]}
-        CustomButtons={() => {
-          return (
-            <CustomButton
-              type="primary"
-              onClick={handleOpenAddSourceModal}
-              icon={<PlusOutlined />}
-            >
-              {btnText[type]}
-            </CustomButton>
-          );
-        }}
+        enableSearch
+        searchPlaceholder="Search by name or owner"
+        searchKey={type}
+        onSearch={(value) => handleSearch(value)}
+        customButtons={
+          // The label is `btnText[type]` — "New LLM" on one route and
+          // "New Text Extractor" on another — so it is not a stable handle.
+          <CustomButton
+            type="primary"
+            data-testid={`${type}-adapter-add-btn`}
+            onClick={handleOpenAddSourceModal}
+            icon={<Plus />}
+          >
+            {btnText[type]}
+          </CustomButton>
+        }
       />
       <IslandLayout>
         <div className="plt-tool-settings-layout-2">
           <div className="plt-tool-settings-body">
-            <ViewTools
-              listOfTools={tableRows}
-              isLoading={isLoading}
-              handleDelete={handleDelete}
-              setOpenAddTool={setOpenAddSourcesModal}
-              handleEdit={(_event, item) => setEditItemId(item?.id)}
-              idProp="id"
-              titleProp="adapter_name"
-              descriptionProp="description"
-              iconProp="icon"
-              isEmpty={!tableRows?.length}
-              centered
-              isClickable={false}
-              handleShare={handleShare}
-              showOwner={true}
-              type="Adapter"
-            />
+            {loadError && (
+              <EmptyState
+                text="Couldn't load. Please try again."
+                btnText="Retry"
+                handleClick={handleListRefresh}
+              />
+            )}
+            {!loadError && displayList === undefined && <SpinnerLoader />}
+            {!loadError && displayList?.length === 0 && !searchTerm && (
+              <EmptyState
+                text={`No ${titles[type]?.toLowerCase() || "adapters"} available`}
+                btnText={btnText[type]}
+                handleClick={handleOpenAddSourceModal}
+              />
+            )}
+            {!loadError && displayList?.length === 0 && searchTerm && (
+              <EmptyState text="No results found for this search" />
+            )}
+            {!loadError && displayList?.length > 0 && (
+              <ResourceTable
+                testIdPrefix="adapter-list"
+                dataSource={displayList}
+                loading={isLoading}
+                pagination={pagination}
+                sort={sort}
+                userSorted={userSorted}
+                onPaginationChange={handlePaginationChange}
+                onSortChange={handleSortChange}
+                titleProp="adapter_name"
+                descriptionProp="description"
+                iconProp="icon"
+                idProp="id"
+                dateProp="created_at"
+                handleEdit={handleEdit}
+                handleShare={handleShare}
+                handleCopyId={handleCopyId}
+                handleDelete={handleDelete}
+                handleCoOwner={handleCoOwner}
+                sessionDetails={sessionDetails}
+                isClickable={false}
+                type="Adapter"
+              />
+            )}
           </div>
         </div>
       </IslandLayout>
@@ -254,8 +453,11 @@ function ToolSettings({ type }) {
         permissionEdit={isPermissonEdit}
         loading={isShareLoading}
         allUsers={userList}
+        allGroups={groupList}
         onApply={onShare}
+        isSharableToOrg={true}
       />
+      <CoOwnerModal coOwner={coOwner} resourceType="Adapter" />
     </div>
   );
 }

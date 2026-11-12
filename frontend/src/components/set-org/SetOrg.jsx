@@ -1,26 +1,34 @@
 import Cookies from "js-cookie";
 import { useEffect, useState } from "react";
-import { Button, Card } from "antd";
 import { useLocation, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Card } from "@/components/ui/shims/antd-structure";
 import "./SetOrg.css"; // Import your CSS file for styling
 import axios from "axios";
 import Proptypes from "prop-types";
+
 import {
   OrgAvatar,
   OrgSelection,
   RedGradCircle,
-  YellowGradCircle,
   UnstractBlackLogo,
+  YellowGradCircle,
 } from "../../assets/index";
+import {
+  isOrgSwitchViaLogin,
+  switchOrgViaLogin,
+} from "../../helpers/orgSwitchLogin.js";
 import { useExceptionHandler } from "../../hooks/useExceptionHandler";
-import { useAlertStore } from "../../store/alert-store";
 import { useUserSession } from "../../hooks/useUserSession.js";
+import { useAlertStore } from "../../store/alert-store";
 
 function SetOrg() {
   const { state } = useLocation();
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [loadingOrgId, setLoadingOrgId] = useState(null);
+  // null until the session loads: a pick before then could take the wrong path.
+  const [viaLogin, setViaLogin] = useState(null);
   const { setAlertDetails } = useAlertStore();
   const handleException = useExceptionHandler();
   const userSession = useUserSession();
@@ -29,10 +37,11 @@ function SetOrg() {
       try {
         const userSessionData = await userSession();
         const signedInOrgId = userSessionData?.organization_id;
+        setViaLogin(isOrgSwitchViaLogin(userSessionData));
         if (state === null || signedInOrgId) {
           navigate("/");
         }
-      } catch (error) {
+      } catch (_error) {
         navigate("/");
       } finally {
         setLoading(false);
@@ -44,6 +53,10 @@ function SetOrg() {
   const handleContinue = (id) => {
     setLoading(true);
     setLoadingOrgId(id);
+    if (viaLogin) {
+      switchOrgViaLogin(id);
+      return;
+    }
     const csrfToken = Cookies.get("csrftoken");
     const requestOptions = {
       method: "POST",
@@ -78,7 +91,10 @@ function SetOrg() {
                 organization={org}
                 onConnect={(id) => handleContinue(id)}
                 loading={loading && loadingOrgId === org?.id}
-                disabled={loadingOrgId !== null && loadingOrgId !== org?.id}
+                disabled={
+                  viaLogin === null ||
+                  (loadingOrgId !== null && loadingOrgId !== org?.id)
+                }
               />
             ))}
           </div>

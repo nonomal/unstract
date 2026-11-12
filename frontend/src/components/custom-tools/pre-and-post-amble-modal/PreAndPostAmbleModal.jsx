@@ -1,13 +1,19 @@
-import { Button, Input, Space, Typography } from "antd";
+import { Expand } from "lucide-react";
 import PropTypes from "prop-types";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Input } from "@/components/ui/shims/antd-inputs";
+import { Space } from "@/components/ui/shims/antd-layout";
+import { Modal } from "@/components/ui/shims/antd-overlays";
+import { Typography } from "@/components/ui/shims/antd-typography";
 import "./PreAndPostAmbleModal.css";
 
+import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import { useAlertStore } from "../../../store/alert-store";
 import { useCustomToolStore } from "../../../store/custom-tool-store";
 import { CustomButton } from "../../widgets/custom-button/CustomButton";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import SpaceWrapper from "../../widgets/space-wrapper/SpaceWrapper";
+
 import DefaultPrompts from "./DefaultPrompts.json";
 
 const fieldNames = {
@@ -18,32 +24,49 @@ const fieldNames = {
 function PreAndPostAmbleModal({ type, handleUpdateTool }) {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
-  const { details, updateCustomTool } = useCustomToolStore();
+  const [expandModalVisible, setExpandModalVisible] = useState(false);
+  const [hasChanges, setHasChanges] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSaved, setIsSaved] = useState(false);
+  const textAreaRef = useRef(null);
+  const { details, updateCustomTool, isPublicSource } = useCustomToolStore();
   const { setAlertDetails } = useAlertStore();
   const handleException = useExceptionHandler();
 
   useEffect(() => {
     if (type === fieldNames.preamble) {
-      setTitle("Preamble");
+      setTitle("Preamble Settings");
       setText(details?.preamble || "");
-      return;
-    }
-
-    if (type === fieldNames.postamble) {
-      setTitle("Postamble");
+    } else if (type === fieldNames.postamble) {
+      setTitle("Postamble Settings");
       setText(details?.postamble || "");
     }
-  }, [type]);
+    setHasChanges(false);
+  }, [type, details]);
+
+  // Reset isSaved on tool switch (separate from text initialization)
+  useEffect(() => {
+    setIsSaved(false);
+  }, [details?.tool_id]);
 
   const setDefaultPrompt = () => {
     if (type === fieldNames.preamble) {
       setText(DefaultPrompts.preamble);
-      return;
-    }
-
-    if (type === fieldNames.postamble) {
+    } else if (type === fieldNames.postamble) {
       setText(DefaultPrompts.postamble);
     }
+    setHasChanges(true);
+    setIsSaved(false);
+  };
+
+  const handleTextChange = (e) => {
+    setText(e.target.value);
+    setHasChanges(true);
+    setIsSaved(false);
+  };
+
+  const toggleExpandModal = () => {
+    setExpandModalVisible(!expandModalVisible);
   };
 
   const handleSave = () => {
@@ -55,6 +78,7 @@ function PreAndPostAmbleModal({ type, handleUpdateTool }) {
     if (type === fieldNames.postamble) {
       body["postamble"] = text;
     }
+    setIsLoading(true);
     handleUpdateTool(body)
       .then((res) => {
         const data = res?.data;
@@ -64,13 +88,14 @@ function PreAndPostAmbleModal({ type, handleUpdateTool }) {
         };
         const updatedDetails = { ...details, ...updatedData };
         updateCustomTool({ details: updatedDetails });
-        setAlertDetails({
-          type: "success",
-          content: "Saved successfully",
-        });
+        setHasChanges(false);
+        setIsSaved(true);
       })
       .catch((err) => {
         setAlertDetails(handleException(err, "Failed to update."));
+      })
+      .finally(() => {
+        setIsLoading(false);
       });
   };
 
@@ -83,24 +108,70 @@ function PreAndPostAmbleModal({ type, handleUpdateTool }) {
           </Typography.Text>
         </div>
         <div>
-          <div>
+          <div className="text-area-header">
             <Typography.Text>Add {title}</Typography.Text>
           </div>
         </div>
-        <div>
-          <Input.TextArea
-            rows={4}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-          />
-          <Button size="small" type="link" onClick={setDefaultPrompt}>
+        <div className="text-area-container">
+          <div className="text-area-wrapper">
+            <Input.TextArea
+              ref={textAreaRef}
+              rows={4}
+              value={text}
+              onChange={handleTextChange}
+              disabled={isPublicSource}
+              autoSize={{ minRows: 4 }}
+            />
+            <Button
+              icon={<Expand />}
+              className="expand-button"
+              onClick={toggleExpandModal}
+              type="text"
+              disabled={isPublicSource}
+              title="Expand view"
+            />
+          </div>
+          <Button
+            size="small"
+            type="link"
+            onClick={setDefaultPrompt}
+            disabled={isPublicSource}
+          >
             Reset with default prompt
           </Button>
+
+          <Modal
+            title={title}
+            open={expandModalVisible}
+            onCancel={toggleExpandModal}
+            footer={null}
+            width="60%"
+            className="expanded-modal-body"
+            centered={true}
+          >
+            <Input.TextArea
+              value={text}
+              onChange={handleTextChange}
+              disabled={isPublicSource}
+              autoSize={{ minRows: 15 }}
+              className="expanded-textarea"
+            />
+            <div className="modal-footer">
+              <Button type="primary" onClick={toggleExpandModal}>
+                Close
+              </Button>
+            </div>
+          </Modal>
         </div>
         <div className="display-flex-right">
           <Space>
-            <CustomButton type="primary" onClick={handleSave}>
-              Save
+            <CustomButton
+              type="primary"
+              onClick={handleSave}
+              loading={isLoading}
+              disabled={isPublicSource || !hasChanges}
+            >
+              {isSaved ? "Saved" : "Save"}
             </CustomButton>
           </Space>
         </div>

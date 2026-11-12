@@ -1,0 +1,1247 @@
+# Dashboard Metrics Module
+
+This module provides a metrics dashboard for monitoring document processing, API usage, and LLM costs. It aggregates data from various source tables into pre-computed hourly, daily, and monthly tables for fast querying.
+
+---
+
+## Quick Reference (TL;DR)
+
+### What It Does
+- Tracks **12 metrics**: documents processed, pages processed, LLM calls, challenges, summarization calls, API requests, ETL executions, LLM costs, prompt executions, failed pages, HITL reviews, and HITL completions
+- Aggregates data from 4 source tables into 3 pre-computed tables (hourly/daily/monthly)
+- Provides REST API endpoints with Redis caching for fast dashboard rendering
+
+### Data Flow
+```
+Source Tables (usage_v2, page_usage, workflow_execution, workflow_file_execution)
+       ↓ [PG scheduler fires; hourly tier every 15 min, daily+monthly hourly at :20]
+       ↓ [worker-pg-metrics drains dashboard_metric_events → POSTs the internal API]
+Aggregated Tables (EventMetricsHourly → Daily → Monthly)
+       ↓
+API Endpoints (/overview/, /summary/, /series/)
+       ↓ [Redis cache]
+Frontend Dashboard (MetricsSummary, MetricsChart, MetricsTable)
+```
+
+### Key Files
+| File | Purpose |
+|------|---------|
+| `services.py` | Queries source tables (9 methods, one per metric) |
+| `tasks.py` | The aggregation and cleanup task bodies (run by both transports) |
+| `internal_views.py` | Internal API the PG consumer POSTs to, which calls `tasks.py` |
+| `views.py` | REST API endpoints |
+| `cache.py` | Redis caching layer (bucket-based MGET) |
+| `models.py` | Aggregated tables (Hourly/Daily/Monthly) |
+
+### Quick Commands
+```bash
+# Backfill historical data
+# The deploy step is a different invocation with its own ordering — see
+# "Why 62 days" below; do not run it from the outgoing image, where
+# --skip-hourly still issues the HOUR queries it skips here.
+python manage.py backfill_metrics --days=30
+
+# PG transport (the default; see "Transport" below) — BOTH are required.
+# The consumer drains the queue; the reaper is what actually fires the schedule.
+(cd workers/ && ./run-worker.sh pg-metrics)
+(cd workers/ && ./run-worker.sh reaper)
+
+# Legacy Celery transport — rollback only, needs PG_SCHEDULER_ENABLED=false
+celery -A backend worker -Q dashboard_metric_events -l info
+celery -A backend beat -l info
+```
+
+### Scheduled Tasks & Schedule
+| Task | Schedule | What It Does |
+|------|----------|--------------|
+| `aggregate_from_sources` | Every 15 min | Aggregates source → **hourly tier only** (`tier=hourly`) |
+| `aggregate_from_sources` (daily+monthly) | Hourly at :20 | Aggregates source → daily; rolls monthly up from daily (`tier=daily_monthly`) |
+| `aggregate_from_sources` (reconcile) | Daily 4:40 AM | Daily + monthly tiers over a 7-day source window, to repair gaps after downtime |
+| `cleanup_hourly_data` | Daily 2 AM | Deletes hourly data > 30 days |
+| `cleanup_daily_data` | Weekly Sun 3 AM | Deletes daily data > 365 days |
+
+### API Endpoints
+| Endpoint | Source | Use Case |
+|----------|--------|----------|
+| `/overview/` | Hourly table | Dashboard home (last 7 days) |
+| `/summary/` | Auto-selected | Detailed stats with date range |
+| `/series/` | Auto-selected | Time series charts |
+| `/live-summary/` | Source tables | Real-time (no aggregation delay) |
+
+### Caching TTLs
+- **Current hour**: 30 seconds (data still changing)
+- **Historical**: 8 hours (stable data)
+- **Overview API**: 5 minutes
+- **Summary/Series API**: 15-30 minutes
+
+---
+
+## Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+- [Metrics Definitions](#metrics-definitions)
+- [Source Tables](#source-tables)
+- [Aggregated Tables](#aggregated-tables)
+- [Scheduled Tasks](#scheduled-tasks)
+- [Transport: how the cron actually fires](#transport-how-the-cron-actually-fires)
+- [API Endpoints](#api-endpoints)
+- [Caching Strategy](#caching-strategy)
+- [UI Data Flow](#ui-data-flow--what-shows-where)
+- [Setup & Configuration](#setup--configuration)
+- [Management Commands](#management-commands)
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              SOURCE TABLES                                   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │   usage_v2   │  │ page_usage   │  │  workflow_   │  │  workflow_   │    │
+│  │              │  │              │  │  execution   │  │  file_exec   │    │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
+└─────────┼─────────────────┼─────────────────┼─────────────────┼────────────┘
+          │                 │                 │                 │
+          └─────────────────┴────────┬────────┴─────────────────┘
+                                     │
+                    ┌────────────────▼────────────────┐
+                    │     MetricsQueryService         │
+                    │   (services.py)                 │
+                    │                                 │
+                    │  Queries source tables and      │
+                    │  aggregates by time period      │
+                    └────────────────┬────────────────┘
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          │                          │                          │
+          ▼                          ▼                          ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│ EventMetrics    │      │ EventMetrics    │      │ EventMetrics    │
+│ Hourly          │      │ Daily           │      │ Monthly         │
+│                 │      │                 │      │                 │
+│ • 24h query     │      │ • 2 day query   │      │ • from daily    │
+│ • 30 day retain │      │ • 365 day retain│      │ • No cleanup    │
+└────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+         │                        │                        │
+         └────────────────────────┼────────────────────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │      API Endpoints        │
+                    │      (views.py)           │
+                    │                           │
+                    │  /overview/               │
+                    │  /summary/                │
+                    │  /series/                 │
+                    │  /live-summary/           │
+                    │  /live-series/            │
+                    └─────────────┬─────────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │   Redis Cache (Bucket)    │
+                    │                           │
+                    │  Per-hour bucket caching  │
+                    │  MGET for batch retrieval │
+                    └─────────────┬─────────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │     Frontend Dashboard    │
+                    │                           │
+                    │  MetricsSummary           │
+                    │  MetricsChart             │
+                    │  MetricsBreakdown         │
+                    │  MetricsTable             │
+                    └───────────────────────────┘
+```
+
+### Why Pre-Aggregated Tables Are Safe
+
+The dashboard reads from **pre-aggregated tables** (`event_metrics_hourly`, `event_metrics_daily`, `event_metrics_monthly`) rather than querying source tables directly. This design is intentionally safe for both reads and writes:
+
+**Write Safety:**
+- Aggregation tables are **write-isolated** — only the Celery aggregation task (`aggregate_from_sources`) and the `backfill_metrics` management command write to them. No user-facing request path writes to these tables.
+- Writes use `bulk_create(update_conflicts=True)` against each tier's own unique constraint — `timestamp` for hourly, `date` for daily, `month` for monthly — making upserts idempotent. Running the aggregation task twice for the same period simply overwrites with the same values.
+- Aggregation tasks use `_base_manager` to bypass Django's `DefaultOrganizationManagerMixin`, which relies on `UserContext` (unavailable in Celery). Most call sites are per-organization; the monthly rollup deliberately is not, and groups by `organization_id` instead — see `_rollup_monthly_from_daily`.
+
+**Read Safety:**
+- Dashboard API endpoints read **only** from pre-aggregated tables, never from source tables (except `/live-summary/` and `/live-series/` which are for real-time fallback).
+- B-tree indexes on `(organization, metric_name, timestamp/date/month)` ensure efficient lookups. Even with millions of rows, queries are index-only scans.
+- No expensive joins — each aggregated row is self-contained with `metric_name`, `metric_value`, and `metric_count`.
+
+**No Impact on Source Tables:**
+- The aggregation task only runs `SELECT` queries against source tables (`usage_v2`, `page_usage`, `workflow_execution`, `workflow_file_execution`). It never modifies them.
+- Source table performance is unaffected by the dashboard feature. If the aggregation task is slow or fails, source tables continue working normally.
+
+**Failure Resilience:**
+- If the aggregation task fails, the dashboard shows stale data rather than crashing — up to 15 minutes old for hourly figures, up to an hour for daily and monthly.
+- A daily 04:40 UTC reconciliation pass reruns the same task over a 7-day source window, so a **daily- or monthly-tier** gap shorter than that repairs itself without a manual backfill. The hourly tier re-queries the last 24h on every run regardless of tier or window, so an hourly gap shorter than 24h repairs itself on the next tick; only one older than 24h needs `backfill_metrics`.
+- The 7-day window is also the ceiling on lag, not just on downtime. `documents_processed` and `failed_pages` filter on a terminal status but window and bucket on `created_at`, so a row whose status turns terminal more than 7 days after it was created is counted in no daily row — and therefore in no monthly total either, since monthly is the sum of daily. Before the monthly tier was derived from daily this was caught by the wider monthly source window.
+- Retry behaviour depends on the transport: on Celery the tasks carry `max_retries=3` with exponential backoff; on the PG transport (the default) retries are governed by the consumer's `MAX_ATTEMPTS`, which compose sets to `1` — a failed run is dropped and the next scheduled tick supersedes it. See [Transport](#transport-how-the-cron-actually-fires).
+- Cleanup tasks (hourly: 30-day retention, daily: 365-day retention) prevent unbounded table growth.
+
+---
+
+## Metrics Definitions
+
+### All 12 Metrics
+
+| Metric Name | Type | Description | Unit |
+|-------------|------|-------------|------|
+| `documents_processed` | Counter | Number of documents successfully processed | count |
+| `pages_processed` | Histogram | Total pages extracted from documents | count |
+| `llm_calls` | Counter | Number of LLM API calls made | count |
+| `challenges` | Counter | LLM calls for challenge/verification | count |
+| `summarization_calls` | Counter | LLM calls for summarization | count |
+| `deployed_api_requests` | Counter | Requests to deployed API endpoints | count |
+| `etl_pipeline_executions` | Counter | ETL pipeline workflow executions | count |
+| `llm_usage` | Histogram | LLM usage cost | USD ($) |
+| `prompt_executions` | Counter | Total workflow/prompt executions | count |
+| `failed_pages` | Histogram | Pages that failed during processing | count |
+| `hitl_reviews` | Counter | HITL (Human-in-the-Loop) reviews initiated | count |
+| `hitl_completions` | Counter | HITL reviews completed | count |
+
+### Metric Types: Counter vs Histogram
+
+The `metric_type` field distinguishes how metrics are aggregated:
+
+| Type | Aggregation | Use Case | Example |
+|------|-------------|----------|---------|
+| **Counter** | `COUNT(id)` | Counting discrete events | "How many LLM calls happened?" |
+| **Histogram** | `SUM(value)` | Summing continuous values | "How many pages were processed?" |
+
+**Counter Metrics** (9 metrics):
+- `documents_processed`, `llm_calls`, `challenges`, `summarization_calls`
+- `deployed_api_requests`, `etl_pipeline_executions`, `prompt_executions`
+- `hitl_reviews`, `hitl_completions`
+
+**Histogram Metrics** (3 metrics):
+- `pages_processed` - Sums `pages_processed` field from PageUsage
+- `llm_usage` - Sums `cost_in_dollars` field from Usage
+- `failed_pages` - Sums failed pages from PageUsage
+
+The `metric_count` field tracks how many source records were aggregated, useful for calculating averages (`total_value / metric_count`).
+
+### Cost Calculation (`llm_usage` metric)
+
+The `cost_in_dollars` value in the Usage table is calculated by the **platform-service** when recording LLM usage:
+
+```
+cost = (input_cost_per_token × input_tokens) + (output_cost_per_token × output_tokens)
+```
+
+**Pricing Source**: LiteLLM's model pricing database
+- URL: `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`
+- Cached locally with configurable TTL (default: 7 days)
+- Contains `input_cost_per_token` and `output_cost_per_token` per model/provider
+
+**Calculation Flow** (in `platform-service/helper/cost_calculation.py`):
+1. Lookup model by name + provider in pricing database
+2. Get `input_cost_per_token` and `output_cost_per_token`
+3. Calculate: `cost = (input_cost × prompt_tokens) + (output_cost × completion_tokens)`
+4. Store in `usage_v2.cost_in_dollars` field
+
+**Example**: GPT-4 with 1000 input tokens and 500 output tokens:
+- Input: $0.00003/token × 1000 = $0.03
+- Output: $0.00006/token × 500 = $0.03
+- Total: $0.06
+
+---
+
+## Source Tables
+
+### Metric to Source Table Mapping
+
+| Metric | Source Table | Model | Filter Conditions | Aggregation |
+|--------|-------------|-------|-------------------|-------------|
+| `documents_processed` | `workflow_file_execution` | `WorkflowFileExecution` | `status="COMPLETED"` | `COUNT(id)` |
+| `pages_processed` | `page_usage` | `PageUsage` | None | `SUM(pages_processed)` |
+| `llm_calls` | `usage_v2` | `Usage` | `usage_type="llm"` | `COUNT(id)` |
+| `challenges` | `usage_v2` | `Usage` | `usage_type="llm"`, `llm_usage_reason="challenge"` | `COUNT(id)` |
+| `summarization_calls` | `usage_v2` | `Usage` | `usage_type="llm"`, `llm_usage_reason="summarize"` | `COUNT(id)` |
+| `deployed_api_requests` | `workflow_execution` | `WorkflowExecution` | `pipeline_id IN APIDeployment.ids` | `COUNT(id)` |
+| `etl_pipeline_executions` | `workflow_execution` | `WorkflowExecution` | `pipeline_id IN Pipeline(type=ETL).ids` | `COUNT(id)` |
+| `llm_usage` | `usage_v2` | `Usage` | `usage_type="llm"` | `SUM(cost_in_dollars)` |
+| `prompt_executions` | `workflow_execution` | `WorkflowExecution` | Via `workflow.organization_id` | `COUNT(id)` |
+
+### Source Table Details
+
+#### 1. `usage_v2` (Usage Model)
+- **Location**: `usage_v2/models.py`
+- **Key Fields**:
+  - `organization_id`: UUID - Organization reference
+  - `usage_type`: String - Type of usage ("llm", "embedding", etc.)
+  - `llm_usage_reason`: String - Reason for LLM call ("extraction", "challenge", "summarize")
+  - `cost_in_dollars`: Decimal - Cost of the LLM call
+  - `created_at`: DateTime - Timestamp
+- **Metrics Derived**: `llm_calls`, `challenges`, `summarization_calls`, `llm_usage`
+
+#### 2. `page_usage` (PageUsage Model)
+- **Location**: `account_usage/models.py`
+- **Key Fields**:
+  - `organization_id`: String - Organization ID (note: CharField, not FK)
+  - `pages_processed`: Integer - Number of pages processed
+  - `file_name`: String - Source file name
+  - `created_at`: DateTime - Timestamp
+- **Metrics Derived**: `pages_processed`
+
+#### 3. `workflow_execution` (WorkflowExecution Model)
+- **Location**: `workflow_manager/workflow_v2/models/execution.py`
+- **Key Fields**:
+  - `workflow_id`: FK - Reference to Workflow
+  - `pipeline_id`: FK - Reference to Pipeline/APIDeployment
+  - `status`: String - Execution status
+  - `created_at`: DateTime - Timestamp
+- **Metrics Derived**: `deployed_api_requests`, `etl_pipeline_executions`, `prompt_executions`
+
+#### 4. `workflow_file_execution` (WorkflowFileExecution Model)
+- **Location**: `workflow_manager/file_execution/models.py`
+- **Key Fields**:
+  - `workflow_execution_id`: FK - Reference to WorkflowExecution
+  - `file_name`: String - Processed file name
+  - `status`: String - "COMPLETED", "ERROR", etc.
+  - `created_at`: DateTime - Timestamp
+- **Metrics Derived**: `documents_processed`
+
+---
+
+## Aggregated Tables
+
+### Three-Tier Aggregation
+
+| Table | Model | Time Column | Granularity | Query Window | Retention |
+|-------|-------|-------------|-------------|--------------|-----------|
+| `event_metrics_hourly` | `EventMetricsHourly` | `timestamp` | Hour | Last 24 hours | 30 days |
+| `event_metrics_daily` | `EventMetricsDaily` | `date` | Day | Last 2 days (7 on the daily reconciliation pass) | 365 days |
+| `event_metrics_monthly` | `EventMetricsMonthly` | `month` | Month | Rolled up from the daily tier, current + previous month | Forever |
+
+### Table Schema
+
+All three tables share a similar schema:
+
+```python
+class EventMetricsHourly(Model):
+    id = UUIDField(primary_key=True)
+    organization = ForeignKey(Organization)
+    timestamp = DateTimeField()           # Hour bucket (truncated)
+    metric_name = CharField(max_length=64)  # e.g., "documents_processed"
+    metric_type = CharField(choices=["counter", "histogram"])
+    metric_value = FloatField()           # Aggregated value
+    metric_count = IntegerField()         # Number of events aggregated
+    project = CharField(default="default")
+    tag = CharField(blank=True)
+    created_at = DateTimeField(auto_now_add=True)
+    modified_at = DateTimeField(auto_now=True)
+```
+
+### Unique Constraints
+
+Each table has a unique constraint on:
+```
+(organization, timestamp/date/month, metric_name, project, tag)
+```
+
+This enables upsert operations during aggregation.
+
+---
+
+## Scheduled Tasks
+
+The task bodies live in `tasks.py` and carry `@shared_task`, but **which process fires
+and runs them depends on the transport** — see
+[Transport](#transport-how-the-cron-actually-fires) below. The task name, the queue and
+the schedule are the same on both.
+
+### Task Configuration
+
+Located in `tasks.py`:
+
+| Python Function | Registered Task Name | Schedule | Queue | Purpose |
+|-----------|-------------|----------|-------|---------|
+| `aggregate_metrics_from_sources` | `dashboard_metrics.aggregate_from_sources` | Every 15 min | `dashboard_metric_events` | Aggregate the hourly tier (`tier=hourly`) |
+| `aggregate_metrics_from_sources` | `dashboard_metrics.aggregate_from_sources` | Hourly at :20 UTC | `dashboard_metric_events` | Aggregate the daily and monthly tiers (`tier=daily_monthly`) |
+| `aggregate_metrics_from_sources` | `dashboard_metrics.aggregate_from_sources` | Daily 4:40 AM UTC | `dashboard_metric_events` | Reconciliation pass, daily + monthly tiers, `source_window_days=7` |
+| `cleanup_hourly_metrics` | `dashboard_metrics.cleanup_hourly_data` | Daily 2:00 AM UTC | `dashboard_metric_events` | Delete hourly data >30 days |
+| `cleanup_daily_metrics` | `dashboard_metrics.cleanup_daily_data` | Weekly Sun 3:00 AM UTC | `dashboard_metric_events` | Delete daily data >365 days |
+
+### Queue Configuration
+
+The queue name `dashboard_metric_events` is shared by both transports: on the PG
+transport it is a `pg_queue_message` queue, on the Celery transport a RabbitMQ one.
+The routing below is the **Celery** half, in `backend/celery_config.py`:
+
+```python
+task_queues = [
+    Queue("dashboard_metric_events", routing_key="dashboard_metric_events"),
+    # ... other queues
+]
+
+task_routes = {
+    "dashboard_metrics.aggregate_from_sources": {"queue": "dashboard_metric_events"},
+    "dashboard_metrics.cleanup_hourly_data": {"queue": "dashboard_metric_events"},
+    "dashboard_metrics.cleanup_daily_data": {"queue": "dashboard_metric_events"},
+}
+```
+
+### Aggregation Task Details
+
+The `aggregate_metrics_from_sources` task:
+
+1. **Iterates over all organizations**
+2. **For each metric**:
+   - Queries source table with `MetricsQueryService`
+   - Groups by time period (hour/day/month)
+3. **Upserts results** into the hourly and daily tables
+4. **Rolls monthly up from the daily tier** for all orgs at once, streamed and batched. Upsert-only:
+   a monthly row the daily tier no longer produces is left in place. A total that is
+   too low is recoverable with `backfill_metrics`; a deleted one is not, because the daily
+   rows that would rebuild it are exactly what is missing. `backfill_metrics` never lowers
+   a stored value, so a total that is too high needs a manual correction
+5. **Uses `_base_manager`** to bypass Django's organization filter in Celery context
+
+```python
+# Query windows
+hourly_start = end_date - timedelta(hours=24)                 # Last 24 hours
+daily_start = truncate_to_day(end_date - source_window_days)  # 2 days, 7 on reconcile
+monthly_start = first_of_previous_month                       # summed from daily
+```
+
+The monthly tier has no source queries of its own. `backfill_metrics` sums monthly
+from the daily rows it has just written (from source only under `--skip-daily`), so within the rollup window (current + previous month) its output
+is overwritten by the sum of the daily tier on the next daily/monthly pass — see that
+command's help text. **Backfill daily before relying on monthly:** where a month's
+stored total is already higher than what daily now sums to, the rollup keeps the
+stored figure and reports it under `needs_daily_repair`. That guard needs a stored
+total to compare against, so a month with no monthly row yet — the first run of any
+calendar month — is still written short. Missing whole days are reported separately,
+under `incomplete_daily_coverage`.
+
+Run this as soon as `migrate` finishes. It cannot be sequenced *before* the first
+aggregation: the schedule row `0006` adds goes live at the end of `migrate`, so the
+:20 run can fire while the backfill is still going. That first rollup may write a
+short month — it has no stored total to compare against, so the guard is blind to it
+— and the backfill repairs it. Expect one under-counted reading, not a race to lose:
+
+```
+python manage.py backfill_metrics --days 62 --skip-hourly --skip-monthly
+```
+
+### Rolling this release back
+
+`0005` and `0006` write task kwargs into both scheduler tables. The previous release's
+zero-argument signatures reject them with `TypeError`, which nothing retries. **Reverting
+the image alone is not enough** — run `migrate dashboard_metrics 0004` from the outgoing
+image *before* the image reverts, which reverses both migrations together. A
+platform-driven rollback (an ArgoCD revision revert, an image tag pin) skips that by
+construction, so treat this release as blocking automated rollback.
+
+**If the rollback already happened without that step**, the migration is gone with the
+image and `migrate dashboard_metrics 0004` has nothing to apply. The rows still carry
+kwargs the restored signatures reject, so all three tiers stop on both transports with
+no self-heal. Recovery is by hand, against both scheduler tables:
+
+```sql
+-- Application tables are not in the default search path: the schema comes from
+-- DB_SCHEMA and is set per connection by the app's own wrapper, which a psql
+-- session does not inherit.
+SET search_path TO unstract;  -- or whatever DB_SCHEMA is set to
+
+DELETE FROM django_celery_beat_periodictask
+ WHERE name IN ('dashboard_metrics_reconcile_source_window',
+                'dashboard_metrics_aggregate_daily_monthly');
+UPDATE django_celery_beat_periodictask SET kwargs = '{}'
+ WHERE name = 'dashboard_metrics_aggregate_from_sources';
+UPDATE django_celery_beat_periodictasks SET last_update = now() WHERE ident = 1;
+```
+
+and the same three against `pg_periodic_task` (`task_kwargs = '{}'::jsonb`).
+
+**This recovery is a one-way door until you undo it.** The SQL changes rows, not
+`django_migrations`, which still records `0005` and `0006` as applied — so a later
+roll-forward of this release reports "No migrations to apply" and restores nothing.
+The install keeps running the single `*/15` row with `kwargs = '{}'`, which defaults
+`tier` to ALL: every tier written 96 times a day, the load this release removes, and
+no reconciliation pass at all. Nothing errors; the only trace is `tier=all` in the
+completion log.
+
+To clear it, deploy the new image first, then from **that** image run
+`manage.py migrate dashboard_metrics 0004 --fake` followed by
+`manage.py migrate dashboard_metrics`. Both steps are needed: the entrypoint's own
+`migrate` runs before you get there and reports nothing to apply. Run the `--fake`
+from the OUTGOING image and it does nothing at all — `0005` and `0006` are not on
+disk there, so `0004` has no child to unapply and the command prints "No migrations
+to apply" while un-recording nothing.
+
+The forward direction is bounded rather than self-healing: a pod still on the old image
+during a rolling deploy has the old signature and raises `TypeError` per tick until the
+rollout completes. The `**_ignored` in this release does not help those pods — it is
+what lets a *later* release add a kwarg without breaking pods running this one.
+
+### Why 62 days
+
+62, not 60: the rollup window reaches back to the first of the previous month, which is
+61 days before a run on the 31st. `--skip-monthly` is deliberate — repair daily and let
+the rollup derive monthly from it.
+
+---
+
+## Transport: how the cron actually fires
+
+There are two transports. **The PG queue is the default and the one a current deploy
+uses**; Celery Beat is the rollback target. Both run the same function in the backend
+process — the difference is what schedules it and what carries it.
+
+### Schedule rows are dual-written
+
+Every `dashboard_metrics.*` schedule exists as a **pair** of rows: a
+`django_celery_beat.PeriodicTask` and a `pg_queue.PgPeriodicTask`. A row's `pg_owned`
+flag says which scheduler fires it.
+
+How the pair is kept in step differs by row, which matters when you edit one:
+
+| Rows | Declared in | Drift risk |
+|------|-------------|------------|
+| The two aggregation rows, and the reconciliation row | One spec in a single migration — `0005_add_reconciliation_task.py`, `0006_split_aggregation_schedule.py` (`split_schedules`) | None by construction |
+| The three original rows (`aggregate_from_sources`, both cleanups) | **Two separate migrations** — `0002_setup_periodic_tasks.py` (Beat) and its PG twin `0004_pg_periodic_tasks.py` | Real — edit one and forget the other and they diverge |
+
+The second row is guarded only by a test, `tests/test_pg_periodic_task_declarations.py`,
+which exists for exactly that failure mode. If you change one of those three schedules,
+change both migrations.
+
+### PG transport (default)
+
+```text
+pg_periodic_task row (pg_owned=true, cron_string)
+       ↓  leader-elected orchestrator tick evaluates the cron — this is worker-pg-reaper
+          workers/queue_backend/pg_queue/reaper.py -> pg_scheduler.dispatch_due_periodic_tasks
+       ↓  enqueue + advance next_run_at IN ONE TRANSACTION (a crash cannot double-fire)
+pg_queue_message on `dashboard_metric_events`
+       ↓  worker-pg-metrics (a generic pg-queue-consumer pinned to that queue)
+workers/scheduler/dashboard_metrics_tasks.py  ← an HTTP proxy, NOT the real work
+       ↓  POST v1/dashboard-metrics/aggregate/  (internal API auth, no X-Organization-ID)
+          relative to INTERNAL_API_BASE_URL, which ends /internal — the full path
+          is /internal/v1/dashboard-metrics/aggregate/
+backend/dashboard_metrics/internal_views.py
+       ↓  calls tasks.py verbatim
+aggregate_metrics_from_sources(...)
+```
+
+The workers image has **no Django**, so the ORM-heavy aggregation cannot run there —
+hence the proxy hop. The windows, the Redis lock and the upsert logic are reused
+unchanged, not reimplemented.
+
+`worker-pg-metrics` is a dedicated service rather than another queue on
+`worker-pg-scheduler` because the consumer's health heartbeat freezes while a task runs,
+so `HEALTH_STALE` doubles as an upper bound on one task's wall clock. The aggregation
+runs for minutes and would trip the scheduler's liveness bound (~4 min) where the
+metrics consumer's is far higher (~15 min). Both are `${VAR:-default}` overrides — read
+the current numbers from `docker/docker-compose.yaml` (`worker-pg-metrics`), and note
+the values that apply in k8s come from the chart in a separate repo.
+
+### Celery transport (legacy / rollback)
+
+Beat reads the `PeriodicTask` row and publishes over RabbitMQ to
+`celery -A backend worker -Q dashboard_metric_events`, which runs the task body
+in-process. No proxy hop.
+
+### Which one is live
+
+`converge_pg_scheduler` decides, and `backend/entrypoint.sh` runs it on every backend
+start **that runs migrations** — the whole block is gated on `--migrate`, which the
+default compose stack passes. Ownership is then a values change rather than a remembered
+procedure. **Where migrations run as a separate job or init-container rather than in the
+backend's own start, this does not fire and ownership will not follow the env var.**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PG_SCHEDULER_ENABLED` | **`true`** | PG scheduler owns the pipeline schedules; matching Beat rows are disabled |
+| `PG_SCHEDULER_ADOPT_PERIODICS` | unset (`false`) | Must be `true` to also move the periodics, which is what carries the `dashboard_metrics.*` rows — it passes `--periodics`, and that flag covers **every** mirrored non-pipeline periodic, not only these |
+
+Both gates are required for the metrics cron. The periodics are separate because
+adopting them needs `worker-pg-metrics` deployed first. The default compose stack sets
+`PG_SCHEDULER_ADOPT_PERIODICS=true` and defines **no** `celery-beat` or `worker-metrics`
+service at all.
+
+> **Rolling back is not just the env var — and do not unset both gates.**
+>
+> `PG_SCHEDULER_ADOPT_PERIODICS` must stay **`true`** while `PG_SCHEDULER_ENABLED` goes
+> to `false`. It gates `--periodics`, which the release direction needs just as much as
+> the adopt direction: without it `converge_pg_scheduler` never touches the
+> `dashboard_metrics.*` rows at all. Turn both off together — the intuitive "roll it all
+> back" — and those rows keep `pg_owned=True` with their Beat twins still disabled,
+> which is the no-firer state below, reached by following the runbook.
+>
+> Converging to Beat also restores *ownership*, not *capacity*. Beat publishes to
+> RabbitMQ, so a released schedule fires again only if `workerMetrics` is actually
+> running. Flip it back on in the **same** change, or you have moved the outage rather
+> than fixed it.
+
+### Failure modes worth knowing
+
+- On the PG transport a periodic is **fire-and-forget** — nothing records a task status,
+  so log severity is the only signal that reaches an alert. The proxy therefore splits
+  the two cases: a non-200 or a transport failure **raises** (marking the message
+  failed), while a 200 that reports per-org `errors` is logged at ERROR rather than
+  raised, since the run did happen. See `dashboard_metrics_tasks.py`.
+- **Retries are effectively off, but that is a deployment setting, not a property of the
+  transport.** Compose sets `WORKER_PG_QUEUE_CONSUMER_MAX_ATTEMPTS=1`, so a failed
+  message is dropped and the next cron tick supersedes it; the consumer's own default is
+  5. Check the value your environment sets before assuming either. Independently, the
+  proxy's `httpx` client retries connection *establishment* three times — it never
+  re-sends a request the server already received.
+- The backend's `autoretry_for=(DatabaseError, OperationalError)` **does not retry on
+  the PG path.** The decorator is still in the call path — `internal_views.py` invokes
+  the decorated task object — but Celery's `retry()` re-raises instead of retrying when
+  a task is called directly rather than dispatched by a worker. Worth knowing before
+  reasoning about `throws=` or `on_failure` here.
+- A schedule adopted with no **`worker-pg-reaper`** running, or released with
+  `workerMetrics` scaled to zero, has **no firer**: no error, no queue depth, no failed
+  pod. Check `pg_owned` against what is actually deployed. Note the service to check is
+  `worker-pg-reaper`, **not** `worker-pg-scheduler` — despite the name, the latter is
+  the pipeline-task consumer and fires no periodics.
+
+---
+
+## API Endpoints
+
+### Endpoint Overview
+
+Base URL: `/api/v1/unstract/<org_id>/metrics/`
+
+| Endpoint | Method | Description | Data Source |
+|----------|--------|-------------|-------------|
+| `/overview/` | GET | Last 7 days summary + daily trend | `EventMetricsHourly` |
+| `/summary/` | GET | Summary stats for date range | Auto-selected table |
+| `/series/` | GET | Time series for date range | Auto-selected table |
+| `/live-summary/` | GET | Summary from source tables | Source tables directly |
+| `/live-series/` | GET | Time series from source tables | Source tables directly |
+| `/recent-activity/` | GET | Latest file executions; paged with counts on request | Source tables directly |
+| `/attention/` | GET | Open items that need attention | Source tables directly |
+| `/attribution/` | GET | Failed pages by source and by day | Source tables directly |
+| `/health/` | GET | Health check | DB + Cache |
+
+### Auto Source Selection
+
+The `/summary/` and `/series/` endpoints automatically select the data source:
+
+| Date Range | Source Table |
+|------------|--------------|
+| ≤ 7 days | `event_metrics_hourly` |
+| ≤ 90 days | `event_metrics_daily` |
+| > 90 days | `event_metrics_monthly` |
+
+Override with `?source=hourly|daily|monthly`
+
+### Query Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `start_date` | ISO 8601 | 30 days ago | Start of date range |
+| `end_date` | ISO 8601 | Now | End of date range |
+| `granularity` | String | `day` | Time grouping: `hour`, `day`, `week` |
+| `metric_name` | String | None | Filter by specific metric |
+| `project` | String | None | Filter by project |
+| `source` | String | `auto` | Data source: `auto`, `hourly`, `daily`, `monthly` |
+
+### Response Format
+
+#### `/overview/` Response
+```json
+{
+  "period": {
+    "start_date": "2024-01-01T00:00:00Z",
+    "end_date": "2024-01-07T23:59:59Z",
+    "days": 7
+  },
+  "totals": [
+    {"metric_name": "documents_processed", "total_value": 1500, "total_count": 150},
+    {"metric_name": "pages_processed", "total_value": 45000, "total_count": 150}
+  ],
+  "daily_trend": [
+    {
+      "date": "2024-01-01T00:00:00Z",
+      "metrics": {
+        "documents_processed": 200,
+        "pages_processed": 6000
+      }
+    }
+  ]
+}
+```
+
+#### `/summary/` Response
+```json
+{
+  "start_date": "2024-01-01T00:00:00Z",
+  "end_date": "2024-01-31T23:59:59Z",
+  "source": "daily",
+  "summary": [
+    {
+      "metric_name": "documents_processed",
+      "metric_type": "counter",
+      "total_value": 5000,
+      "total_count": 500,
+      "average_value": 10,
+      "min_value": 1,
+      "max_value": 50
+    }
+  ]
+}
+```
+
+### Recent activity (DG-02, DG-03)
+
+`/recent-activity/` has two forms. The contract is this section plus the
+`@extend_schema` annotation on `DashboardMetricsViewSet.recent_activity`
+(operation `metrics_recent_activity`).
+
+**Default form.** With none of the parameters below, the response is exactly
+what it has always been: the latest `limit` file executions (default 10, at
+most 50), newest first, and nothing else. The v0 dashboard uses this form.
+
+```json
+{
+  "activity": [
+    {"id": "…", "execution_id": "…", "type": "workflow", "file_name": "inv-01.pdf",
+     "status": "COMPLETED", "workflow_name": "Invoices",
+     "created_at": "2026-10-21T09:12:03+00:00", "execution_time": 4.2,
+     "total_tokens": 1830, "cost": 0.0123}
+  ]
+}
+```
+
+**Paged form.** Passing any of these with a value switches to it; `limit` is then ignored.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `start_date` | 30 days ago | ISO 8601, inclusive. At most 365 days before `end_date` |
+| `end_date` | Now | ISO 8601, inclusive |
+| `status` | All | File execution statuses, comma-separated: `PENDING`, `EXECUTING`, `COMPLETED`, `STOPPED`, `ERROR` (case-insensitive) |
+| `surface` | All | Comma-separated: `api`, `etl`, `task`, `workflow` |
+| `page` | 1 | 1-based, at most 10,000. A page past the end returns no rows |
+| `page_size` | 20 | At most 100 |
+
+`status` and `surface` take one comma-separated value, not a repeated
+parameter, because the response cache keys on the last value of each
+parameter. An unknown value, a bad date or an out-of-range page size is a 400.
+
+```json
+{
+  "start_date": "2026-09-22T00:00:00+00:00",
+  "end_date": "2026-10-22T00:00:00+00:00",
+  "page": 1,
+  "page_size": 20,
+  "activity": [
+    {"id": "…", "execution_id": "…", "type": "workflow", "surface": "task",
+     "file_name": "inv-01.pdf", "status": "ERROR", "workflow_name": "Invoices",
+     "created_at": "2026-10-21T09:12:03+00:00", "execution_time": 4.2,
+     "total_tokens": 1830, "cost": 0.0123}
+  ],
+  "count": 1007,
+  "status_counts": {"PENDING": 0, "EXECUTING": 2, "COMPLETED": 951,
+                    "STOPPED": 0, "ERROR": 54}
+}
+```
+
+- Rows are newest first, ties broken by id. Send the `start_date` and
+  `end_date` echoed on page 1 with every later page.
+- `count` is the number of rows matching every filter (for "Showing 20 of 1,007").
+- `status_counts` counts the range and `surface` but ignores `status`, so each
+  status filter chip can show its count while one is selected. Every status is
+  present, with 0 when there are none; "All" is the sum.
+- `surface` (paged form only) tells Task pipeline runs apart: `api` (API
+  deployment), `etl` (ETL pipeline), `task` (Task pipeline) and `workflow`
+  (everything else: manual runs, and default and app pipelines). `type` keeps
+  its old values, where a Task pipeline run is `workflow`.
+- Both forms are cached like the other metrics responses; `?refresh=true`
+  bypasses the cache and does not switch forms.
+
+### Attention and attribution (PB-T14)
+
+Both take only `start_date` and `end_date` (ISO 8601; default the last 30
+days, at most 365 days apart), are read live and are not cached. JSON Schemas for both responses are in
+[`contract/`](contract/); tests validate real responses against them.
+
+#### `/attention/`
+
+```json
+{
+  "start_date": "2026-09-16T00:00:00+00:00",
+  "end_date": "2026-10-16T00:00:00+00:00",
+  "items": [
+    {
+      "kind": "failing_pipeline",
+      "id": "6f1c2a4e-1d1b-4c8e-9a51-0c7b2f1e9d10",
+      "name": "Nightly invoices",
+      "count": 7,
+      "since": "2026-10-10T02:00:00+00:00",
+      "route": {"key": "etl_pipeline.detail", "params": {"id": "6f1c2a4e-…"}},
+      "details": {
+        "last_failure": "2026-10-15T02:00:00+00:00",
+        "last_success": "2026-10-09T02:00:00+00:00",
+        "pipeline_type": "ETL"
+      }
+    }
+  ],
+  "failed_kinds": []
+}
+```
+
+| kind | where | item | `count` | `since` |
+|---|---|---|---|---|
+| `failing_pipeline` | OSS | one per active ETL or Task pipeline | finished runs failed in a row | first failure of the streak |
+| `failing_deployment` | OSS | one per active API deployment | finished runs failed in a row | first failure of the streak |
+| others | cloud | defined by the cloud app that registers the kind | | |
+
+- A row is failing when each of its last five finished runs ended in ERROR and
+  the latest of them is in the range. Runs still pending or executing are
+  skipped; a STOPPED or COMPLETED run ends the streak. The rule and why it is
+  ERROR only are in `workflow_manager/workflow_v2/failing_streaks.py`.
+- `route` uses the route-registry keys proposed for global search (#2343), or
+  is `null`.
+  `details` is kind-specific.
+- Kinds are sorted by each provider's `order` (OSS: `failing_pipeline` = 10,
+  `failing_deployment` = 20; cloud kinds choose their own); within a kind,
+  newest failure first.
+- The range filters on when the newest failure happened; the failing test
+  always uses a row's latest runs.
+- `failed_kinds` names kinds whose provider raised or returned an item that
+  breaks the contract; never show those as "nothing needs attention".
+- A cloud app adds a kind by subclassing `attention.AttentionProvider` and
+  calling `register_attention_provider()` from its `AppConfig.ready()`.
+
+#### `/attribution/`
+
+```json
+{
+  "start_date": "2026-09-16T00:00:00+00:00",
+  "end_date": "2026-10-16T00:00:00+00:00",
+  "total_failed_pages": 708,
+  "sources": [
+    {"id": "6f1c…", "name": "Nightly invoices", "type": "etl_pipeline",
+     "failed_pages": 512, "share": 0.7232}
+  ],
+  "days": [
+    {"date": "2026-10-10", "failed_pages": 610,
+     "sources": [{"id": "6f1c…", "failed_pages": 512}]}
+  ]
+}
+```
+
+- Built from the same queryset as the `failed_pages` metric
+  (`MetricsQueryService.failed_file_executions_with_pages`), so
+  `total_failed_pages` and each day's `failed_pages` equal that series for the
+  same range.
+- A source is the pipeline or API deployment that ran the file; a run with no
+  pipeline is attributed to its workflow (`type: workflow`), and a source whose
+  pipeline, deployment or workflow no longer exists has `type: deleted` and
+  `name: null`.
+- Sources are ordered by failed pages, most first; `share` is the fraction of
+  `total_failed_pages`, rounded to 4 places.
+
+---
+
+## Caching Strategy
+
+### Two-Layer Caching
+
+#### 1. Whole-Response Caching (Simple)
+Used for `/overview/`, `/live-summary/`, `/live-series/`
+
+```python
+@cache_metrics_response(endpoint="overview")
+def overview(self, request):
+    ...
+```
+
+TTLs:
+- Overview: 5 minutes
+- Summary: 15 minutes
+- Series: 30 minutes
+
+#### 2. Bucket-Based Caching (Advanced)
+Used for `/summary/` and `/series/` with hourly source
+
+**How it works:**
+1. Split time range into hourly buckets
+2. Use Redis MGET to fetch all buckets in one round-trip
+3. Query DB only for missing buckets
+4. Save new buckets with appropriate TTL
+
+**Cache Key Format:**
+```
+metrics:bucket:hourly:<org_id>:<timestamp>[:metric_name]
+```
+
+**TTL Strategy:**
+- Current hour: 30 seconds (data still changing)
+- Historical hours: 8 hours (data stable)
+
+**Benefits:**
+- Overlapping queries reuse cached buckets
+- Query for Jan 1-7 caches 168 hourly buckets
+- Query for Jan 5-10 reuses 72 cached buckets, only queries 72 new
+
+### Cache Configuration
+
+In `settings.py`:
+```python
+DASHBOARD_CACHE_TTL_CURRENT_HOUR = 30      # 30 seconds
+DASHBOARD_CACHE_TTL_HISTORICAL = 28800     # 8 hours
+DASHBOARD_CACHE_TTL_OVERVIEW = 300         # 5 minutes
+DASHBOARD_CACHE_TTL_SUMMARY = 900          # 15 minutes
+DASHBOARD_CACHE_TTL_SERIES = 1800          # 30 minutes
+```
+
+---
+
+## UI Data Flow — What Shows Where
+
+### Overview Tab
+
+#### Summary Cards (top row)
+
+- **Component**: `MetricsSummary` → `frontend/src/components/metrics-dashboard/MetricsSummary.jsx`
+- **Hook**: `useMetricsOverview(startDate, endDate)`
+- **API**: `GET /metrics/overview/?start_date=...&end_date=...`
+- **DB**: `event_metrics_daily` (8-90d range) or `event_metrics_hourly` (≤7d) or `event_metrics_monthly` (>90d)
+- **Response field**: `totals[]` — one entry per metric, `SUM(metric_value)` over the date range
+
+| Card | `metric_name` in DB | Display |
+|---|---|---|
+| Total Pages Processed | `pages_processed` | Sum of `metric_value` |
+| Documents Processed | `documents_processed` | Sum of `metric_value` |
+| LLM Calls | `llm_calls` | Sum of `metric_value` |
+| Prompt Executions | `prompt_executions` | Sum of `metric_value` |
+| LLM Usage Cost | `llm_usage` | Sum of `metric_value` ($ prefix) |
+
+Cards appear in priority order. Only metrics with data show up.
+
+#### Pages Processed Chart (left, below cards)
+
+- **Component**: `PagesChart` → `frontend/src/components/metrics-dashboard/MetricsChart.jsx`
+- **Hook**: `useMetricsOverview(chartStart, chartEnd)` (fixed 30-day range)
+- **API**: Same `/metrics/overview/`
+- **Response field**: `daily_trend[]`
+
+| Line | Color | Source |
+|---|---|---|
+| Pages Processed | Blue `#1890ff` | `daily_trend[].metrics.pages_processed` |
+| Failed Pages | Red `#ff4d4f` | `daily_trend[].metrics.failed_pages` |
+
+#### Trend Analysis Chart (bottom left)
+
+- **Component**: `TrendAnalysisChart` → `frontend/src/components/metrics-dashboard/MetricsChart.jsx`
+- **Hook**: Same `useMetricsOverview` as Pages chart (fixed 30-day range)
+- **Response field**: `daily_trend[]` (excludes `pages_processed` and `failed_pages`)
+
+Default lines: `documents_processed` (yellow), `llm_calls` (purple).
+Users toggle metrics via Filter dropdown.
+
+#### Recent Activity (right sidebar)
+
+- **Component**: `RecentActivity` → `frontend/src/components/metrics-dashboard/RecentActivity.jsx`
+- **Hook**: `useRecentActivity(5)`
+- **API**: `GET /metrics/recent-activity/?limit=5`
+- **DB**: `workflow_execution` + `workflow_file_execution` + `usage` (live queries, no pre-aggregation)
+
+| Field | Source |
+|---|---|
+| Type (ETL / API / Workflow) | Determined by pipeline/api_deployment FK presence |
+| Status tag | `workflow_execution.status` |
+| File name | `workflow_file_execution.file_name` |
+| Token count | `SUM(usage.total_tokens)` per execution |
+| Time ago | Relative time from `workflow_file_execution.created_at` |
+
+### Usage by Deployment Tab
+
+#### Usage by Deployment (table with sub-tabs)
+
+- **Component**: `DeploymentUsageTable` → `frontend/src/components/metrics-dashboard/LLMUsageTable.jsx`
+- **Hook**: `useDeploymentUsage(deploymentType, startDate, endDate)`
+- **API**: `GET /metrics/workflow-token-usage/?start_date=...&end_date=...&deployment_type=API`
+- **DB**: `workflow_execution` → deployment table → `usage` (3-table join per type)
+
+Sub-tabs: API, ETL, TASK, WF (each fetched independently with per-tab caching)
+
+| Column | Source |
+|---|---|
+| Deployment | Name from `api_deployment.display_name`, `pipeline.pipeline_name`, or `workflow.workflow_name` |
+| Tokens | `SUM(usage.total_tokens)` |
+| LLM Calls | `COUNT(usage.id)` |
+| Executions | `COUNT(DISTINCT workflow_execution.id)` |
+| Cost | `SUM(usage.cost_in_dollars)` |
+
+Sorted by tokens descending.
+
+### Data Hooks
+
+Located in `frontend/src/hooks/useMetricsData.js`:
+
+| Hook | Endpoint | Purpose |
+|------|----------|---------|
+| `useMetricsOverview` | `/overview/` | Summary cards + chart data |
+| `useRecentActivity` | `/recent-activity/` | Live recent processing events |
+| `useWorkflowTokenUsage` | `/workflow-token-usage/` | Per-workflow LLM token breakdown |
+
+### Frontend Caching
+
+Uses localStorage with TTL matching backend (`frontend/src/helpers/metricsCache.js`):
+```javascript
+const CACHE_TTL = {
+  overview: 5 * 60 * 1000,    // 5 minutes
+  summary: 15 * 60 * 1000,    // 15 minutes
+  series: 30 * 60 * 1000,     // 30 minutes
+};
+```
+
+---
+
+## Setup & Configuration
+
+### 1. Install Dependencies
+
+```bash
+cd backend/
+uv sync
+```
+
+Required packages in `pyproject.toml`:
+- `django-celery-beat` - Holds the Beat half of every schedule row (see [Transport](#transport-how-the-cron-actually-fires)); still required even when the PG scheduler is the firer
+- `django-redis` - For MGET/pipeline operations
+
+### 2. Run Migrations
+
+```bash
+python manage.py migrate dashboard_metrics
+```
+
+This creates:
+- Three aggregated tables
+- Periodic task schedules — a paired row in **both** `django_celery_beat.PeriodicTask` and `pg_queue.PgPeriodicTask` (see [Transport](#transport-how-the-cron-actually-fires) for which migration declares which)
+
+### 3. Backfill Historical Data
+
+```bash
+# Backfill last 30 days for all organizations
+python manage.py backfill_metrics --days=30
+
+# Backfill for specific org
+python manage.py backfill_metrics --days=90 --org-id=<uuid>
+
+# Dry run to see what would be done
+python manage.py backfill_metrics --days=7 --dry-run
+```
+
+### 4. Start Workers
+
+The PG transport is the default. It needs the metrics consumer, and the schedule rows
+adopted onto the PG scheduler (`PG_SCHEDULER_ENABLED=true` **and**
+`PG_SCHEDULER_ADOPT_PERIODICS=true`, which `entrypoint.sh` converges on a `--migrate`
+start):
+
+```bash
+# 1. The firer — the leader-elected loop that fires due pg_owned schedules.
+#    This is the Beat replacement; without it NOTHING is ever enqueued.
+(cd workers/ && ./run-worker.sh reaper)
+
+# 2. The consumer — drains dashboard_metric_events off pg_queue.
+(cd workers/ && ./run-worker.sh pg-metrics)
+```
+
+**Both are required**, the same way the Celery path needed Beat *and* a worker. The
+scheduler tick is not a daemon of its own: it is leader-elected inside the
+reaper/orchestrator loop (`reaper.py` calls `dispatch_due_periodic_tasks` each cycle).
+In compose that loop is the `worker-pg-reaper` service, which is already declared — so
+this second process is easy to miss when moving from compose to a local run, and
+missing it produces exactly the silent no-firer state described under
+[Transport](#transport-how-the-cron-actually-fires).
+
+Celery transport, for rollback only — requires `PG_SCHEDULER_ENABLED=false`:
+
+```bash
+# Terminal 1: Dashboard metrics worker
+celery -A backend worker --loglevel=info -Q dashboard_metric_events
+
+# Terminal 2: Celery Beat scheduler
+celery -A backend beat --loglevel=info
+```
+
+### 5. Verify Setup
+
+```bash
+# Check periodic tasks are registered, and WHICH scheduler owns them.
+# pg_owned=True  -> the PG scheduler fires it (the Beat twin should be disabled)
+# pg_owned=False -> Celery Beat fires it, and workerMetrics must be running
+python manage.py shell -c "
+from django_celery_beat.models import PeriodicTask
+from pg_queue.models import PgPeriodicTask
+print('-- pg_queue (default transport) --')
+for t in PgPeriodicTask.objects.filter(name__startswith='dashboard'):
+    print(f'{t.name}: enabled={t.enabled} pg_owned={t.pg_owned} cron={t.cron_string}')
+print('-- celery beat (rollback transport) --')
+for t in PeriodicTask.objects.filter(name__startswith='dashboard'):
+    print(f'{t.name}: enabled={t.enabled}')
+"
+
+# Check aggregated data exists
+python manage.py shell -c "
+from dashboard_metrics.models import EventMetricsHourly
+print(f'Hourly records: {EventMetricsHourly._base_manager.count()}')
+"
+```
+
+---
+
+## Management Commands
+
+### `backfill_metrics`
+
+Populates aggregated tables from historical source data.
+
+```bash
+python manage.py backfill_metrics [options]
+
+Options (run --help for the authoritative text; the three --skip-* flags carry
+caveats that do not fit one line):
+  --days=N          Number of days to backfill (default: 30)
+  --org-id=UUID     Specific organization (default: all)
+  --active-only     Only orgs with an active subscription
+  --dry-run         Show what would be done
+  --skip-hourly     Skip the HOUR source queries, not just their upsert
+  --skip-daily      Leave the daily tier short; the rollup then freezes the month
+  --skip-monthly    Largely a no-op inside the rollup window
+```
+
+It never lowers a stored `metric_value`. HITL TTL cleanup expires approved reviews and
+deleting a workflow removes its executions, so a recount can come out below what
+was aggregated at the time; the stored row is kept and the run logs how many. The
+scheduled aggregator still rewrites rows inside its own window. Monthly is summed from
+the daily rows after that check, unless `--skip-daily` is passed.
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+#### 1. Chart shows only one metric
+**Cause**: Only one metric has data in `EventMetricsHourly`
+**Fix**: Run `python manage.py backfill_metrics --days=30`
+
+#### 2. Empty dashboard
+**Cause**: Aggregated tables are empty
+**Fix**:
+1. Check source tables have data
+2. Run backfill command
+3. Verify the metrics consumer is running — `worker-pg-metrics` on the default
+   transport, `workerMetrics` if you have rolled back to Celery
+
+#### 3. Aggregation task never runs
+**Cause (PG transport, most common)**: the schedule has **no firer**. This is silent —
+no error, no queue depth, no failed pod.
+**Fix**: check ownership matches what is deployed (see step 5 of
+[Setup](#5-verify-setup)). `pg_owned=False` with no `workerMetrics` running, or
+`pg_owned=True` with no PG scheduler, both fire nothing. Ownership is converged from
+`PG_SCHEDULER_ENABLED` + `PG_SCHEDULER_ADOPT_PERIODICS` on backend start.
+
+**Cause (Celery transport)**: task not routed to the correct queue.
+**Fix**: ensure `celery_config.py` has the task route:
+```python
+"dashboard_metrics.aggregate_from_sources": {"queue": "dashboard_metric_events"},
+```
+
+#### 4. Slow queries
+**Cause**: Large date range hitting hourly table
+**Fix**: Use `?source=daily` or `?source=monthly` for large ranges
+
+### Debugging Commands
+
+```bash
+# Check what's in aggregated tables
+python manage.py shell -c "
+from dashboard_metrics.models import *
+from django.db.models import Count
+
+print('=== Hourly ===')
+for m in EventMetricsHourly._base_manager.values('metric_name').annotate(c=Count('id')):
+    print(f\"  {m['metric_name']}: {m['c']}\")
+
+print('=== Daily ===')
+for m in EventMetricsDaily._base_manager.values('metric_name').annotate(c=Count('id')):
+    print(f\"  {m['metric_name']}: {m['c']}\")
+"
+
+# Manually trigger aggregation
+python manage.py shell -c "
+from dashboard_metrics.tasks import aggregate_metrics_from_sources
+result = aggregate_metrics_from_sources()
+print(result)
+"
+
+# Check Redis cache keys
+python manage.py shell -c "
+from django.core.cache import cache
+keys = cache.keys('metrics:*')
+print(f'Cached metric keys: {len(keys)}')
+"
+```
+
+---
+
+## File Structure
+
+```
+backend/dashboard_metrics/
+├── __init__.py
+├── admin.py                    # Django admin registration
+├── apps.py                     # App configuration
+├── cache.py                    # Caching layer (bucket-based + decorators)
+├── models.py                   # EventMetricsHourly/Daily/Monthly models
+├── serializers.py              # DRF serializers
+├── services.py                 # MetricsQueryService (source table queries)
+├── tasks.py                    # Task bodies (aggregation, cleanup) — both transports
+├── internal_urls.py            # Internal API routes (PG transport)
+├── internal_views.py           # Internal API views the PG consumer POSTs to
+├── urls.py                     # URL routing
+├── views.py                    # API ViewSet
+├── README.md                   # This file
+├── management/
+│   └── commands/
+│       └── backfill_metrics.py # Backfill historical data
+├── migrations/
+│   ├── 0001_initial.py                    # Create 3 aggregation tables
+│   ├── 0002_setup_periodic_tasks.py       # Register the Beat schedules
+│   ├── 0003_alter_eventmetricsdaily_organization_and_more.py
+│   ├── 0004_pg_periodic_tasks.py          # Mirror the schedules onto pg_queue
+│   ├── 0005_add_reconciliation_task.py    # Daily 04:40 UTC 7-day repair pass
+│   └── 0006_split_aggregation_schedule.py # Split aggregation into two rows by tier
+└── tests/                      # Test suites (not exhaustively listed)
+    └── test_tasks.py
+```
+
+---
+
+## Contributing
+
+When adding new metrics:
+
+1. **Add query method** in `services.py`:
+   ```python
+   @staticmethod
+   def get_new_metric(org_id, start, end, granularity):
+       ...
+   ```
+
+2. **Add to metric configs** in `tasks.py`:
+   ```python
+   metric_configs = [
+       ...
+       ("new_metric", MetricsQueryService.get_new_metric, False),
+   ]
+   ```
+
+3. **Add to backfill command** in `management/commands/backfill_metrics.py`
+
+4. **Update frontend** default selected metrics if needed
+
+5. **Run backfill** to populate historical data

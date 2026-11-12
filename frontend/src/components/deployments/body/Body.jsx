@@ -1,74 +1,61 @@
-import { Collapse, Table } from "antd";
 import PropTypes from "prop-types";
-import { useState } from "react";
 
 import { deploymentsStaticContent } from "../../../helpers/GetStaticData";
 import { IslandLayout } from "../../../layouts/island-layout/IslandLayout";
-import { LogsLabel } from "../../agency/logs-label/LogsLabel";
+import { CardGridView } from "../../widgets/card-grid-view";
 import { EmptyState } from "../../widgets/empty-state/EmptyState";
 import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
-import { DisplayLogs } from "../../agency/display-logs/DisplayLogs";
 
-function Body({ type, columns, tableData, isTableLoading, openAddModal }) {
-  const [activeKey, setActiveKey] = useState([]);
-  const getItems = () => [
-    {
-      key: "1",
-      label: activeKey?.length > 0 ? <LogsLabel /> : "Logs",
-      children: (
-        <div className="tool-ide-logs">
-          <IslandLayout>
-            <DisplayLogs />
-          </IslandLayout>
-        </div>
-      ),
-    },
-  ];
-
-  const handleCollapse = (keys) => {
-    setActiveKey(keys);
-  };
+function Body({
+  type,
+  tableData,
+  isTableLoading,
+  openAddModal,
+  cardConfig,
+  onCardClick,
+  listMode = false,
+  forceExpandedId = null,
+  scrollToId = null,
+  pagination = null,
+  searchTerm = "",
+}) {
   if (isTableLoading) {
     return <SpinnerLoader />;
   }
-  if (!tableData?.length) {
+  if (!tableData?.length && searchTerm) {
     return (
-      <EmptyState
-        text={`Currently you have no ${deploymentsStaticContent[type].addBtn}`}
-        btnText={deploymentsStaticContent[type].addBtn}
-        handleClick={() => openAddModal(false)}
-      />
+      <IslandLayout>
+        <EmptyState text="No results found for this search" />
+      </IslandLayout>
     );
   }
+  if (!tableData?.length) {
+    return (
+      <IslandLayout>
+        <EmptyState
+          text={`Currently you have no ${deploymentsStaticContent[type].addBtn}`}
+          btnText={deploymentsStaticContent[type].addBtn}
+          handleClick={() => openAddModal(false)}
+        />
+      </IslandLayout>
+    );
+  }
+
   return (
     <IslandLayout>
-      <div className="body-div">
-        <div className="table-div">
-          <Table
-            className="table"
-            size="middle"
-            columns={columns}
-            dataSource={tableData}
-            rowKey="id"
-            loading={{
-              indicator: <SpinnerLoader />,
-              spinning: isTableLoading,
-            }}
-          />
-        </div>
-        {deploymentsStaticContent[type].isLogsRequired && (
-          <>
-            <div className="gap" />
-            <Collapse
-              className="tool-ide-collapse-panel"
-              size="small"
-              activeKey={activeKey}
-              items={getItems()}
-              expandIconPosition="end"
-              onChange={handleCollapse}
-            />
-          </>
-        )}
+      <div className="body-div pipeline-card-grid-container">
+        <CardGridView
+          data={tableData}
+          cardConfig={cardConfig}
+          loading={isTableLoading}
+          onCardClick={onCardClick}
+          testIdPrefix={`${type}-deployment-list`}
+          rowKey="id"
+          listMode={listMode}
+          forceExpandedId={forceExpandedId}
+          scrollToId={scrollToId}
+          pagination={pagination}
+        />
       </div>
     </IslandLayout>
   );
@@ -76,10 +63,21 @@ function Body({ type, columns, tableData, isTableLoading, openAddModal }) {
 
 Body.propTypes = {
   type: PropTypes.string.isRequired,
-  columns: PropTypes.array.isRequired,
   tableData: PropTypes.array.isRequired,
   isTableLoading: PropTypes.bool.isRequired,
   openAddModal: PropTypes.func.isRequired,
+  cardConfig: PropTypes.object.isRequired,
+  onCardClick: PropTypes.func,
+  listMode: PropTypes.bool,
+  forceExpandedId: PropTypes.string,
+  scrollToId: PropTypes.string,
+  pagination: PropTypes.shape({
+    current: PropTypes.number,
+    pageSize: PropTypes.number,
+    total: PropTypes.number,
+    onChange: PropTypes.func,
+  }),
+  searchTerm: PropTypes.string,
 };
 
 export { Body };

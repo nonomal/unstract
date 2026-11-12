@@ -1,12 +1,14 @@
+import { Plus } from "lucide-react";
 import PropTypes from "prop-types";
-import { Button } from "antd";
-import { PlusOutlined } from "@ant-design/icons";
+import { Button } from "@/components/ui/shims/antd-button";
 
 import "./Footer.css";
-import { FooterLayout } from "../footer-layout/FooterLayout";
 import { promptType } from "../../../helpers/GetStaticData";
+import { useCustomToolStore } from "../../../store/custom-tool-store";
+import { FooterLayout } from "../footer-layout/FooterLayout";
 
 function Footer({ activeKey, addPromptInstance }) {
+  const { isPublicSource } = useCustomToolStore();
   if (activeKey === "1") {
     return (
       <FooterLayout>
@@ -14,8 +16,9 @@ function Footer({ activeKey, addPromptInstance }) {
           <div>
             <Button
               type="link"
-              icon={<PlusOutlined />}
+              icon={<Plus />}
               onClick={() => addPromptInstance(promptType.notes)}
+              disabled={isPublicSource}
             >
               Notes
             </Button>
@@ -23,8 +26,9 @@ function Footer({ activeKey, addPromptInstance }) {
           <div>
             <Button
               type="link"
-              icon={<PlusOutlined />}
+              icon={<Plus />}
               onClick={() => addPromptInstance(promptType.prompt)}
+              disabled={isPublicSource}
             >
               Prompt
             </Button>

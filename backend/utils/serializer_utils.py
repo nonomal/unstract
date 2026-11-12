@@ -1,7 +1,8 @@
 from typing import Any
 
-from account.models import User
+from account_v2.models import User
 from rest_framework.request import Request
+
 from utils.constants import Account
 
 

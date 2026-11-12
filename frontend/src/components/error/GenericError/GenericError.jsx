@@ -1,6 +1,6 @@
-import { Result } from "antd";
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { Result } from "@/components/ui/shims/antd-structure";
 
 function GenericError() {
   const [searchParams] = useSearchParams();
@@ -12,7 +12,7 @@ function GenericError() {
       IDM: {
         title: "Sorry, but this invitation is not meant for you.",
         subtitle:
-          "Please contact the organization owner to send you another invite.",
+          "Please make sure to use the same email address that you were invited with. If that doesn't work, contact the organization owner to send you another invite.",
       },
       INF: {
         title: "This invitation is either invalid or has expired.",
@@ -25,7 +25,7 @@ function GenericError() {
       },
       USF: {
         title: `We're unable to create your account since an account for your organization ${searchParams.get(
-          "domain"
+          "domain",
         )} already exists.`,
         subtitle:
           "You'll need to contact the admin of your organization's account to get access or you'll need to use a different email address to sign up.",
@@ -42,6 +42,14 @@ function GenericError() {
       INE002: {
         title: `Invalid Email format`,
         subtitle: "Please give a valid email address",
+      },
+      INE003: {
+        title: `Email not allowed`,
+        subtitle: "This email is forbidden.",
+      },
+      INS: {
+        title: `Access Denied`,
+        subtitle: "Please contact your administrator to request access.",
       },
 
       // Add more key-value pairs as needed

@@ -1,8 +1,13 @@
-import { DeleteOutlined, EditOutlined } from "@ant-design/icons";
-import { Button, Radio, Table, Typography } from "antd";
+import { Copy, Pencil, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/shims/antd-button";
+import { Radio } from "@/components/ui/shims/antd-inputs";
+import { Tooltip } from "@/components/ui/shims/antd-overlays";
+import { Table } from "@/components/ui/shims/antd-structure";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
+import { useCopyToClipboard } from "../../../hooks/useCopyToClipboard";
 import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import { useAlertStore } from "../../../store/alert-store";
 import { useCustomToolStore } from "../../../store/custom-tool-store";
@@ -41,16 +46,10 @@ const columns = [
     key: "text_extractor",
   },
   {
-    title: "",
-    dataIndex: "delete",
-    key: "delete",
-    width: 30,
-  },
-  {
-    title: "",
-    dataIndex: "edit",
-    key: "edit",
-    width: 30,
+    title: "Actions",
+    dataIndex: "actions",
+    key: "actions",
+    width: 120,
   },
   {
     title: "Select Default",
@@ -65,18 +64,26 @@ function ManageLlmProfiles() {
   const [editLlmProfileId, setEditLlmProfileId] = useState(null);
   const axiosPrivate = useAxiosPrivate();
   const { sessionDetails } = useSessionStore();
-  const { details, defaultLlmProfile, updateCustomTool, llmProfiles } =
-    useCustomToolStore();
+  const {
+    details,
+    defaultLlmProfile,
+    updateCustomTool,
+    llmProfiles,
+    isPublicSource,
+  } = useCustomToolStore();
   const { setAlertDetails } = useAlertStore();
+  const copyToClipboard = useCopyToClipboard();
   const handleException = useExceptionHandler();
   const { setPostHogCustomEvent } = usePostHogEvents();
+  const MAX_PROFILE_COUNT = 4;
+  const isMaxProfile = llmProfiles.length >= MAX_PROFILE_COUNT;
 
   const handleDefaultLlm = (profileId) => {
     try {
       setPostHogCustomEvent("ps_profile_changed_per_prompt", {
         info: "Selected default LLM profile",
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
 
@@ -101,10 +108,6 @@ function ManageLlmProfiles() {
           defaultLlmProfile: data?.default_profile,
         };
         updateCustomTool(updatedState);
-        setAlertDetails({
-          type: "success",
-          content: "Default LLM Profile updated successfully",
-        });
       })
       .catch((err) => {
         handleException(err, "Failed to set default LLM Profile");
@@ -113,6 +116,9 @@ function ManageLlmProfiles() {
 
   useEffect(() => {
     const modifiedRows = llmProfiles.map((item) => {
+      // One id per profile — every action below repeats once per table row.
+      const rowTestId = (action) =>
+        `ps-llm-profile-${action}-${item?.profile_id}`;
       return {
         key: item?.profile_id,
         name: item?.profile_name || "",
@@ -120,29 +126,51 @@ function ManageLlmProfiles() {
         embedding_model: item?.embedding_model || "",
         vector_db: item?.vector_store || "",
         text_extractor: item?.x2text || "",
-        delete: (
-          <ConfirmModal
-            handleConfirm={() => handleDelete(item?.profile_id)}
-            content="The LLM profile will be permanently deleted."
-          >
-            <Button size="small" className="display-flex-align-center">
-              <DeleteOutlined classID="manage-llm-pro-icon" />
-            </Button>
-          </ConfirmModal>
-        ),
-        edit: (
-          <Button
-            size="small"
-            className="display-flex-align-center"
-            onClick={() => handleEdit(item?.profile_id)}
-          >
-            <EditOutlined classID="manage-llm-pro-icon" />
-          </Button>
+        actions: (
+          <div className="action-buttons-container">
+            <Tooltip title="Copy Profile ID">
+              <Button
+                data-testid={rowTestId("copy-id")}
+                size="small"
+                icon={<Copy />}
+                onClick={() => copyToClipboard(item?.profile_id, "Profile ID")}
+              />
+            </Tooltip>
+            <Button
+              data-testid={rowTestId("edit")}
+              size="small"
+              icon={<Pencil />}
+              disabled={isPublicSource}
+              onClick={() => handleEdit(item?.profile_id)}
+            />
+            <ConfirmModal
+              handleConfirm={() => handleDelete(item?.profile_id)}
+              content="The LLM profile will be permanently deleted."
+            >
+              <Tooltip
+                title={
+                  defaultLlmProfile === item?.profile_id &&
+                  "Default profile cannot be deleted"
+                }
+              >
+                <Button
+                  data-testid={rowTestId("delete")}
+                  size="small"
+                  icon={<Trash2 />}
+                  disabled={
+                    isPublicSource || defaultLlmProfile === item?.profile_id
+                  }
+                />
+              </Tooltip>
+            </ConfirmModal>
+          </div>
         ),
         select: (
           <Radio
+            data-testid={rowTestId("select-default")}
             checked={defaultLlmProfile === item?.profile_id}
             onClick={() => handleDefaultLlm(item?.profile_id)}
+            disabled={isPublicSource}
           />
         ),
       };
@@ -151,26 +179,27 @@ function ManageLlmProfiles() {
   }, [llmProfiles, defaultLlmProfile]);
 
   const handleAddNewLlmProfileBtnClick = () => {
+    setEditLlmProfileId(null);
     setIsAddLlm(true);
 
     try {
       setPostHogCustomEvent("intent_ps_new_llm_profile", {
         info: "Clicked on 'Add New LLM Profile' button",
       });
-    } catch (err) {
+    } catch (_err) {
       // If an error occurs while setting custom posthog event, ignore it and continue
     }
   };
 
-  const handleEdit = (id) => {
-    setEditLlmProfileId(id);
+  const handleEdit = (profileId) => {
+    setEditLlmProfileId(profileId);
     setIsAddLlm(true);
   };
 
-  const handleDelete = (id) => {
+  const handleDelete = (profileId) => {
     const requestOptions = {
       method: "DELETE",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/profile-manager/${id}/`,
+      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/profile-manager/${profileId}/`,
       headers: {
         "X-CSRFToken": sessionDetails?.csrfToken,
       },
@@ -179,14 +208,14 @@ function ManageLlmProfiles() {
     axiosPrivate(requestOptions)
       .then(() => {
         const modifiedLlmProfiles = [...llmProfiles].filter(
-          (item) => item?.profile_id !== id
+          (item) => item?.profile_id !== profileId,
         );
         const body = {
           llmProfiles: modifiedLlmProfiles,
         };
 
         // Reset the default LLM profile if it got deleted.
-        if (id === defaultLlmProfile) {
+        if (profileId === defaultLlmProfile) {
           body["defaultLlmProfile"] = "";
         }
 
@@ -213,7 +242,7 @@ function ManageLlmProfiles() {
       <SpaceWrapper>
         <div>
           <Typography.Text className="add-cus-tool-header">
-            LLM Profiles Manager
+            LLM Profile Settings
           </Typography.Text>
         </div>
         <div>
@@ -228,9 +257,21 @@ function ManageLlmProfiles() {
         </div>
       </SpaceWrapper>
       <div className="display-flex-right">
-        <CustomButton type="primary" onClick={handleAddNewLlmProfileBtnClick}>
-          Add New LLM Profile
-        </CustomButton>
+        <Tooltip
+          title={
+            isMaxProfile
+              ? `Max profile count(${MAX_PROFILE_COUNT})`
+              : "Add New LLM Profile"
+          }
+        >
+          <CustomButton
+            type="primary"
+            onClick={handleAddNewLlmProfileBtnClick}
+            disabled={isMaxProfile || isPublicSource}
+          >
+            Add New LLM Profile
+          </CustomButton>
+        </Tooltip>
       </div>
     </div>
   );

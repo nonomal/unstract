@@ -1,8 +1,10 @@
 import { useEffect, useRef } from "react";
-import { Col, Row, Typography } from "antd";
+import { Col, Row } from "@/components/ui/shims/antd-layout";
+import { Typography } from "@/components/ui/shims/antd-typography";
 
 import "./DisplayLogs.css";
 import { useSocketLogsStore } from "../../../store/socket-logs-store";
+import CustomMarkdown from "../../helpers/custom-markdown/CustomMarkdown";
 
 function DisplayLogs() {
   const bottomRef = useRef(null);
@@ -37,9 +39,10 @@ function DisplayLogs() {
                 </Typography>
               </Col>
               <Col span={8}>
-                <Typography className="display-logs-col">
-                  {log?.message}
-                </Typography>
+                <CustomMarkdown
+                  text={log?.message}
+                  styleClassName="display-logs-col"
+                />
               </Col>
               <Col span={2}>
                 <Typography className="display-logs-col">

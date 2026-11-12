@@ -1,6 +1,15 @@
+import { format, parseISO } from "date-fns";
 import moment from "moment";
 import momentTz from "moment-timezone";
 import { v4 as uuidv4 } from "uuid";
+
+let cloudHomePagePath;
+try {
+  const mod = await import("../plugins/unstract-subscription/helper/constants");
+  cloudHomePagePath = mod.cloudHomePagePath;
+} catch {
+  // Ignore if plugin not available
+}
 
 const THEME = {
   DARK: "dark",
@@ -27,13 +36,16 @@ const getBaseUrl = () => {
   return url;
 };
 
-const getOrgNameFromPathname = (pathname) => {
+const getOrgNameFromPathname = (pathname, isLlmWhisperer) => {
   if (!pathname) {
     return null;
   }
 
   if (publicRoutes.includes(pathname)) {
     return null;
+  }
+  if (isLlmWhisperer) {
+    return pathname?.split("/")[2];
   }
   return pathname?.split("/")[1];
 };
@@ -55,7 +67,9 @@ const replaceFirstRoute = (url, newRoute) => {
 };
 
 const formatBytes = (bytes, decimals = 1) => {
-  if (!+bytes) return "0 B";
+  if (!+bytes) {
+    return "0 B";
+  }
 
   const k = 1000;
   const dm = decimals < 0 ? 0 : decimals;
@@ -64,12 +78,13 @@ const formatBytes = (bytes, decimals = 1) => {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
 
   return sizes[i]
-    ? `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
-    : `${bytes / Math.pow(k, i - 1)} ${sizes.at(-1)}`;
+    ? `${parseFloat((bytes / k ** i).toFixed(dm))} ${sizes[i]}`
+    : `${bytes / k ** (i - 1)} ${sizes.at(-1)}`;
 };
 
 const O_AUTH_PROVIDERS = {
   GOOGLE: "google-oauth2",
+  MICROSOFT: "azuread-tenant-oauth2",
 };
 
 const CONNECTOR_TYPE_MAP = {
@@ -159,21 +174,30 @@ const listOfAppDeployments = [
   },
 ];
 
-const getReadableDateAndTime = (timestamp) => {
+const getReadableDateAndTime = (timestamp, includeTime = true) => {
   const currentDate = new Date(timestamp);
 
-  // Options for formatting the date and time
-  const options = {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
+  if (isNaN(currentDate)) {
+    return "Invalid date";
+  }
+
+  // Options for formatting the date
+  const dateOptions = { year: "numeric", month: "long", day: "numeric" };
+  const formattedDate = currentDate.toLocaleDateString("en-US", dateOptions);
+
+  if (!includeTime) {
+    return formattedDate;
+  }
+
+  // Options for formatting the time
+  const timeOptions = {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     timeZoneName: "short",
   };
-  const formattedDate = currentDate.toLocaleDateString("en-US", options);
-  const formattedTime = currentDate.toLocaleTimeString("en-US", options);
+  const formattedTime = currentDate.toLocaleTimeString("en-US", timeOptions);
+
   return formattedDate + ", " + formattedTime;
 };
 
@@ -187,6 +211,17 @@ const sourceTypes = {
   adapters: ["llm", "vector_db", "embedding"],
 };
 
+const getSequenceNumber = (listOfPrompts) => {
+  let maxSequenceNumber = 0;
+  listOfPrompts.forEach((item) => {
+    if (item?.sequence_number > maxSequenceNumber) {
+      maxSequenceNumber = item?.sequence_number;
+    }
+  });
+
+  return maxSequenceNumber + 1;
+};
+
 const deploymentTypes = {
   etl: "etl",
   task: "task",
@@ -194,28 +229,29 @@ const deploymentTypes = {
   app: "app",
 };
 
+const deploymentApiTypes = {
+  api: "api",
+  pipeline: "pipeline",
+};
+
 const deploymentsStaticContent = {
   etl: {
     title: "Unstructured to Structured ETL Pipelines",
     modalTitle: "Deploy ETL Pipeline",
     addBtn: "ETL Pipeline",
-    isLogsRequired: true,
   },
   task: {
     title: "Unstructured to Structured Task Pipelines",
     modalTitle: "Deploy Task Pipeline",
     addBtn: "Task Pipeline",
-    isLogsRequired: true,
   },
   api: {
     title: "API Deployments",
     addBtn: "API Deployment",
-    isLogsRequired: false,
   },
   app: {
     title: "App Deployments",
     addBtn: "App Deployment",
-    isLogsRequired: false,
   },
 };
 
@@ -243,13 +279,19 @@ const getTimeForLogs = () => {
 };
 
 const getDateTimeString = (timestamp) => {
-  // Convert to milliseconds
+  // Check if the timestamp is a valid number
+  if (typeof timestamp !== "number" || isNaN(timestamp) || timestamp <= 0) {
+    return timestamp;
+  }
+
   const timestampInMilliseconds = timestamp * 1000;
 
-  // Create a new Date object
   const date = new Date(timestampInMilliseconds);
 
-  // Extract date components
+  if (isNaN(date.getTime())) {
+    return timestamp;
+  }
+
   const year = date.getFullYear();
   const month = (date.getMonth() + 1).toString().padStart(2, "0"); // Months are zero-indexed
   const day = date.getDate().toString().padStart(2, "0");
@@ -262,7 +304,7 @@ const getDateTimeString = (timestamp) => {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${milliseconds}`;
 };
 
-const base64toBlob = (data) => {
+const base64toBlob = (data, mimeType) => {
   const bytes = atob(data);
   let length = bytes.length;
   const out = new Uint8Array(length);
@@ -271,7 +313,7 @@ const base64toBlob = (data) => {
     out[length] = bytes.charCodeAt(length);
   }
 
-  return new Blob([out], { type: "application/pdf" });
+  return new Blob([out], { type: mimeType || "application/pdf" });
 };
 
 const removeFileExtension = (fileName) => {
@@ -295,17 +337,20 @@ const isJson = (text) => {
       return typeof json === "object";
     }
     return false;
-  } catch (err) {
+  } catch (_err) {
     return false;
   }
 };
 
-const displayPromptResult = (output, isFormat = false) => {
+const displayPromptResult = (
+  output,
+  isFormat = false,
+  isHighlightEnabled = false,
+) => {
   /*
     output: The data to be displayed or parsed
     isFormat: A flag indicating whether the output should be formatted
   */
-
   let i = 0;
   let parsedData = output;
 
@@ -327,11 +372,18 @@ const displayPromptResult = (output, isFormat = false) => {
   // Check if the parsed data is an array or object and formatting is requested
   if (Array.isArray(parsedData) || typeof parsedData === "object") {
     // If formatting is requested, return the JSON string with indentation
+    if (isHighlightEnabled) {
+      return parsedData;
+    }
     return JSON.stringify(parsedData, null, 4);
   }
-
   return String(parsedData);
 };
+
+// Deprecated adapters stay listed so users can see what to migrate off, but
+// they cannot be selected or counted as configured.
+const usableAdapters = (adapters) =>
+  (adapters || []).filter((adapter) => !adapter?.is_deprecated);
 
 const onboardCompleted = (adaptersList) => {
   if (!Array.isArray(adaptersList)) {
@@ -347,7 +399,6 @@ const onboardCompleted = (adaptersList) => {
 const formattedDateTime = (ISOdateTime) => {
   if (ISOdateTime) {
     const validIsoDate = moment.utc(ISOdateTime).toISOString();
-    // eslint-disable-next-line new-cap
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     return momentTz.tz(validIsoDate, zone).format("lll z");
   } else {
@@ -355,10 +406,44 @@ const formattedDateTime = (ISOdateTime) => {
   }
 };
 
+/**
+ * Relative time for a backend timestamp ("3 days ago").
+ *
+ * Strict ISO parsing: malformed input returns "" (callers should hide the
+ * label) instead of moment's literal "Invalid date". Clamped to now so a
+ * slightly-fast server clock never renders "in a few seconds".
+ * @param {string} ISOdateTime ISO-8601 timestamp
+ * @returns {string} relative time, or "" when absent/malformed
+ */
+const timeAgo = (ISOdateTime) => {
+  const parsed = moment(ISOdateTime, moment.ISO_8601, true);
+  if (!parsed.isValid()) {
+    return "";
+  }
+  return moment.min(parsed, moment()).fromNow();
+};
+
 const getBackendErrorDetail = (attr, backendErrors) => {
   if (backendErrors) {
-    const error = backendErrors?.errors.find((error) => error?.attr === attr);
-    return error ? error?.detail : null;
+    // Handle structured error response with errors array
+    if (backendErrors?.errors && Array.isArray(backendErrors.errors)) {
+      const error = backendErrors.errors.find((error) => error?.attr === attr);
+      return error ? error?.detail : null;
+    }
+
+    // Handle direct field errors (e.g., { api_name: ["error message"] })
+    if (backendErrors[attr]) {
+      return Array.isArray(backendErrors[attr])
+        ? backendErrors[attr].join(", ")
+        : backendErrors[attr];
+    }
+
+    // Handle nested errors in non_field_errors
+    if (backendErrors?.non_field_errors) {
+      return Array.isArray(backendErrors.non_field_errors)
+        ? backendErrors.non_field_errors.join(", ")
+        : backendErrors.non_field_errors;
+    }
   }
   return null;
 };
@@ -395,6 +480,11 @@ const isNonNegativeNumber = (value) => {
   return typeof value === "number" && !isNaN(value) && value >= 0;
 };
 
+// Icons are image URLs; an unresolved adapter falls back to an emoji.
+// Detect the URL - compound (ZWJ) emoji break length heuristics.
+const isImageUrl = (value) =>
+  typeof value === "string" && /^(https?:\/\/|\/|data:image\/)/.test(value);
+
 // Default token usage object with all counts initialized to 0
 const defaultTokenUsage = {
   embedding_tokens: 0,
@@ -409,41 +499,319 @@ const generateUUID = () => {
   return uuid;
 };
 
+function getFormattedTotalCost(tokenUsageDetails) {
+  const value = tokenUsageDetails?.cost_in_dollars ?? 0;
+
+  // Format the value to 5 decimal places or return "0" if the value is zero
+  return value === 0 ? 0 : value.toFixed(5);
+}
+
+const pollForCompletion = (
+  startTime,
+  requestOptions,
+  maxWaitTime,
+  pollingInterval,
+  makeApiRequest,
+) => {
+  const elapsedTime = Date.now() - startTime;
+  if (elapsedTime >= maxWaitTime) {
+    return Promise.reject(
+      new Error(
+        "Unable to fetch results since there's an ongoing extraction, please try again later",
+      ),
+    );
+  }
+
+  const recursivePoll = () => {
+    return makeApiRequest(requestOptions)
+      .then((response) => {
+        if (response?.data?.status === "pending") {
+          return new Promise((resolve) =>
+            setTimeout(resolve, pollingInterval),
+          ).then(recursivePoll);
+        } else {
+          return response;
+        }
+      })
+      .catch((err) => {
+        throw err;
+      });
+  };
+
+  return recursivePoll();
+};
+
+function getDocIdFromKey(key) {
+  // Split the key by '__'
+  const parts = key.split("__");
+
+  // Return the docId part, which is the second element in the array
+  if (parts.length === 3) {
+    return parts[1];
+  } else {
+    return null;
+  }
+}
+
+const displayURL = (text) => {
+  return getBaseUrl() + "/" + text;
+};
+
+// Helper to strip trailing slashes without regex (avoids ReDoS concerns)
+const stripTrailingSlashes = (str) => {
+  let end = str.length;
+  while (end > 0 && str[end - 1] === "/") {
+    end--;
+  }
+  return str.slice(0, end);
+};
+
+const shortenApiEndpoint = (url) => {
+  if (typeof url !== "string" || url.trim() === "") {
+    return "";
+  }
+  try {
+    // Parse URL to strip query/hash and get clean pathname
+    const parsed = new URL(url, globalThis.location.origin);
+    const path = stripTrailingSlashes(parsed.pathname);
+    const parts = path.split("/").filter(Boolean);
+    const suffix = parts[parts.length - 1] || "";
+    return suffix ? `.../${suffix}` : ".../";
+  } catch {
+    // Fallback for invalid URLs - strip query/hash manually
+    const path = stripTrailingSlashes(url.split("?")[0].split("#")[0]);
+    const parts = path.split("/").filter(Boolean);
+    const suffix = parts[parts.length - 1] || "";
+    return suffix ? `.../${suffix}` : ".../";
+  }
+};
+
+const formatNumberWithCommas = (number) => {
+  if (!number && number !== 0) {
+    return null;
+  }
+
+  // Convert the number to a string and split into integer and decimal parts.
+  const [integerPart, decimalPart] = number.toString().split(".");
+
+  // Add commas to the integer part.
+  const formattedIntegerPart = Number(integerPart).toLocaleString();
+
+  // Reassemble the formatted number, including the decimal part if it exists.
+  return decimalPart
+    ? `${formattedIntegerPart}.${decimalPart}`
+    : formattedIntegerPart;
+};
+
+const isValidJsonKey = (key) => {
+  // Check for Prompt-Key
+  // Allowed case, contains alphanumeric characters and underscores,
+  // and doesn't start with a number.
+  const regex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  return regex.test(key);
+};
+
+const PROMPT_RUN_TYPES = {
+  RUN_ONE_PROMPT_ONE_LLM_ONE_DOC: "RUN_ONE_PROMPT_ONE_LLM_ONE_DOC",
+  RUN_ONE_PROMPT_ONE_LLM_ALL_DOCS: "RUN_ONE_PROMPT_ONE_LLM_ALL_DOCS",
+  RUN_ONE_PROMPT_ALL_LLMS_ONE_DOC: "RUN_ONE_PROMPT_ALL_LLMS_ONE_DOC",
+  RUN_ONE_PROMPT_ALL_LLMS_ALL_DOCS: "RUN_ONE_PROMPT_ALL_LLMS_ALL_DOCS",
+  RUN_ALL_PROMPTS_ALL_LLMS_ONE_DOC: "RUN_ALL_PROMPTS_ALL_LLMS_ONE_DOC",
+  RUN_ALL_PROMPTS_ALL_LLMS_ALL_DOCS: "RUN_ALL_PROMPTS_ALL_LLMS_ALL_DOCS",
+};
+
+const PROMPT_RUN_API_STATUSES = {
+  RUNNING: "RUNNING",
+  COMPLETED: "COMPLETED",
+};
+
+const generateApiRunStatusId = (docId, profileId) => {
+  return `${docId}__${profileId}`;
+};
+
+const base64toBlobWithMime = (data, mimeType) => {
+  // Converts a base64 encoded string to a Blob object with the specified MIME type.
+  const byteCharacters = atob(data?.data); // Decode base64
+  const byteArrays = [];
+
+  for (let offset = 0; offset < byteCharacters.length; offset += 512) {
+    const slice = byteCharacters.slice(offset, offset + 512);
+    const byteNumbers = new Array(slice.length);
+    for (let i = 0; i < slice.length; i++) {
+      byteNumbers[i] = slice.charCodeAt(i);
+    }
+    const byteArray = new Uint8Array(byteNumbers);
+    byteArrays.push(byteArray);
+  }
+  return new Blob(byteArrays, { type: mimeType });
+};
+
+const generateCoverageKey = (promptId, profileId) => {
+  return `coverage_${promptId}_${profileId}`;
+};
+
+function formatSecondsToHMS(seconds) {
+  if (isNaN(seconds) || seconds < 0) {
+    return "00:00:00";
+  }
+
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+
+  return [hrs, mins, secs]
+    .map((unit) => String(unit).padStart(2, "0"))
+    .join(":");
+}
+
+const formattedDateTimeWithSeconds = (ISOdateTime) => {
+  if (ISOdateTime) {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const zonedDate = parseISO(ISOdateTime);
+    return format(zonedDate, "MMM d, yyyy h:mm:ss a zzz", { timeZone: zone });
+  } else {
+    return "";
+  }
+};
+
+const TRIAL_PLAN = "TRIAL";
+
+const homePagePath = cloudHomePagePath || "tools";
+
+const convertTimestampToHHMMSS = (timestamp) => {
+  // Convert the timestamp to milliseconds
+  const date = new Date(timestamp * 1000);
+
+  // Extract hours, minutes, and seconds
+  const [hours, minutes, seconds] = [
+    date.getUTCHours(),
+    date.getUTCMinutes(),
+    date.getUTCSeconds(),
+  ].map((unit) => unit.toString().padStart(2, "0"));
+  // Return the formatted time string
+  return `${hours}:${minutes}:${seconds}`;
+};
+
+const formatTimeDisplay = (seconds) => {
+  // Format time display for TTL or duration display
+  if (seconds <= 0) {
+    return "Expired";
+  }
+
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+
+  const parts = [];
+  if (days > 0) {
+    parts.push(`${days}d`);
+  }
+  if (hours > 0) {
+    parts.push(`${hours}h`);
+  }
+  if (minutes > 0) {
+    parts.push(`${minutes}m`);
+  }
+  if (secs > 0 || parts.length === 0) {
+    parts.push(`${secs}s`);
+  }
+
+  return parts.join(" ");
+};
+
+const copyToClipboard = async (text) => {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Clipboard API may fail in insecure contexts or unsupported browsers
+    return false;
+  }
+};
+
+const UNSTRACT_ADMIN = "unstract_admin";
+
+const logsStaticContent = {
+  ETL: {
+    addBtn: "ETL Pipeline",
+    route: "etl",
+  },
+  TASK: {
+    addBtn: "Task Pipeline",
+    route: "task",
+  },
+  API: {
+    addBtn: "API Deployment",
+    route: "api",
+  },
+  WF: {
+    addBtn: "Workflow",
+    route: "workflows",
+  },
+};
+
 export {
+  base64toBlob,
+  base64toBlobWithMime,
   CONNECTOR_TYPE_MAP,
-  O_AUTH_PROVIDERS,
-  THEME,
   calculateDivHeight,
-  deploymentTypes,
+  convertTimestampToHHMMSS,
+  copyToClipboard,
+  defaultTokenUsage,
+  deploymentApiTypes,
   deploymentsStaticContent,
+  deploymentTypes,
+  displayPromptResult,
+  displayURL,
+  docIndexStatus,
   endpointType,
   formatBytes,
+  formatNumberWithCommas,
+  formatSecondsToHMS,
+  formatTimeDisplay,
   formattedDateTime,
+  formattedDateTimeWithSeconds,
+  generateApiRunStatusId,
+  generateCoverageKey,
+  generateUUID,
+  getBackendErrorDetail,
   getBaseUrl,
+  getDateTimeString,
+  getDocIdFromKey,
+  getFormattedTotalCost,
+  getMenuItem,
   getOrgNameFromPathname,
   getReadableDateAndTime,
+  getSequenceNumber,
   getTimeForLogs,
-  getDateTimeString,
+  homePagePath,
+  isImageUrl,
+  isJson,
+  isNonNegativeNumber,
+  isValidJsonKey,
   listOfAppDeployments,
+  logsStaticContent,
+  O_AUTH_PROVIDERS,
   onboardCompleted,
+  PROMPT_RUN_API_STATUSES,
+  PROMPT_RUN_TYPES,
+  pollForCompletion,
   promptStudioUpdateStatus,
   promptType,
   publicRoutes,
+  removeFileExtension,
   replaceFirstRoute,
   setInitialWorkflowInstance,
+  shortenApiEndpoint,
   sourceTypes,
+  THEME,
+  TRIAL_PLAN,
+  timeAgo,
+  titleCase,
   toolIdeOutput,
+  UNSTRACT_ADMIN,
+  usableAdapters,
   wfExecutionTypes,
   workflowStatus,
-  base64toBlob,
-  removeFileExtension,
-  isJson,
-  displayPromptResult,
-  getBackendErrorDetail,
-  titleCase,
-  getMenuItem,
-  docIndexStatus,
-  isNonNegativeNumber,
-  defaultTokenUsage,
-  generateUUID,
 };

@@ -1,0 +1,162 @@
+"""Task dispatch onto the PG queue.
+
+Routes each task via :func:`resolve_backend` (a per-call ``backend`` override,
+else :func:`select_backend`):
+
+- **PG Queue** (the only transport :func:`select_backend` returns since UN-4046)
+  — the task is serialised and enqueued to ``pg_queue_message``; the PG consumer
+  drains and runs it.
+- **Celery** — a thin pass-through to ``current_app.send_task``, reachable only
+  by an explicit ``backend=QueueBackend.CELERY`` override. Nothing passes one;
+  the branch goes with the rest of the Celery transport.
+
+This used to default to Celery and route to PG only for task names opted into
+``WORKER_PG_QUEUE_ENABLED_TASKS``. That allow-list was set nowhere, so the
+default sent everything to Celery; UN-4046 removed it along with the
+``pg_queue_enabled`` flag.
+
+.. warning::
+   Every PG queue **requires its consumer to be running** — otherwise the
+   message is durably enqueued and never executed, with no error at the
+   producer. ``validate-pg-worker-fleet.yaml`` in the chart refuses a partial
+   fleet at render time for exactly this reason.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from celery import current_app
+
+from .fairness import DEFAULT_PRIORITY, FairnessKey
+from .handle import DispatchHandle
+from .pg_queue import PgQueueClient, to_payload
+from .routing import QueueBackend, resolve_backend
+
+logger = logging.getLogger(__name__)
+
+# pg_queue_message.queue_name used when a dispatch carries no Celery queue.
+_DEFAULT_PG_QUEUE = "default"
+
+# Task names already logged as PG-routed in this process — bounds the cutover
+# log to once per task name (per prefork child).
+_pg_routing_logged: set[str] = set()
+
+# Per-thread client, reused across dispatches (it self-recovers a dead
+# connection). The worker pool is prefork (each child a single thread), so
+# this is effectively one client per child; ``threading.local`` keeps it
+# correct under a ``-P threads`` pool too, since a libpq connection is not
+# safe for concurrent use across threads. (A gevent pool shares one thread
+# across greenlets and would need a connection pool — out of scope while
+# prefork is the deployment.)
+_pg_local = threading.local()
+
+
+def _get_pg_client() -> PgQueueClient:
+    client = getattr(_pg_local, "client", None)
+    if client is None:
+        client = PgQueueClient()
+        _pg_local.client = client
+    return client
+
+
+@dataclass(frozen=True, slots=True)
+class PgDispatchHandle:
+    """:class:`~queue_backend.handle.TaskHandle` for a PG-enqueued task.
+
+    ``id`` is the ``pg_queue_message.msg_id`` (as a string), so call sites
+    that read ``handle.id`` keep working across the Celery/PG boundary.
+    """
+
+    id: str
+
+
+def dispatch(
+    task_name: str,
+    *,
+    args: Sequence[Any] | None = None,
+    kwargs: Mapping[str, Any] | None = None,
+    queue: str | None = None,
+    fairness: FairnessKey | None = None,
+    backend: QueueBackend | None = None,
+) -> DispatchHandle:
+    """Enqueue a task by name onto its selected transport.
+
+    ``fairness`` is attached as the ``x-fairness-key`` header on the Celery
+    path / serialised into the message on the PG path. Pass ``None`` for
+    non-workflow worker tasks.
+
+    ``backend`` is a per-call transport override (see
+    :func:`~queue_backend.routing.resolve_backend` for the precedence). When
+    ``None`` — the default, and every call site today — ``select_backend`` decides,
+    and since UN-4046 it returns PG unconditionally. The override is therefore the
+    only remaining dial, and nothing in production passes one. It forces the
+    *transport* only; it does not bypass ``_enqueue_pg``'s no-silent-fallback
+    contract.
+    """
+    if resolve_backend(task_name, backend) is QueueBackend.PG:
+        return _enqueue_pg(task_name, args, kwargs, queue, fairness)
+
+    headers = fairness.as_header() if fairness is not None else None
+    return current_app.send_task(
+        task_name,
+        args=args,
+        kwargs=kwargs,
+        queue=queue,
+        headers=headers,
+    )
+
+
+def _enqueue_pg(
+    task_name: str,
+    args: Sequence[Any] | None,
+    kwargs: Mapping[str, Any] | None,
+    queue: str | None,
+    fairness: FairnessKey | None,
+) -> PgDispatchHandle:
+    """Serialise + enqueue a PG-routed task to ``pg_queue_message``.
+
+    A PG enqueue failure raises (no silent Celery fallback — that would
+    hide the failure or risk double-dispatch).
+    """
+    pg_queue = queue or _DEFAULT_PG_QUEUE
+    if task_name not in _pg_routing_logged:
+        # Log the routing *decision* once per task, BEFORE the send — it's
+        # true regardless of send outcome, so a first-dispatch failure
+        # (DB down / unmigrated) must not suppress the one announcement.
+        # INFO so it survives a default log config; once-per-task bounds it.
+        _pg_routing_logged.add(task_name)
+        logger.info(
+            "PG-queue: routing task=%r to Postgres (queue=%r). Requires the "
+            "PG consumer to be running, or it will not execute.",
+            task_name,
+            pg_queue,
+        )
+    payload = to_payload(
+        task_name, args=args, kwargs=kwargs, queue=queue, fairness=fairness
+    )
+    try:
+        # Carry org_id + L3 priority onto the row so the dequeue can order by
+        # priority. A bare dispatch (fairness=None) writes the neutral defaults
+        # (org_id None → "" / DEFAULT_PRIORITY).
+        msg_id = _get_pg_client().send(
+            pg_queue,
+            payload,
+            org_id=fairness.org_id if fairness is not None else None,
+            priority=(
+                fairness.pipeline_priority if fairness is not None else DEFAULT_PRIORITY
+            ),
+        )
+    except Exception:
+        # Re-raise with a breadcrumb (raw psycopg2.Error / a json.dumps
+        # TypeError on a non-serialisable arg would otherwise propagate with
+        # no "this was a PG-routed dispatch" context). No Celery fallback.
+        logger.exception(
+            "PG-queue: failed to enqueue task=%r to queue=%r", task_name, pg_queue
+        )
+        raise
+    return PgDispatchHandle(id=str(msg_id))

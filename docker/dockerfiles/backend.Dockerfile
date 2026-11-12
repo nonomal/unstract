@@ -1,59 +1,85 @@
-FROM python:3.9-slim
+# Use a specific version of Python slim image
+FROM python:3.12-slim-trixie AS base
 
-LABEL maintainer="Zipstack Inc."
+LABEL maintainer="Zipstack Inc." \
+    description="Backend Service Container"
 
-# Keeps Python from generating .pyc files in the container
-ENV PYTHONDONTWRITEBYTECODE 1
-# Set to immediately flush stdout and stderr streams without first buffering
-ENV PYTHONUNBUFFERED 1
-ENV PYTHONPATH /unstract
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/unstract \
+    BUILD_CONTEXT_PATH=backend \
+    BUILD_PACKAGES_PATH=unstract \
+    DJANGO_SETTINGS_MODULE="backend.settings.dev" \
+    APP_HOME=/app \
+    # OpenTelemetry configuration (disabled by default, enable in docker-compose)
+    OTEL_TRACES_EXPORTER=none \
+    OTEL_LOGS_EXPORTER=none \
+    OTEL_SERVICE_NAME=unstract_backend
 
-ENV BUILD_CONTEXT_PATH backend
-ENV BUILD_PACKAGES_PATH unstract
-ENV DJANGO_SETTINGS_MODULE "backend.settings.dev"
-ENV PDM_VERSION 2.12.3
+# Install system dependencies
+RUN apt-get update \
+    && apt-get --no-install-recommends install -y \
+    build-essential \
+    freetds-dev \
+    git \
+    libkrb5-dev \
+    libmagic-dev \
+    libssl-dev \
+    pkg-config \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+# Install uv package manager
+COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /uvx /bin/
 
-# Disable all telemetry by default
-ENV OTEL_TRACES_EXPORTER none
-ENV OTEL_METRICS_EXPORTER none
-ENV OTEL_LOGS_EXPORTER none
-ENV OTEL_SERVICE_NAME unstract_backend
+# Create working directory
+WORKDIR ${APP_HOME}
 
-RUN apt-get update; \
-    apt-get --no-install-recommends install -y \
-        # unstract sdk
-        build-essential libmagic-dev pandoc pkg-config tesseract-ocr \
-        # git url
-        git; \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    \
-    pip install --no-cache-dir -U pip pdm~=${PDM_VERSION};
+# -----------------------------------------------
+# EXTERNAL DEPENDENCIES STAGE - This layer gets cached if external dependencies don't change
+# -----------------------------------------------
+FROM base AS ext-dependencies
 
-WORKDIR /app
+# Copy dependency-related files
+COPY ${BUILD_CONTEXT_PATH}/pyproject.toml ${BUILD_CONTEXT_PATH}/uv.lock ${BUILD_CONTEXT_PATH}/README.md ./
 
-COPY ${BUILD_CONTEXT_PATH}/ .
-# Copy local dependency packages
-COPY ${BUILD_PACKAGES_PATH}/ /unstract
+# Copy local package dependencies
+COPY ${BUILD_PACKAGES_PATH}/ /unstract/
 
-RUN set -e; \
-    \
-    rm -rf .venv .pdm* .python* requirements.txt 2>/dev/null; \
-    \
-    pdm venv create -w virtualenv --with-pip; \
-    # source command may not be availble in sh
-    . .venv/bin/activate; \
-    \
-    # Install opentelemetry for instrumentation.
-    pip install opentelemetry-distro opentelemetry-exporter-otlp; \
-    \
-    opentelemetry-bootstrap -a install; \
-    \
-    # Applicaiton dependencies.
-    pdm sync --prod --no-editable; \
-    \
-    # REF: https://docs.gunicorn.org/en/stable/deploy.html#using-virtualenv
-    pip install --no-cache-dir gunicorn;
+# Increase timeout for large packages (flipt-client is ~45MB)
+ENV UV_HTTP_TIMEOUT=120
+
+# Install external dependencies from pyproject.toml
+RUN uv sync --group deploy --locked --no-install-project --no-dev
+
+# -----------------------------------------------
+# FINAL STAGE - Minimal image for production
+# -----------------------------------------------
+FROM ext-dependencies AS production
+
+# Set shell options for better error handling
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Copy application code (this layer changes most frequently)
+COPY ${BUILD_CONTEXT_PATH}/ ./
+
+# Install the application
+RUN uv sync --group deploy --locked && \
+    uv run opentelemetry-bootstrap -a requirements | uv pip install --requirement - && \
+    # Use OpenTelemetry v1 - v2 breaks LiteLLM with instrumentation enabled
+    uv pip uninstall opentelemetry-instrumentation-openai-v2 && \
+    uv pip install opentelemetry-instrumentation-openai && \
+    chmod +x ./entrypoint.sh
+
+# Install additional requirements if present
+RUN if [ -f requirements.txt ]; then \
+    uv pip install -r requirements.txt; \
+    fi
 
 EXPOSE 8000
+
+# Capture build version at the very end so it doesn't affect layer caching
+ARG VERSION=dev
+ENV UNSTRACT_APPS_VERSION=${VERSION}
 
 ENTRYPOINT [ "./entrypoint.sh" ]

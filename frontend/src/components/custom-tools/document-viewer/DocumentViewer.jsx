@@ -1,8 +1,7 @@
 import PropTypes from "prop-types";
-import { Typography } from "antd";
-
-import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
+import { Typography } from "@/components/ui/shims/antd-typography";
 import { EmptyState } from "../../widgets/empty-state/EmptyState";
+import { SpinnerLoader } from "../../widgets/spinner-loader/SpinnerLoader";
 
 function DocumentViewer({
   children,

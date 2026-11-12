@@ -1,32 +1,22 @@
 import PropTypes from "prop-types";
-import ReactMarkdown from "markdown-to-jsx";
+import { memo } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-function MarkdownRenderer({ markdownText }) {
+const MarkdownRenderer = memo(({ markdownText }) => {
+  if (!markdownText) {
+    return null;
+  }
+
   return (
-    <ReactMarkdown
-      options={{
-        overrides: {
-          pre: {
-            component: MyParagraph,
-          },
-        },
-      }}
-    >
-      {markdownText}
-    </ReactMarkdown>
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownText}</ReactMarkdown>
   );
-}
+});
+
+MarkdownRenderer.displayName = "MarkdownRenderer";
 
 MarkdownRenderer.propTypes = {
   markdownText: PropTypes.string,
-};
-
-const MyParagraph = ({ children, ...props }) => (
-  <div {...props}>{children}</div>
-);
-
-MyParagraph.propTypes = {
-  children: PropTypes.any,
 };
 
 export { MarkdownRenderer };

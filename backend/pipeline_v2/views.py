@@ -1,0 +1,273 @@
+import json
+import logging
+from typing import Any
+
+from account_v2.custom_exceptions import DuplicateData
+from api_v2.exceptions import NoActiveAPIKeyError
+from api_v2.key_helper import KeyHelper
+from api_v2.postman_collection.dto import PostmanCollection
+from django.db import IntegrityError, transaction
+from django.db.models import F, QuerySet
+from django.http import HttpResponse, QueryDict
+from permissions.membership_views import OwnerManagementMixin
+from permissions.permission import (
+    IsOwner,
+    IsOwnerOrSharedUserOrSharedToOrg,
+    is_activation_only_patch,
+)
+from permissions.resource_share_views import ResourceShareManagementMixin
+from platform_audit.actions import Action
+from platform_audit.resources import record_resource_event, resource_ref
+from plugins import get_plugin
+from rest_framework import serializers, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.versioning import URLPathVersioning
+from scheduler.helper import SchedulerHelper
+from tenant_account_v2.capabilities import Capability, RequiresCapability
+from utils.filters.ordering_filter import DeterministicOrderingFilter
+from utils.pagination import CustomPagination
+from workflow_manager.workflow_v2.list_aggregate_serializers import (
+    LIST_FILTER_ACTIONS,
+    list_filters_from,
+    workflow_filter_from,
+)
+from workflow_manager.workflow_v2.list_aggregates import (
+    RowFields,
+    aggregate_rows,
+    apply_list_filters,
+)
+
+from pipeline_v2.constants import (
+    PipelineConstants,
+    PipelineErrors,
+    PipelineExecutionKey,
+)
+from pipeline_v2.constants import PipelineKey as PK
+from pipeline_v2.manager import PipelineManager
+from pipeline_v2.models import Pipeline
+from pipeline_v2.pipeline_processor import PipelineProcessor
+from pipeline_v2.serializers.aggregate import PipelineAggregateSerializer
+from pipeline_v2.serializers.crud import PipelineSerializer
+from pipeline_v2.serializers.execute import (
+    PipelineExecuteSerializer as ExecuteSerializer,
+)
+from pipeline_v2.serializers.sharing import SharedUserListSerializer
+
+notification_plugin = get_plugin("notification")
+
+logger = logging.getLogger(__name__)
+
+PIPELINE_ROW_FIELDS = RowFields(
+    active="active", last_run="last_run_time", schedule="cron_string"
+)
+
+
+def _pipeline_type_from(params: QueryDict) -> str | None:
+    """The ``type`` param, ``None`` when blank; an unknown type is a 400."""
+    pipeline_type: str | None = params.get(PipelineConstants.TYPE)
+    if not pipeline_type:
+        return None
+    if pipeline_type not in Pipeline.PipelineType.values:
+        raise serializers.ValidationError(
+            {PipelineConstants.TYPE: "Unknown pipeline type."}
+        )
+    return pipeline_type
+
+
+class PipelineViewSet(
+    OwnerManagementMixin, ResourceShareManagementMixin, viewsets.ModelViewSet
+):
+    versioning_class = URLPathVersioning
+    queryset = Pipeline.objects.all()
+    pagination_class = CustomPagination
+    filter_backends = [DeterministicOrderingFilter]
+    ordering_fields = ["created_at", "last_run_time", "pipeline_name", "run_count"]
+    # Note: Default ordering with nulls_last is applied in get_queryset()
+    # DRF's ordering attribute doesn't support nulls_last natively
+    notification_resource_name_field = "pipeline_name"
+
+    def get_notification_resource_type(self, resource: Any) -> str | None:
+        if not notification_plugin:
+            return None
+        from tenant_account_v2.notification_resource_types import (
+            pipeline_notification_type,
+        )
+
+        return pipeline_notification_type(resource.pipeline_type)
+
+    def get_permissions(self) -> list[Any]:
+        # Enabling or disabling is use, not configuration, so it follows
+        # sharing. ``pipeline_id`` is echoed by the client and changes nothing.
+        if self.action == "partial_update" and is_activation_only_patch(
+            self.request, flag="active", ignore=("pipeline_id",)
+        ):
+            return [IsOwnerOrSharedUserOrSharedToOrg()]
+        if self.action == "destroy":
+            # Ownership as before, narrowed by the org's deletion capability.
+            return [
+                IsOwner(),
+                RequiresCapability(Capability.DELETE_WORKFLOWS_AND_DEPLOYMENTS),
+            ]
+        if self.action in [
+            "partial_update",
+            "update",
+            "add_co_owner",
+            "remove_co_owner",
+        ]:
+            return [IsOwner()]
+        return [IsOwnerOrSharedUserOrSharedToOrg()]
+
+    serializer_class = PipelineSerializer
+
+    def get_queryset(self) -> QuerySet:
+        # Use for_user manager method to include shared pipelines
+        # Avoid per-row queries for owner/co-owner + creator fields in list views
+        queryset = (
+            Pipeline.objects.for_user(self.request.user)
+            .select_related("created_by")
+            .prefetch_related("memberships__user")
+        )
+
+        # Apply type filter if specified
+        pipeline_type = _pipeline_type_from(self.request.query_params)
+        if pipeline_type:
+            queryset = queryset.filter(pipeline_type=pipeline_type)
+
+        # Filter by workflow ID if provided
+        workflow_filter = workflow_filter_from(self.request.query_params)
+        if workflow_filter:
+            queryset = queryset.filter(workflow_id=workflow_filter)
+
+        # Search by pipeline name
+        search = self.request.query_params.get("search", None)
+        if search:
+            queryset = queryset.filter(pipeline_name__icontains=search)
+
+        # Exact-match lookup (distinct from the icontains search above).
+        pipeline_name = self.request.query_params.get(PK.PIPELINE_NAME)
+        if pipeline_name:
+            queryset = queryset.filter(pipeline_name=pipeline_name)
+
+        # Apply default ordering: last_run_time desc (nulls last), then created_at desc
+        # This ensures pipelines with recent runs appear first, never-run pipelines at end
+        queryset = queryset.order_by(
+            F("last_run_time").desc(nulls_last=True),
+            F("created_at").desc(),
+        )
+
+        return queryset
+
+    def filter_queryset(self, queryset: QuerySet) -> QuerySet:
+        queryset = super().filter_queryset(queryset)
+        if self.action not in LIST_FILTER_ACTIONS:
+            return queryset
+        filters = list_filters_from(self.request.query_params)
+        return apply_list_filters(queryset, filters, PIPELINE_ROW_FIELDS)
+
+    def get_serializer_class(self) -> serializers.Serializer:
+        if self.action == "execute":
+            return ExecuteSerializer
+        else:
+            return PipelineSerializer
+
+    @action(detail=False, methods=["get"])
+    def aggregate(self, request: Request) -> Response:
+        """Status counts and failing rows over the list's filtered rows.
+
+        Call it without ``status`` and ``failing`` to fill the counts while the
+        list is filtered by them.
+        """
+        rows = self.filter_queryset(self.get_queryset())
+        summary = aggregate_rows(rows, PIPELINE_ROW_FIELDS)
+        return Response(PipelineAggregateSerializer(summary).data)
+
+    # TODO: Refactor to perform an action with explicit arguments
+    # For eg, passing pipeline ID and with_log=False -> executes pipeline
+    # For FE however we call the same API twice
+    # (first call generates execution ID)
+    def execute(self, request: Request) -> Response:
+        serializer: ExecuteSerializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        execution_id = serializer.validated_data.get("execution_id", None)
+        pipeline_id = serializer.validated_data[PK.PIPELINE_ID]
+
+        execution = PipelineManager.execute_pipeline(
+            request=request,
+            pipeline_id=pipeline_id,
+            execution_id=execution_id,
+        )
+        pipeline: Pipeline = PipelineProcessor.fetch_pipeline(pipeline_id)
+        serializer = PipelineSerializer(pipeline)
+        response_data = {
+            PipelineExecutionKey.PIPELINE: serializer.data,
+            PipelineExecutionKey.EXECUTION: execution.data,
+        }
+        return Response(data=response_data, status=status.HTTP_200_OK)
+
+    def create(self, request: Request) -> Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            # ``save()`` schedules the cron job, which can raise a non-IntegrityError
+            # (JobSchedulingError/ValidationError) *after* the pipeline row commits.
+            # Without this transaction that leaves a pipeline with no OWNER row —
+            # and since ``created_by`` is audit-only (UN-2202), for_user() would
+            # never match it again, so only an org admin could clean it up.
+            with transaction.atomic():
+                pipeline_instance = serializer.save()
+                # Grant before the API key so the creator's access is committed
+                # with the row itself, matching api_deployment_views.create().
+                pipeline_instance.grant_owner(request.user)
+                # Create API key using the created instance
+                KeyHelper.create_api_key(pipeline_instance, request)
+        except IntegrityError:
+            raise DuplicateData(
+                f"{PipelineErrors.PIPELINE_EXISTS}, {PipelineErrors.DUPLICATE_API}"
+            )
+        record_resource_event(request, Action.RESOURCE_CREATED, pipeline_instance)
+        return Response(data=serializer.data, status=status.HTTP_201_CREATED)
+
+    def perform_destroy(self, instance: Pipeline) -> None:
+        pipeline_to_remove = str(instance.pk)
+        deleted = resource_ref(instance)
+        super().perform_destroy(instance)
+        record_resource_event(self.request, Action.RESOURCE_DELETED, deleted)
+        return SchedulerHelper.remove_job(pipeline_to_remove)
+
+    @action(detail=True, methods=["get"], url_path="users")
+    def list_of_shared_users(self, request: Request, pk: str | None = None) -> Response:
+        """Returns the list of users the pipeline is shared with.
+
+        Viewer-tier by design (``get_permissions`` →
+        ``IsOwnerOrSharedUserOrSharedToOrg``): a shared user may open the owner
+        popup (co-owners spec §10). ``get_permissions`` ignores any
+        ``permission_classes`` set on the decorator, so none is set here.
+        """
+        pipeline = self.get_object()
+        serializer = SharedUserListSerializer(pipeline)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"])
+    def download_postman_collection(
+        self, request: Request, pk: str | None = None
+    ) -> Response:
+        """Downloads a Postman Collection of the API deployment instance."""
+        instance: Pipeline = self.get_object()
+        api_key_inst = instance.apikey_set.filter(is_active=True).first()
+        if not api_key_inst:
+            logger.error(f"No active API key set for pipeline {instance}")
+            raise NoActiveAPIKeyError(deployment_name=instance.pipeline_name)
+
+        # Create a PostmanCollection for a Pipeline
+        postman_collection = PostmanCollection.create(
+            instance=instance, api_key=api_key_inst.api_key
+        )
+        response = HttpResponse(
+            json.dumps(postman_collection.to_dict()), content_type="application/json"
+        )
+        response["Content-Disposition"] = (
+            f'attachment; filename="{instance.pipeline_name}.json"'
+        )
+        return response

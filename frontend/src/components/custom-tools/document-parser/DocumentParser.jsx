@@ -1,35 +1,123 @@
 import PropTypes from "prop-types";
 import { useEffect, useRef, useState } from "react";
-import "./DocumentParser.css";
+import { useSearchParams } from "react-router-dom";
 
-import {
-  promptStudioUpdateStatus,
-  promptType,
-} from "../../../helpers/GetStaticData";
+import "./DocumentParser.css";
+import { promptType } from "../../../helpers/GetStaticData";
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
+import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
 import { useAlertStore } from "../../../store/alert-store";
 import { useCustomToolStore } from "../../../store/custom-tool-store";
+import { usePromptOutputStore } from "../../../store/prompt-output-store";
 import { useSessionStore } from "../../../store/session-store";
 import { EmptyState } from "../../widgets/empty-state/EmptyState";
-import { NotesCard } from "../notes-card/NotesCard";
-import { PromptCard } from "../prompt-card/PromptCard";
-import { useExceptionHandler } from "../../../hooks/useExceptionHandler";
+import { PromptCardWrapper } from "../prompt-card/PromptCardWrapper";
+
+let promptCardService;
+let promptPatchApiSps;
+let SpsPromptsEmptyState;
+try {
+  const pcMod = await import(
+    "../../../plugins/prompt-card/prompt-card-service"
+  );
+  promptCardService = pcMod.promptCardService;
+  const helperMod = await import(
+    "../../../plugins/simple-prompt-studio/helper"
+  );
+  promptPatchApiSps = helperMod.promptPatchApiSps;
+  const spsMod = await import(
+    "../../../plugins/simple-prompt-studio/SpsPromptsEmptyState"
+  );
+  SpsPromptsEmptyState = spsMod.SpsPromptsEmptyState;
+} catch {
+  // The component will remain null of it is not available
+}
+
+// Module-scoped to avoid per-render recompilation.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const getFieldErrors = (err) => {
+  const data = err?.response?.data;
+  if (data?.type !== "validation_error" || !Array.isArray(data?.errors)) {
+    return {};
+  }
+  return data.errors.reduce((acc, e) => {
+    if (e?.attr) {
+      acc[e.attr] = e.detail || "Invalid value";
+    }
+    return acc;
+  }, {});
+};
 
 function DocumentParser({
   addPromptInstance,
   scrollToBottom,
   setScrollToBottom,
 }) {
-  const [updateStatus, setUpdateStatus] = useState({
-    promptId: null,
-    status: null,
-  });
+  const [enforceTypeList, setEnforceTypeList] = useState([]);
+  const [updatedPromptsCopy, setUpdatedPromptsCopy] = useState({});
+  const [isChallenge, setIsChallenge] = useState(false);
+  const [allTableSettings, setAllTableSettings] = useState([]);
   const bottomRef = useRef(null);
-  const { details, updateCustomTool } = useCustomToolStore();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const {
+    details,
+    isSimplePromptStudio,
+    updateCustomTool,
+    getDropdownItems,
+    isChallengeEnabled,
+    isPublicSource,
+  } = useCustomToolStore();
   const { sessionDetails } = useSessionStore();
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
   const handleException = useExceptionHandler();
+  const { promptOutputs } = usePromptOutputStore();
+  let promptCardApiService;
+
+  if (promptCardService && !isPublicSource) {
+    promptCardApiService = promptCardService();
+  }
+
+  useEffect(() => {
+    const outputTypeData = getDropdownItems("output_type") || {};
+    const dropdownList1 = Object.keys(outputTypeData)?.map((item) => {
+      return { value: outputTypeData[item] };
+    });
+    setEnforceTypeList(dropdownList1);
+    setIsChallenge(isChallengeEnabled);
+    if (promptCardApiService) {
+      promptCardApiService
+        .getAllTableSettings()
+        .then((res) => {
+          const data = res?.data;
+          setAllTableSettings(data || []);
+        })
+        .catch((err) => {
+          setAlertDetails(handleException(err));
+        });
+    }
+    return () => {
+      // Set the prompts with updated changes when the component is unmounted
+      const modifiedDetails = { ...useCustomToolStore.getState()?.details };
+      const modifiedPrompts = [...(modifiedDetails?.prompts || [])]?.map(
+        (item) => {
+          const itemPromptId = item?.prompt_id;
+          if (itemPromptId && updatedPromptsCopy[itemPromptId]) {
+            return updatedPromptsCopy[itemPromptId];
+          }
+          return item;
+        },
+      );
+      modifiedDetails["prompts"] = modifiedPrompts;
+      updateCustomTool({ details: modifiedDetails });
+    };
+  }, []);
+
+  useEffect(() => {
+    setIsChallenge(details.enable_challenge);
+  }, [details.enable_challenge]);
 
   useEffect(() => {
     if (scrollToBottom) {
@@ -39,49 +127,53 @@ function DocumentParser({
     }
   }, [scrollToBottom]);
 
-  const handleChange = async (
-    event,
+  // Cross-link from Lookup Studio: scroll to a specific prompt.
+  useEffect(() => {
+    const scrollToPromptId = searchParams.get("scrollTo");
+    if (
+      !scrollToPromptId ||
+      !UUID_RE.test(scrollToPromptId) ||
+      !details?.prompts?.length
+    ) {
+      return;
+    }
+
+    const el = document.querySelector(`[data-prompt-id="${scrollToPromptId}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("highlighted-prompt");
+      setTimeout(() => el.classList.remove("highlighted-prompt"), 2000);
+    }
+
+    searchParams.delete("scrollTo");
+    setSearchParams(searchParams, { replace: true });
+  }, [details?.prompts, searchParams]);
+
+  const promptUrl = (urlPath) => {
+    return `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/prompt/${urlPath}`;
+  };
+
+  const handleChangePromptCard = async (
+    name,
+    value,
     promptId,
-    dropdownItem,
-    isUpdateStatus = false,
-    isPromptUpdate = false
+    onFieldError,
   ) => {
     const promptsAndNotes = details?.prompts || [];
-    let name = "";
-    let value = "";
-    if (dropdownItem?.length) {
-      name = dropdownItem;
-      value = event;
-    } else {
-      name = event.target.name;
-      value = event.target.value;
-    }
 
     if (name === "prompt_key") {
       // Return if the prompt or the prompt key is empty
       if (!value) {
         return;
       }
-      if (!isValidJsonKey(value)) {
-        handleUpdateStatus(
-          isUpdateStatus,
-          promptId,
-          promptStudioUpdateStatus.validationError
-        );
-        return;
-      }
     }
 
-    function isValidJsonKey(key) {
-      // Check for Prompt-Key
-      // Allowed case, contains alphanumeric characters and underscores,
-      // and doesn't start with a number.
-      const regex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-      return regex.test(key);
-    }
+    // Mark that changes have been made when any prompt field is modified
+    const { setHasUnsavedChanges } = useCustomToolStore.getState();
+    setHasUnsavedChanges(true);
 
     const index = promptsAndNotes.findIndex(
-      (item) => item?.prompt_id === promptId
+      (item) => item?.prompt_id === promptId,
     );
 
     if (index === -1) {
@@ -97,9 +189,14 @@ function DocumentParser({
     const body = {
       [`${name}`]: value,
     };
+
+    let url = promptUrl(promptDetails?.prompt_id + "/");
+    if (isSimplePromptStudio) {
+      url = promptPatchApiSps(promptDetails?.prompt_id);
+    }
     const requestOptions = {
       method: "PATCH",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/prompt/${promptDetails?.prompt_id}/`,
+      url,
       headers: {
         "X-CSRFToken": sessionDetails?.csrfToken,
         "Content-Type": "application/json",
@@ -107,76 +204,44 @@ function DocumentParser({
       data: body,
     };
 
-    const modifiedDetails = { ...details };
-    const modifiedPrompts = [...(modifiedDetails?.prompts || [])].map(
-      (item) => {
-        if (item?.prompt_id === promptId) {
-          return {
-            ...item,
-            [name]: value, // Update the specific field instantly
-          };
-        }
-        return item;
-      }
-    );
-    modifiedDetails["prompts"] = modifiedPrompts;
-    updateCustomTool({ details: modifiedDetails });
-
-    handleUpdateStatus(
-      isUpdateStatus,
-      promptId,
-      promptStudioUpdateStatus.isUpdating
-    );
-
     return axiosPrivate(requestOptions)
       .then((res) => {
-        const data = res?.data;
-        const modifiedPrompts = [...(modifiedDetails?.prompts || [])].map(
-          (item) => {
-            if (item?.prompt_id === data?.prompt_id) {
-              return data;
-            }
-            return item;
+        // Update the store with the modified prompt
+        const updatedPrompt = res?.data;
+        if (updatedPrompt) {
+          const modifiedDetails = { ...details };
+          const modifiedPrompts = [...(modifiedDetails?.prompts || [])];
+          const promptIndex = modifiedPrompts.findIndex(
+            (item) => item?.prompt_id === promptId,
+          );
+          if (promptIndex !== -1) {
+            modifiedPrompts[promptIndex] = updatedPrompt;
+            modifiedDetails["prompts"] = modifiedPrompts;
+            updateCustomTool({ details: modifiedDetails });
           }
-        );
-        modifiedDetails["prompts"] = modifiedPrompts;
-        if (!isPromptUpdate) {
-          updateCustomTool({ details: modifiedDetails });
         }
-        handleUpdateStatus(
-          isUpdateStatus,
-          promptId,
-          promptStudioUpdateStatus.done
-        );
+        return res;
       })
       .catch((err) => {
-        setAlertDetails(handleException(err, "Failed to update"));
-        updateCustomTool({ details });
-        handleUpdateStatus(isUpdateStatus, promptId, null);
-      })
-      .finally(() => {
-        if (isUpdateStatus) {
-          setTimeout(() => {
-            handleUpdateStatus(true, promptId, null);
-          }, 3000);
+        // Reporting the rejection is opt-in: a caller that will not report it
+        // itself returns false and gets the alert, so a rejected value can
+        // never fail silently.
+        const handledInline = onFieldError?.(getFieldErrors(err));
+        if (!handledInline) {
+          setAlertDetails(handleException(err, "Failed to update"));
         }
+        throw err;
       });
   };
 
-  const handleUpdateStatus = (isUpdate, promptId, value) => {
-    if (!isUpdate) {
-      return;
-    }
-    setUpdateStatus({
-      promptId: promptId,
-      status: value,
-    });
-  };
-
   const handleDelete = (promptId) => {
+    let url = promptUrl(promptId + "/");
+    if (isSimplePromptStudio) {
+      url = promptPatchApiSps(promptId);
+    }
     const requestOptions = {
       method: "DELETE",
-      url: `/api/v1/unstract/${sessionDetails?.orgId}/prompt-studio/prompt/${promptId}/`,
+      url,
       headers: {
         "X-CSRFToken": sessionDetails?.csrfToken,
       },
@@ -186,21 +251,37 @@ function DocumentParser({
       .then(() => {
         const modifiedDetails = { ...details };
         const modifiedPrompts = [...(modifiedDetails?.prompts || [])].filter(
-          (item) => item?.prompt_id !== promptId
+          (item) => item?.prompt_id !== promptId,
         );
         modifiedDetails["prompts"] = modifiedPrompts;
         updateCustomTool({ details: modifiedDetails });
-        setAlertDetails({
-          type: "success",
-          content: "Deleted successfully",
-        });
       })
       .catch((err) => {
         setAlertDetails(handleException(err, "Failed to delete"));
       });
   };
 
+  const getPromptOutputs = (promptId) => {
+    const keys = Object.keys(promptOutputs || {});
+
+    if (!keys?.length) {
+      return {};
+    }
+
+    const outputs = {};
+    keys.forEach((key) => {
+      if (key.startsWith(promptId)) {
+        outputs[key] = promptOutputs[key];
+      }
+    });
+    return outputs;
+  };
+
   if (!details?.prompts?.length) {
+    if (isSimplePromptStudio && SpsPromptsEmptyState) {
+      return <SpsPromptsEmptyState />;
+    }
+
     return (
       <EmptyState
         text="Add prompt or a note and choose the LLM profile"
@@ -212,28 +293,22 @@ function DocumentParser({
 
   return (
     <div className="doc-parser-layout">
-      {details?.prompts.map((item) => {
+      {details?.prompts?.map((item) => {
         return (
-          <div key={item.prompt_id}>
+          <div key={item.prompt_id} data-prompt-id={item.prompt_id}>
             <div className="doc-parser-pad-top" />
-            {item.prompt_type === promptType.prompt && (
-              <PromptCard
-                promptDetails={item}
-                handleChange={handleChange}
-                handleDelete={handleDelete}
-                updateStatus={updateStatus}
-                updatePlaceHolder="Enter Prompt"
-              />
-            )}
-            {item.prompt_type === promptType.notes && (
-              <NotesCard
-                details={item}
-                handleChange={handleChange}
-                handleDelete={handleDelete}
-                updateStatus={updateStatus}
-                updatePlaceHolder="Enter Notes"
-              />
-            )}
+            <PromptCardWrapper
+              item={item}
+              handleChangePromptCard={handleChangePromptCard}
+              handleDelete={handleDelete}
+              outputs={getPromptOutputs(item?.prompt_id)}
+              enforceTypeList={enforceTypeList}
+              allTableSettings={allTableSettings}
+              setAllTableSettings={setAllTableSettings}
+              setUpdatedPromptsCopy={setUpdatedPromptsCopy}
+              coverageCountData={item?.coverage}
+              isChallenge={isChallenge}
+            />
             <div ref={bottomRef} className="doc-parser-pad-bottom" />
           </div>
         );

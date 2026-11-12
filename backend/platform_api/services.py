@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import logging
+import re
+import uuid as _uuid
+from typing import TYPE_CHECKING
+
+from account_v2.enums import UserRole
+from account_v2.models import User
+from django.apps import apps
+from django.db import models, transaction
+from tenant_account_v2.models import OrganizationMember
+
+if TYPE_CHECKING:
+    from account_v2.models import Organization
+
+    from platform_api.models import PlatformApiKey
+
+logger = logging.getLogger(__name__)
+
+# Distinguishes "caller said nothing" from an explicit None in transfer_ownership.
+_SAME_AS_TO_USER: object = object()
+
+# Reserved domain for service-account addresses. The frontend matches on it to
+# label an ownerless resource "Platform key" instead of naming a machine.
+SERVICE_ACCOUNT_EMAIL_DOMAIN = "platform.internal"
+
+# Business app labels whose models may carry created_by / membership rows.
+# Restricts transfer_ownership to avoid scanning Django built-in and third-party models.
+_BUSINESS_APP_LABELS = {
+    "adapter_processor_v2",
+    "api_v2",
+    "connector_v2",
+    "pipeline_v2",
+    "workflow_v2",
+    "prompt_studio_core_v2",
+    "prompt_studio_registry_v2",
+    "agentic_studio_registry",
+}
+
+
+def _slugify_for_email(name: str) -> str:
+    """Sanitize key name to RFC 5321-safe email local part."""
+    slug = name.lower().replace(" ", "-")
+    slug = re.sub(r"[^a-z0-9\-]", "", slug)
+    return slug[:20] or "key"
+
+
+def create_api_user_for_key(
+    platform_api_key: PlatformApiKey, organization: Organization
+) -> User:
+    """Create a dedicated service account for bearer auth sessions."""
+    with transaction.atomic():
+        uid = str(_uuid.uuid4())
+        name_slug = _slugify_for_email(platform_api_key.name)
+        user = User(
+            username=f"svc-{name_slug}-{uid[:8]}",
+            email=f"{name_slug}-{uid[:8]}@{SERVICE_ACCOUNT_EMAIL_DOMAIN}",
+            user_id=uid,
+            is_service_account=True,
+        )
+        user.set_unusable_password()
+        user.save()
+
+        OrganizationMember.objects.create(
+            user=user,
+            organization=organization,
+            role=UserRole.USER.value,
+        )
+
+        platform_api_key.api_user = user
+        platform_api_key.save(update_fields=["api_user"])
+    return user
+
+
+def live_key_creator(platform_api_key: PlatformApiKey) -> User | None:
+    """The key's creator if they still belong to the key's organization.
+
+    ``_is_resource_owner`` grants on any surviving OWNER row without checking
+    live membership, which is why ``cleanup_user_org_access`` purges those rows
+    when a user leaves. Handing an ex-member a fresh row -- at create, on key
+    deletion, or in a backfill -- reopens that rejoin backdoor, so every path
+    that names a successor asks this one question.
+    """
+    creator = platform_api_key.created_by
+    if creator is None:
+        return None
+    # ``_base_manager`` because the default manager is org-scoped by
+    # ``UserContext``, which is None outside a request — an empty result would
+    # silently strip every resource of its owner. The org is filtered here.
+    if not OrganizationMember._base_manager.filter(
+        user=creator, organization=platform_api_key.organization
+    ).exists():
+        return None
+    return creator
+
+
+def owner_user_for(user: User) -> User:
+    """Resolve the human who should own a resource created by ``user``.
+
+    Service accounts are filtered out of every owner surface, so granting to
+    one leaves no human owner; attribute it to the key's live creator instead.
+    Returns ``user`` unchanged for a normal session, or when no live creator
+    can be named -- the UI then labels the resource "Platform key".
+    """
+    if not getattr(user, "is_service_account", False):
+        return user
+
+    # Imported here so the module keeps its models import behind TYPE_CHECKING.
+    from platform_api.models import PlatformApiKey
+
+    key = (
+        PlatformApiKey.objects.filter(api_user=user)
+        .select_related("created_by", "organization")
+        .first()
+    )
+    if key is None:
+        logger.warning(
+            "Service account %s backs no platform key; resource gets no human owner",
+            user.id,
+        )
+        return user
+    creator = live_key_creator(key)
+    if creator is None:
+        logger.warning(
+            "Platform key %s has no live creator; resource gets no human owner",
+            key.id,
+        )
+        return user
+    return creator
+
+
+def _get_user_fk_fields(model: type) -> list[str]:
+    """Return names of all ForeignKey fields pointing to User."""
+    return [
+        f.name
+        for f in model._meta.get_fields()
+        if isinstance(f, models.ForeignKey) and f.related_model is User
+    ]
+
+
+def _get_user_m2m_fields(model: type) -> list[str]:
+    """Return names of ManyToMany-to-User fields safe to mutate via ``.add()``.
+
+    Only auto-created (implicit) through tables qualify. A custom through model
+    can't be mutated with ``.add()`` / ``.remove()``, so it is excluded — the
+    sole such data (resource memberships, UN-2202) now lives in the polymorphic
+    ``ResourceMembership`` table and is transferred by
+    :func:`_transfer_membership_rows`.
+    """
+    return [
+        f.name
+        for f in model._meta.get_fields()
+        if isinstance(f, models.ManyToManyField)
+        and f.related_model is User
+        and f.remote_field.through._meta.auto_created
+    ]
+
+
+def _transfer_model_ownership(model: type, from_user: User, to_user: User) -> None:
+    """Transfer ownership for a single model from one user to another.
+
+    Dynamically discovers all ForeignKey and ManyToMany fields pointing to
+    User, so custom fields like workflow_owner are handled automatically.
+
+    Uses _base_manager to bypass DefaultOrganizationManagerMixin which
+    relies on UserContext (unavailable during signal/cleanup paths).
+    """
+    # Use _base_manager to bypass org-scoped default manager filtering.
+    qs = model._base_manager.all()
+
+    user_fk_fields = _get_user_fk_fields(model)
+    user_m2m_fields = _get_user_m2m_fields(model)
+
+    # Transfer all ForeignKey fields pointing to User
+    for field_name in user_fk_fields:
+        qs.filter(**{field_name: from_user}).update(**{field_name: to_user})
+
+    # Transfer all ManyToMany fields pointing to User
+    for field_name in user_m2m_fields:
+        for instance in qs.filter(**{field_name: from_user}):
+            getattr(instance, field_name).add(to_user)
+            getattr(instance, field_name).remove(from_user)
+
+
+def _transfer_membership_rows(from_user: User, to_user: User) -> None:
+    """Re-point OWNER/VIEWER ``ResourceMembership`` rows across all resources.
+
+    One polymorphic table covers every resource (UN-2202). ``unique_together
+    (user, content_type, object_id)`` caps ``to_user`` at one row per resource,
+    so when both users hold a row on the same resource they are reconciled by
+    role precedence (OWNER outranks VIEWER): ``to_user`` keeps the stronger of
+    the two roles and ``from_user``'s row is dropped. Without this, transferring
+    an OWNER onto an existing VIEWER would silently leave the resource ownerless.
+    """
+    from permissions.roles import ResourceRole
+    from tenant_account_v2.models import ResourceMembership
+
+    # Rank so a collision only ever promotes to_user, never demotes them.
+    role_rank = {ResourceRole.VIEWER: 0, ResourceRole.OWNER: 1}
+
+    # to_user's current rows keyed by resource, to compare roles on collision.
+    to_rows = {
+        (r.content_type_id, r.object_id): r
+        for r in ResourceMembership.objects.filter(user=to_user)
+    }
+    for row in ResourceMembership.objects.filter(user=from_user):
+        existing = to_rows.get((row.content_type_id, row.object_id))
+        if existing is None:
+            row.user = to_user
+            row.save(update_fields=["user"])
+            continue
+        # to_user already holds a row here — keep the higher-ranked role.
+        if role_rank.get(row.role, 0) > role_rank.get(existing.role, 0):
+            existing.role = row.role
+            existing.save(update_fields=["role"])
+        row.delete()
+
+
+def transfer_ownership(
+    from_user: User, to_user: User | None, membership_to: User | None = _SAME_AS_TO_USER
+) -> None:
+    """Transfer all resource ownership from one user to another.
+
+    Replaces from_user with to_user across business models:
+    - created_by / modified_by ForeignKey fields
+    - auto-through ManyToMany fields to User
+    - OWNER/VIEWER membership rows (custom-through, UN-2202) — re-pointed,
+      reconciling by role precedence when to_user already holds a row so the
+      resource keeps an owner.
+
+    ``membership_to`` splits the two halves. Audit fields may follow a user who
+    has left the org -- nulling them has no security value and breaks deletes
+    that dereference ``created_by`` -- while an OWNER row may not.
+    """
+    if membership_to is _SAME_AS_TO_USER:
+        membership_to = to_user
+
+    with transaction.atomic():
+        if to_user:
+            for model in apps.get_models():
+                if model._meta.app_label not in _BUSINESS_APP_LABELS:
+                    continue
+                _transfer_model_ownership(model, from_user, to_user)
+        # Memberships live in one polymorphic table — transfer once, not per model.
+        if membership_to:
+            _transfer_membership_rows(from_user, membership_to)
+
+
+def delete_api_user_for_key(platform_api_key: PlatformApiKey) -> None:
+    """Transfer ownership to the key's creator, then delete the service account.
+
+    Audit fields follow ``created_by`` even if they have left the org: deleting
+    the account is ``SET_NULL`` on those FKs, and a null ``created_by`` breaks
+    callers that dereference it. An OWNER row is a live-membership question, so
+    it goes only to a creator ``live_key_creator`` still admits.
+    """
+    api_user = platform_api_key.api_user
+    if not api_user:
+        return
+
+    with transaction.atomic():
+        transfer_ownership(
+            from_user=api_user,
+            to_user=platform_api_key.created_by,
+            membership_to=live_key_creator(platform_api_key),
+        )
+        api_user.delete()

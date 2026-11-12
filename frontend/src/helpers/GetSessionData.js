@@ -20,11 +20,16 @@ function getSessionData(sessionData) {
     isAdmin: sessionData.isAdmin,
     adapters: sessionData?.adapters,
     logEventsId: sessionData?.logEventsId,
-    remainingTrialDays: sessionData?.remainingTrialDays,
     allOrganization: sessionData?.allOrganization,
     isPlatformAdmin: sessionData?.isPlatformAdmin,
     loginOnboardingMessage: sessionData?.loginOnboardingMessage,
     promptOnboardingMessage: sessionData?.promptOnboardingMessage,
+    flags: sessionData?.flags,
+    role: sessionData?.role,
+    provider: sessionData?.provider,
+    isStaff: sessionData?.is_staff,
+    disableSsoIdpAuthorization: sessionData?.disable_sso_idp_authorization,
+    orgSwitchViaLogin: sessionData?.orgSwitchViaLogin === true,
   };
 }
 

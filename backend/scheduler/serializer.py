@@ -1,11 +1,11 @@
 import logging
 from typing import Any
 
-from pipeline.manager import PipelineManager
+from pipeline_v2.manager import PipelineManager
 from rest_framework import serializers
-from scheduler.constants import SchedulerConstants as SC
 
 from backend.constants import FieldLengthConstants as FieldLength
+from scheduler.constants import SchedulerConstants as SC
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,12 @@ class JobKwargsSerializer(serializers.Serializer):
 
 class AddJobSerializer(serializers.Serializer):
     id = serializers.CharField(max_length=FieldLength.UUID_LENGTH)
-    cron_string = serializers.CharField(max_length=FieldLength.CRON_LENGTH)
+    cron_string = serializers.CharField(
+        max_length=FieldLength.CRON_LENGTH,
+        allow_null=True,
+        required=False,
+        allow_blank=True,
+    )
     name = serializers.CharField(
         max_length=JOB_NAME_LENGTH, required=False, allow_blank=True
     )

@@ -1,0 +1,57 @@
+.logs-container {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background-color: var(--card);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -2px 5px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  z-index: 999;
+  transition: height 0.1s;
+}
+
+.logs-handle {
+  height: 40px;
+  background-color: var(--card);
+  border-bottom: 1px solid var(--border);
+  cursor: ns-resize;
+  user-select: none;
+  font-weight: bold;
+}
+
+.logs-header-container {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+}
+
+.logs-content {
+  flex: 1;
+  overflow: auto;
+}
+
+.tool-logs-table .ant-table {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px !important;
+  background-color: var(--card);
+}
+
+.tool-logs-table .ant-table-thead > tr > th {
+  background-color: var(--card);
+  font-weight: 600;
+}
+
+/* A light red wash for error logs. Mixed off --destructive so it tracks the
+ * theme instead of staying a light-mode-only #fff1f0. */
+.tool-logs-table .ant-table-tbody > tr.display-logs-error-bg > td {
+  background-color: color-mix(in srgb, var(--destructive) 8%, var(--card));
+}
+
+.display-logs-md {
+  font-size: 13px;
+  padding-left: 5px;
+}

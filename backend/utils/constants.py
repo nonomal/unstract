@@ -1,6 +1,7 @@
 import os
 
 from django.conf import settings
+
 from utils.common_utils import CommonUtils
 
 os.environ.setdefault(
@@ -12,6 +13,9 @@ os.environ.setdefault(
 class Account:
     CREATED_BY = "created_by"
     MODIFIED_BY = "modified_by"
+    ORGANIZATION_ID = "organization_id"
+    # (organization_id, Organization) resolved for the current request or task.
+    ORGANIZATION_CACHE = "organization_cache"
 
 
 class Common:
@@ -35,6 +39,26 @@ class Pagination:
     MAX_PAGE_SIZE = 1000
 
 
+class CeleryQueue:
+    """Constants for Celery Queue.
+
+    Attributes:
+        CELERY_API_DEPLOYMENTS (str): The name of the Celery queue for API
+            deployments.
+    """
+
+    CELERY_API_DEPLOYMENTS = "celery_api_deployments"
+
+
+class FileProcessingQueue:
+    """Queue names for file processing tasks (consumed by workers v2)."""
+
+    FILE_PROCESSING = "file_processing"
+    API_FILE_PROCESSING = "api_file_processing"
+    FILE_PROCESSING_CALLBACK = "file_processing_callback"
+    API_FILE_PROCESSING_CALLBACK = "api_file_processing_callback"
+
+
 class ExecutionLogConstants:
     """Constants for ExecutionLog.
 
@@ -56,5 +80,5 @@ class ExecutionLogConstants:
     LOGS_BATCH_LIMIT: int = settings.LOGS_BATCH_LIMIT
     LOG_QUEUE_NAME: str = "log_history_queue"
     CELERY_QUEUE_NAME = "celery_periodic_logs"
-    PERIODIC_TASK_NAME = "workflow_log_history"
-    TASK = "workflow_manager.workflow.execution_log_utils.consume_log_history"
+    PERIODIC_TASK_NAME_V2 = "workflow_log_history_v2"
+    TASK_V2 = "consume_log_history"

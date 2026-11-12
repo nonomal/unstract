@@ -13,6 +13,7 @@ import sys
 PREFERRED_BASE_ENV_KEYS = [
     "STRUCTURE_TOOL_IMAGE_URL",
     "STRUCTURE_TOOL_IMAGE_TAG",
+    "CONTAINER_CLIENT_PATH",
 ]
 DEFAULT_AUTH_KEY = "unstract"
 DEFAULT_ADMIN_KEY = "admin"
@@ -54,8 +55,8 @@ def _merge_to_env_file(base_env_file_path: str, target_env: dict[str, str] = {})
     target env.
 
     Args:
-        base_env_path (string): Base env file path.
-        target_env (dict, optional): Target env to use for merge.
+        base_env_file_path (string): Base env file path e.g. `sample.env`
+        target_env (dict, optional): Target env to use for merge e.g. `.env`
 
     Returns:
         string: File contents after merge.
